@@ -6,12 +6,12 @@ defmodule Bluez.Rebus.MessageTest do
   use ExUnit.Case, async: true
   alias Bluez.Rebus.Message
 
-  # Helper function to encode message and return binary for decoding
+  # Helper function to encode message and return binary for decoding.
+  # (No error branch: encode/2 always returns {:ok, iodata} — the 1.20 type
+  # checker proves a defensive clause unreachable under --warnings-as-errors.)
   defp encode_to_binary(message, endianness \\ :little) do
-    case Message.encode(message, endianness) do
-      {:ok, iodata} -> {:ok, IO.iodata_to_binary(iodata)}
-      error -> error
-    end
+    {:ok, iodata} = Message.encode(message, endianness)
+    {:ok, IO.iodata_to_binary(iodata)}
   end
 
   describe "new/2" do
