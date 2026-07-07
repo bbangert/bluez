@@ -52,7 +52,7 @@ defmodule Bluez.MixProject do
     [
       licenses: ["Apache-2.0"],
       links: %{"GitHub" => @source_url},
-      files: ~w(lib guides .formatter.exs mix.exs README.md CHANGELOG.md LICENSE)
+      files: ~w(lib guides .formatter.exs mix.exs README.md LICENSE)
     ]
   end
 
@@ -64,7 +64,6 @@ defmodule Bluez.MixProject do
       before_closing_body_tag: &before_closing_body_tag/1,
       extras: [
         "README.md",
-        "CHANGELOG.md",
         "guides/architecture.md",
         "guides/host_integration.md",
         "guides/nerves_system.md"
