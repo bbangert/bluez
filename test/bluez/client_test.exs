@@ -8,7 +8,7 @@ defmodule Bluez.ClientTest do
 
   defmodule ConnStub do
     @moduledoc """
-    Minimal stand-in for a `Rebus.Connection` pid: answers the handler
+    Minimal stand-in for a `Bluez.Rebus.Connection` pid: answers the handler
     registrations `Client.init/1` performs and any other call with `:ok`.
     No D-Bus traffic ever flows in these tests (`setup: false` and an
     injected `apply_mode_fun` keep the Client away from the bus). The
@@ -110,7 +110,7 @@ defmodule Bluez.ClientTest do
 
     # A Device1 InterfacesAdded under the (default) hci0 adapter path, in
     # rebus wire shape — drives the real signal → DeviceCache → emit path.
-    msg = %Rebus.Message{
+    msg = %Bluez.Rebus.Message{
       type: :signal,
       flags: [],
       version: 1,

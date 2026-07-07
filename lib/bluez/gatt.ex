@@ -293,9 +293,9 @@ defmodule Bluez.Gatt do
 
   @impl GenServer
   def init(opts) do
-    case Rebus.connect(:system) do
+    case Bluez.Rebus.connect(:system) do
       {:ok, conn} ->
-        sig_ref = Rebus.add_signal_handler(conn)
+        sig_ref = Bluez.Rebus.add_signal_handler(conn)
         conn_ref = Process.monitor(conn)
 
         # rebus installs no bus-side match rules; route org.bluez's Device1
@@ -629,7 +629,7 @@ defmodule Bluez.Gatt do
   end
 
   # org.bluez signals (device property changes + notification values).
-  def handle_info({ref, %Rebus.Message{type: :signal} = msg}, %{sig_ref: ref} = state) do
+  def handle_info({ref, %Bluez.Rebus.Message{type: :signal} = msg}, %{sig_ref: ref} = state) do
     {:noreply, handle_signal(msg, state)}
   end
 
@@ -643,7 +643,10 @@ defmodule Bluez.Gatt do
   # ── signal handling ──────────────────────────────────────────────────────
 
   defp handle_signal(
-         %Rebus.Message{header_fields: %{member: "PropertiesChanged", path: path}, body: body},
+         %Bluez.Rebus.Message{
+           header_fields: %{member: "PropertiesChanged", path: path},
+           body: body
+         },
          state
        ) do
     case body do

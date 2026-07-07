@@ -1,7 +1,8 @@
 # Architecture
 
 Bluez brings up the Linux BlueZ stack under one Elixir supervisor and
-puts a set of `rebus` (pure-Elixir D-Bus) clients on top of it. Your
+puts a set of pure-Elixir D-Bus clients (the vendored `Bluez.Rebus`) on
+top of it. Your
 application plugs in through injected funs and child specs — the library
 never calls back into named modules of yours, so it carries no compile-time
 dependency on the host.
@@ -76,7 +77,8 @@ Two runtime-switchable modes, matching what ESPHome-style hosts expose:
 
 - **`:passive`** (default) — registers an `AdvertisementMonitor1` object
   *we export* on the bus (the client is also a D-Bus service; this is
-  what requires the rebus fork). BlueZ never sends scan requests, so
+  what the vendored `Bluez.Rebus` service-side API exists for). BlueZ
+  never sends scan requests, so
   peripherals don't burn battery answering us. The monitor's
   `or_patterns` match the common Flags values — the documented
   "match all devices" recipe.

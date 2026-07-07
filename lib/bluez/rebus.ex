@@ -1,0 +1,342 @@
+# Vendored from bbangert/rebus @ c6f7b64 (branch dbus-service, a fork of
+# ausimian/rebus adding the service-side API), namespaced Rebus -> Bluez.Rebus
+# so it can never collide with a hex rebus in a host app. MIT licensed —
+# see lib/bluez/rebus/VENDORED.md. Upstreaming: ausimian/rebus#9.
+defmodule Bluez.Rebus do
+  @moduledoc """
+  An Elixir implementation of the D-Bus message protocol.
+
+  Bluez.Rebus provides a clean, Elixir-native interface for communicating over D-Bus,
+  the inter-process communication (IPC) and remote procedure call (RPC) mechanism
+  that is standard on Linux desktop systems.
+
+  ## Overview
+
+  D-Bus is a message bus system that allows multiple processes to communicate with
+  each other in a structured way. Bluez.Rebus implements the D-Bus wire protocol and provides
+  an easy-to-use API for:
+
+  - Connecting to D-Bus message buses (system and session buses)
+  - Sending method calls and receiving replies
+  - Emitting and receiving signals
+  - Publishing and consuming D-Bus services
+
+  ## Quick Start
+
+      # Connect to the session bus
+      {:ok, conn} = Bluez.Rebus.connect(:session)
+
+      # Add a signal handler to receive all signals
+      ref = Bluez.Rebus.add_signal_handler(conn)
+
+      # Later, remove the signal handler
+      Bluez.Rebus.remove_signal_handler(conn, ref)
+
+  ## Connection Types
+
+  Bluez.Rebus supports connecting to different types of D-Bus endpoints:
+
+  - `:system` - Connects to the system bus using the address specified in
+     application config (see below) or the `/run/dbus/system_bus_socket` by default.
+  - `:session` - Connects to the session bus using the address specified in
+     the `DBUS_SESSION_BUS_ADDRESS` environment variable.
+  - `%{family: :local, path: path}` - Unix domain socket connection to a local D-Bus daemon
+  - `%{family: :inet, addr: {ip, port}}` - TCP/IP connection to a remote D-Bus daemon
+
+  ## Configuration
+
+  You can configure the system bus address in your application's config:
+
+      config :rebus, :system_bus_address, "unix:path=/run/dbus/system_bus_socket"
+
+  ## Architecture
+
+  When you connect to a D-Bus bus using `connect/2`, Bluez.Rebus creates a supervised
+  connection process that handles the low-level protocol details. The connection
+  manages authentication, message serialization/deserialization, and maintains
+  the persistent connection to the bus.
+
+  ## Error Handling
+
+  All functions return standard Elixir `{:ok, result}` or `{:error, reason}` tuples.
+  Connection failures, authentication errors, and protocol violations are properly
+  propagated as error tuples.
+
+  ## Examples
+
+      # Connect to session bus with default options
+      {:ok, conn} = Bluez.Rebus.connect(:session)
+
+      # Connect to a Unix domain socket
+      {:ok, conn} = Bluez.Rebus.connect(%{family: :local, path: "/tmp/dbus-socket"})
+
+  For more advanced usage, see the documentation for `Bluez.Rebus.Message` and other
+  modules in this package.
+  """
+
+  @type address :: :system | :session | :socket.sockaddr_in() | :socket.sockaddr_un()
+
+  @default_system_bus_address "unix:path=/run/dbus/system_bus_socket"
+
+  @doc """
+  Establishes a connection to a D-Bus message bus.
+
+  Creates a supervised connection process that handles D-Bus protocol communication.
+  The connection automatically handles authentication and maintains the persistent
+  connection to the specified D-Bus endpoint.
+
+  ## Parameters
+
+  - `address` - The D-Bus endpoint to connect to:
+    - `:system` - Connects to the system bus using the address specified in
+       application config (see below) or the `/run/dbus/system_bus_socket` by default.
+    - `:session` - Connects to the session bus using the address specified in
+       the `DBUS_SESSION_BUS_ADDRESS` environment variable.
+    - `%{family: :local, path: path}` - Unix domain socket connection to a local D-Bus daemon
+    - `%{family: :inet, addr: {ip, port}}` - TCP/IP connection to a remote D-Bus daemon
+
+  - `opts` - Optional keyword list of connection options:
+    - `:timeout` - Connection timeout in milliseconds (default: 5000)
+    - `:name` - Optional name for the connection process
+    - Additional options are passed to the underlying connection process
+
+  ## Return Values
+
+  - `{:ok, pid}` - Returns the PID of the connection process
+  - `{:error, reason}` - Connection failed due to the specified reason
+
+  ## Examples
+
+      # Connect to a custom Unix socket
+      {:ok, conn} = Bluez.Rebus.connect(%{family: :local, path: "/tmp/my-dbus"})
+
+      # Connect to a TCP endpoint
+      address = %{family: :inet, addr: {127, 0, 0, 1}, port: 12345}
+      {:ok, conn} = Bluez.Rebus.connect(address)
+
+  ## Notes
+
+  The returned PID is for the connection process, which is the main interface for
+  sending and receiving D-Bus messages.
+
+  """
+  @spec connect(address(), keyword()) :: DynamicSupervisor.on_start_child()
+  def connect(address, opts \\ [])
+
+  def connect(:system, opts) do
+    case Application.get_env(:rebus, :system_bus_address, @default_system_bus_address) do
+      nil ->
+        {:error, :no_system_bus_address}
+
+      "unix:path=" <> address ->
+        connect(%{family: :local, path: address}, opts)
+    end
+  end
+
+  def connect(:session, opts) do
+    case System.get_env("DBUS_SESSION_BUS_ADDRESS") do
+      nil ->
+        {:error, :no_session_bus_address}
+
+      "unix:path=" <> address ->
+        connect(%{family: :local, path: address}, opts)
+    end
+  end
+
+  def connect(%{family: family} = addr, opts) when family in [:inet, :local] do
+    args =
+      opts
+      |> Keyword.put(:addr, addr)
+
+    child_spec = {Bluez.Rebus.Connection, args}
+    DynamicSupervisor.start_child(Bluez.Rebus.ConnectionSupervisor, child_spec)
+  end
+
+  @doc """
+  Same as `connect/2`, but raises an exception on failure.
+  """
+  @spec connect!(address(), keyword()) :: pid()
+  def connect!(address, opts \\ []) do
+    case connect(address, opts) do
+      {:ok, pid} -> pid
+      {:error, reason} -> raise "Failed to connect to D-Bus: #{inspect(reason)}"
+    end
+  end
+
+  @doc """
+  Adds a signal handler to receive D-Bus signals on the connection.
+
+  Signal handlers receive all D-Bus signals that arrive on the connection.
+  Multiple signal handlers can be registered on the same connection, and each
+  will receive copies of all signals.
+
+  ## Parameters
+
+  - `conn` - The connection PID returned from `connect/2`
+
+  ## Return Values
+
+  - `reference()` - A unique reference that identifies this signal handler
+
+  ## Examples
+
+      {:ok, conn} = Bluez.Rebus.connect(%{family: :local, path: "/tmp/my-dbus"})
+      ref = Bluez.Rebus.add_signal_handler(conn)
+
+      # The calling process will now receive messages like:
+      # {^ref, %Bluez.Rebus.Message{type: :signal, ...}}
+
+  ## Signal Message Format
+
+  When a D-Bus signal is received, registered signal handlers will receive
+  a message in the format:
+
+      {^ref, %Bluez.Rebus.Message{
+        type: :signal,
+        header_fields: %{
+          path: "/path/to/object",
+          interface: "com.example.Interface",
+          member: "SignalName",
+          sender: "com.example.Service"
+        },
+        body: [signal_args...],
+        signature: "signal_signature"
+      }}
+
+  ## Notes
+
+  Signal handlers should be prepared to handle a potentially high volume of
+  messages depending on the activity on the D-Bus. Consider using selective
+  receive or GenServer message handling for robust signal processing.
+
+  Remember to call `remove_signal_handler/2` when you no longer need to
+  receive signals to avoid message queue buildup.
+
+  Signal handlers are automatically cleaned up when the connection is closed
+  or when the handler exits.
+  """
+  defdelegate add_signal_handler(conn), to: Bluez.Rebus.Connection
+
+  @doc """
+  Removes a previously registered signal handler from the connection.
+
+  Stops the specified signal handler from receiving future D-Bus signals.
+  The handler is identified by the reference returned from `add_signal_handler/1`.
+
+  ## Parameters
+
+  - `conn` - The connection PID returned from `connect/2`
+  - `ref` - The reference returned from `add_signal_handler/1`
+
+  ## Return Values
+
+  - `:ok` - The signal handler was successfully removed
+
+  ## Examples
+
+      {:ok, conn} = Bluez.Rebus.connect(%{family: :local, path: "/tmp/my-dbus"})
+      ref = Bluez.Rebus.add_signal_handler(conn)
+
+      # ... handle signals ...
+
+      # Remove the handler when done
+      :ok = Bluez.Rebus.delete_signal_handler(conn, ref)
+
+  ## Notes
+
+  After deleting a signal handler, the calling process will no longer receive
+  signal messages for that handler. Other signal handlers on the same connection
+  (if any) will continue to receive signals normally.
+
+  It's safe to call this function multiple times with the same reference -
+  subsequent calls will simply return `:ok` without error.
+  """
+  defdelegate delete_signal_handler(conn, ref), to: Bluez.Rebus.Connection
+
+  # ── Service-side API (fork addition: bbangert/rebus, branch dbus-service) ──
+  #
+  # Upstream rebus is a pure client. These let a process act as a D-Bus
+  # *service* — receive inbound method calls and reply — which is required to
+  # export objects (e.g. an org.bluez AdvertisementMonitor for passive BLE
+  # scanning).
+
+  @doc """
+  Register `handler` to receive inbound method calls on `conn` as
+  `{:dbus_call, %Bluez.Rebus.Message{type: :method_call}}` messages. The handler
+  replies with `reply/4` or `reply_error/4`.
+  """
+  defdelegate set_method_handler(conn, handler), to: Bluez.Rebus.Connection
+
+  @doc """
+  Reply to an inbound method call `request` with a `:method_return`. `body` is
+  the reply arguments (default none); pass `signature` when the body is
+  non-empty (e.g. `"a{sv}"`).
+  """
+  @spec reply(pid(), Bluez.Rebus.Message.t(), [term()], String.t() | nil) ::
+          :ok | {:error, term()}
+  def reply(conn, %Bluez.Rebus.Message{} = request, body \\ [], signature \\ nil) do
+    if no_reply_expected?(request) do
+      # The caller flagged the method call NO_REPLY_EXPECTED (e.g. org.bluez
+      # AdvertisementMonitor1.DeviceFound). Sending a method_return anyway is an
+      # unsolicited reply the bus policy rejects ("Rejected send message ...
+      # requested_reply=0"), so skip it.
+      :ok
+    else
+      opts = [
+        reply_serial: request.serial,
+        destination: request.header_fields[:sender],
+        body: body,
+        flags: [:no_reply_expected]
+      ]
+
+      opts = if signature, do: Keyword.put(opts, :signature, signature), else: opts
+      Bluez.Rebus.Connection.send(conn, Bluez.Rebus.Message.new!(:method_return, opts))
+    end
+  end
+
+  @doc """
+  Reply to an inbound method call `request` with a D-Bus error
+  (e.g. `"org.freedesktop.DBus.Error.UnknownMethod"`).
+  """
+  @spec reply_error(pid(), Bluez.Rebus.Message.t(), String.t(), String.t()) ::
+          :ok | {:error, term()}
+  def reply_error(conn, %Bluez.Rebus.Message{} = request, error_name, message) do
+    if no_reply_expected?(request) do
+      :ok
+    else
+      Bluez.Rebus.Connection.send(
+        conn,
+        Bluez.Rebus.Message.new!(:error,
+          error_name: error_name,
+          reply_serial: request.serial,
+          destination: request.header_fields[:sender],
+          body: [message],
+          signature: "s",
+          flags: [:no_reply_expected]
+        )
+      )
+    end
+  end
+
+  defp no_reply_expected?(%Bluez.Rebus.Message{flags: flags}) do
+    is_list(flags) and :no_reply_expected in flags
+  end
+
+  @doc """
+  Emit a D-Bus `:signal` on `conn`.
+
+  `opts` are forwarded to `Bluez.Rebus.Message.new!/2` and must include `:path`,
+  `:interface`, and `:member`. Pass `:body` and `:signature` when the signal
+  carries arguments, and an optional `:destination` to direct it at one peer.
+
+  Unlike `reply/4`, a signal is fire-and-forget: the transport skips the
+  pending-reply table, so there is nothing to await — this returns `:ok` as
+  soon as the frame is written. Used to push GATT notifications, e.g. a
+  `org.freedesktop.DBus.Properties.PropertiesChanged` on an exported
+  characteristic object.
+  """
+  @spec emit_signal(pid(), keyword()) :: :ok | {:error, term()}
+  def emit_signal(conn, opts) when is_pid(conn) and is_list(opts) do
+    Bluez.Rebus.Connection.send(conn, Bluez.Rebus.Message.new!(:signal, opts))
+  end
+end

@@ -15,8 +15,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true
       - uses: erlef/setup-beam@v1
         with:
           otp-version: ${{ env.OTP_VERSION }}
@@ -37,8 +35,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true
       - uses: erlef/setup-beam@v1
         with:
           otp-version: ${{ env.OTP_VERSION }}
@@ -51,13 +47,10 @@ jobs:
           key: mix-dev-${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock') }}
         env:
           MIX_ENV: dev
-      # PLT cache must key on the vendored rebus SOURCES, not just mix.lock —
-      # a path dep changes without the lock moving (the vendored-dep PLT
-      # gotcha).
       - uses: actions/cache@v4
         with:
           path: priv/plts
-          key: plt-${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock', 'deps_local/**/*.ex', '.gitmodules') }}
+          key: plt-${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock') }}
           restore-keys: plt-${{ env.ELIXIR_VERSION }}-
       - run: mix deps.get
       - run: mix dialyzer

@@ -25,3 +25,6 @@ bluez-*.tar
 
 # Dialyzer PLTs
 /priv/plts/
+
+# hex.build output
+/*.tar

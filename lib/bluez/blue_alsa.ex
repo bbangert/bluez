@@ -101,14 +101,14 @@ defmodule Bluez.BlueAlsa do
 
   @impl GenServer
   def init(opts) do
-    case Rebus.connect(:system) do
+    case Bluez.Rebus.connect(:system) do
       {:ok, conn} ->
         conn_ref = Process.monitor(conn)
         # Watch org.bluealsa's ObjectManager so we learn the instant a PCM
         # object is added/removed (headset (dis)connect). The match is on the
         # bus daemon, so it installs even before bluealsad owns the name;
         # signals start flowing once it emits them.
-        sig_ref = Rebus.add_signal_handler(conn)
+        sig_ref = Bluez.Rebus.add_signal_handler(conn)
 
         DBus.add_match(
           conn,
@@ -146,7 +146,7 @@ defmodule Bluez.BlueAlsa do
   # org.bluealsa ObjectManager change means re-checking the PCM set is due;
   # the downstream re-enumeration is cheap and debounced.
   def handle_info(
-        {ref, %Rebus.Message{type: :signal, header_fields: %{member: member}}},
+        {ref, %Bluez.Rebus.Message{type: :signal, header_fields: %{member: member}}},
         %{sig_ref: ref} = state
       )
       when member in ["InterfacesAdded", "InterfacesRemoved"] do

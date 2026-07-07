@@ -146,9 +146,9 @@ defmodule Bluez.Agent do
 
   @impl GenServer
   def init(_opts) do
-    case Rebus.connect(:system) do
+    case Bluez.Rebus.connect(:system) do
       {:ok, conn} ->
-        Rebus.set_method_handler(conn, self())
+        Bluez.Rebus.set_method_handler(conn, self())
         conn_ref = Process.monitor(conn)
 
         state = %{conn: conn, conn_ref: conn_ref, expected: %{}}
@@ -202,7 +202,7 @@ defmodule Bluez.Agent do
   end
 
   # Inbound method calls from bluetoothd into our exported agent object.
-  def handle_info({:dbus_call, %Rebus.Message{} = msg}, state) do
+  def handle_info({:dbus_call, %Bluez.Rebus.Message{} = msg}, state) do
     dispatch_method_call(msg, state)
     {:noreply, state}
   end
@@ -258,25 +258,25 @@ defmodule Bluez.Agent do
 
   # ── inbound method-call dispatch ──────────────────────────────────────────
 
-  defp dispatch_method_call(%Rebus.Message{header_fields: hf} = msg, state) do
+  defp dispatch_method_call(%Bluez.Rebus.Message{header_fields: hf} = msg, state) do
     conn = state.conn
 
     case hf[:interface] do
       @agent_iface ->
         case decide(hf[:member], msg.body, state.expected) do
           :ack ->
-            Rebus.reply(conn, msg)
+            Bluez.Rebus.reply(conn, msg)
 
           {:reject, error_name} ->
             Logger.info("Bluez.Agent: rejected #{hf[:member]} #{inspect(msg.body)}")
-            Rebus.reply_error(conn, msg, error_name, hf[:member])
+            Bluez.Rebus.reply_error(conn, msg, error_name, hf[:member])
 
           :unknown ->
             unknown_method(conn, msg, hf)
         end
 
       @introspect_iface ->
-        Rebus.reply(conn, msg, [introspect_xml(hf[:path])], "s")
+        Bluez.Rebus.reply(conn, msg, [introspect_xml(hf[:path])], "s")
 
       _other ->
         unknown_method(conn, msg, hf)
@@ -286,7 +286,7 @@ defmodule Bluez.Agent do
       Logger.warning("Bluez.Agent: inbound call handling raised #{inspect(e)}")
       # Always answer a reply-expecting call so bluetoothd doesn't block on
       # its timeout; reply_error/4 no-ops for NO_REPLY_EXPECTED notifications.
-      Rebus.reply_error(
+      Bluez.Rebus.reply_error(
         state.conn,
         msg,
         "org.freedesktop.DBus.Error.Failed",
@@ -295,7 +295,7 @@ defmodule Bluez.Agent do
   end
 
   defp unknown_method(conn, msg, hf) do
-    Rebus.reply_error(
+    Bluez.Rebus.reply_error(
       conn,
       msg,
       "org.freedesktop.DBus.Error.UnknownMethod",

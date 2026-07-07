@@ -23,5 +23,7 @@ Pis.
 - Host seams throughout: `on_advertisement:`, `on_gatt_event:`,
   `on_connections_changed:`, `pubsub:`, `desired_adapter:`, `audio:`,
   daemon binary paths, `extra_children:`.
-- D-Bus layer on a vendored [rebus](https://github.com/ausimian/rebus)
-  fork (service-side API), pinned as a git submodule.
+- D-Bus layer: a vendored, namespaced copy of
+  [rebus](https://github.com/ausimian/rebus) (`Bluez.Rebus.*`, MIT) with
+  the service-side API proposed upstream in ausimian/rebus#9 — no
+  path/git deps, so the package is hex-publishable.

@@ -22,7 +22,7 @@ defmodule Bluez.Client do
 
   Flow:
 
-    1. `Rebus.connect(:system)`, `set_method_handler(self())`, monitor the
+    1. `Bluez.Rebus.connect(:system)`, `set_method_handler(self())`, monitor the
        connection, and install bus match rules for org.bluez device signals.
     2. Power the adapter on, then engage `configured_mode/0`: either
        `AdvertisementMonitorManager1.RegisterMonitor` our root object (BlueZ
@@ -203,13 +203,13 @@ defmodule Bluez.Client do
     # test-only injection seams (host has no system D-Bus). Production
     # callers pass `on_advertisement:` (per-advert fan-out fun) and
     # `pubsub:` (adapter-change broadcasts).
-    connect_fun = Keyword.get(opts, :connect_fun, fn -> Rebus.connect(:system) end)
+    connect_fun = Keyword.get(opts, :connect_fun, fn -> Bluez.Rebus.connect(:system) end)
 
     case connect_fun.() do
       {:ok, conn} ->
-        ref = Rebus.add_signal_handler(conn)
+        ref = Bluez.Rebus.add_signal_handler(conn)
         # Receive inbound method calls (BlueZ → our monitor object) too.
-        Rebus.set_method_handler(conn, self())
+        Bluez.Rebus.set_method_handler(conn, self())
         # Restart (and reconnect) if the connection dies.
         conn_ref = Process.monitor(conn)
 
@@ -338,12 +338,12 @@ defmodule Bluez.Client do
   def handle_info({:setup_retry, retries}, state), do: attempt_setup(state, retries)
 
   # org.bluez device signals arrive as {handler_ref, %Message{type: :signal}}.
-  def handle_info({ref, %Rebus.Message{type: :signal} = msg}, %{sig_ref: ref} = state) do
+  def handle_info({ref, %Bluez.Rebus.Message{type: :signal} = msg}, %{sig_ref: ref} = state) do
     {:noreply, handle_signal(msg, state)}
   end
 
   # Inbound method calls from BlueZ into our exported monitor/ObjectManager.
-  def handle_info({:dbus_call, %Rebus.Message{} = msg}, state) do
+  def handle_info({:dbus_call, %Bluez.Rebus.Message{} = msg}, state) do
     dispatch_method_call(msg, state)
     {:noreply, state}
   end
@@ -620,7 +620,7 @@ defmodule Bluez.Client do
 
   defp register_monitor(conn) do
     msg =
-      Rebus.Message.new!(:method_call,
+      Bluez.Rebus.Message.new!(:method_call,
         destination: @bluez,
         path: adapter_path(),
         interface: @advmon_mgr_iface,
@@ -630,8 +630,8 @@ defmodule Bluez.Client do
       )
 
     case GenServer.call(conn, {:send, msg}, @register_timeout_ms) do
-      %Rebus.Message{type: :method_return} -> :ok
-      %Rebus.Message{type: :error, header_fields: hf} -> {:error, hf[:error_name]}
+      %Bluez.Rebus.Message{type: :method_return} -> :ok
+      %Bluez.Rebus.Message{type: :error, header_fields: hf} -> {:error, hf[:error_name]}
     end
   rescue
     e -> {:error, e}
@@ -642,38 +642,41 @@ defmodule Bluez.Client do
 
   # ── inbound method-call dispatch (we are the service BlueZ calls) ────────
 
-  defp dispatch_method_call(%Rebus.Message{header_fields: hf} = msg, state) do
+  defp dispatch_method_call(%Bluez.Rebus.Message{header_fields: hf} = msg, state) do
     conn = state.conn
 
     case {hf[:interface], hf[:member]} do
       {@om_iface, "GetManagedObjects"} ->
-        Rebus.reply(conn, msg, [managed_objects()], "a{oa{sa{sv}}}")
+        Bluez.Rebus.reply(conn, msg, [managed_objects()], "a{oa{sa{sv}}}")
 
       {@props_iface, "GetAll"} ->
-        Rebus.reply(conn, msg, [monitor_props()], "a{sv}")
+        Bluez.Rebus.reply(conn, msg, [monitor_props()], "a{sv}")
 
       {@props_iface, "Get"} ->
         prop = msg.body |> Enum.at(1)
 
         case List.keyfind(monitor_props(), prop, 0) do
-          {_p, variant} -> Rebus.reply(conn, msg, [variant], "v")
-          nil -> Rebus.reply_error(conn, msg, "org.freedesktop.DBus.Error.UnknownProperty", prop)
+          {_p, variant} ->
+            Bluez.Rebus.reply(conn, msg, [variant], "v")
+
+          nil ->
+            Bluez.Rebus.reply_error(conn, msg, "org.freedesktop.DBus.Error.UnknownProperty", prop)
         end
 
       {@advmon_iface, "Activate"} ->
         Logger.info("Bluez.Client: AdvertisementMonitor activated (passive scanning)")
-        Rebus.reply(conn, msg)
+        Bluez.Rebus.reply(conn, msg)
 
       {@advmon_iface, member} when member in ["Release", "DeviceFound", "DeviceLost"] ->
         # We learn device data from InterfacesAdded/PropertiesChanged, so these
         # are just acknowledged.
-        Rebus.reply(conn, msg)
+        Bluez.Rebus.reply(conn, msg)
 
       {@introspect_iface, "Introspect"} ->
-        Rebus.reply(conn, msg, [introspect_xml(hf[:path])], "s")
+        Bluez.Rebus.reply(conn, msg, [introspect_xml(hf[:path])], "s")
 
       {iface, member} ->
-        Rebus.reply_error(
+        Bluez.Rebus.reply_error(
           conn,
           msg,
           "org.freedesktop.DBus.Error.UnknownMethod",
@@ -685,7 +688,7 @@ defmodule Bluez.Client do
       Logger.warning("Bluez.Client: inbound call handling raised #{inspect(e)}")
       # Always answer a reply-expecting call so BlueZ doesn't block until its
       # timeout; reply_error/4 no-ops for NO_REPLY_EXPECTED notifications.
-      Rebus.reply_error(
+      Bluez.Rebus.reply_error(
         state.conn,
         msg,
         "org.freedesktop.DBus.Error.Failed",
@@ -723,7 +726,7 @@ defmodule Bluez.Client do
   # ── org.bluez device signal handling (advert source) ────────────────────
 
   defp handle_signal(
-         %Rebus.Message{header_fields: %{member: "InterfacesAdded"}, body: body},
+         %Bluez.Rebus.Message{header_fields: %{member: "InterfacesAdded"}, body: body},
          state
        ) do
     [path, interfaces] = body
@@ -759,7 +762,10 @@ defmodule Bluez.Client do
   end
 
   defp handle_signal(
-         %Rebus.Message{header_fields: %{member: "PropertiesChanged", path: path}, body: body},
+         %Bluez.Rebus.Message{
+           header_fields: %{member: "PropertiesChanged", path: path},
+           body: body
+         },
          state
        ) do
     [iface, changed, _invalidated] = body
@@ -776,7 +782,7 @@ defmodule Bluez.Client do
   end
 
   defp handle_signal(
-         %Rebus.Message{header_fields: %{member: "InterfacesRemoved"}, body: body},
+         %Bluez.Rebus.Message{header_fields: %{member: "InterfacesRemoved"}, body: body},
          state
        ) do
     case body do

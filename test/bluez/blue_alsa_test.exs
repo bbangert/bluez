@@ -3,10 +3,10 @@ defmodule Bluez.BlueAlsaTest do
   Host tests for `Bluez.BlueAlsa`'s pure/observable behavior.
 
   The GenServer itself can't be started here — `init/1` calls
-  `Rebus.connect(:system)`, and there's no system bus on the host (it's part of
+  `Bluez.Rebus.connect(:system)`, and there's no system bus on the host (it's part of
   the BT subtree, compile-gated off). So we exercise the signal→PubSub mapping
   by calling `handle_info/2` directly with a constructed state + message, which
-  is exactly what the live process would receive from `Rebus.add_signal_handler`.
+  is exactly what the live process would receive from `Bluez.Rebus.add_signal_handler`.
   """
   use ExUnit.Case, async: true
 
@@ -22,7 +22,7 @@ defmodule Bluez.BlueAlsaTest do
   end
 
   defp signal(member) do
-    %Rebus.Message{
+    %Bluez.Rebus.Message{
       type: :signal,
       header_fields: %{member: member},
       body: [],

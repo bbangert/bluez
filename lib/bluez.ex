@@ -137,6 +137,14 @@ defmodule Bluez do
   @spec children(keyword()) :: [Supervisor.child_spec() | {module(), term()} | module()]
   def children(opts) do
     [
+      # Vendored rebus runtime (see lib/bluez/rebus/VENDORED.md): the
+      # gen_event signal router and the DynamicSupervisor every bus
+      # connection runs under. First so all clients below can connect, and
+      # so a fault here rebuilds the whole stack (every connection rides
+      # on these two).
+      {Bluez.Rebus.SignalHandler, []},
+      {DynamicSupervisor, strategy: :one_for_one, name: Bluez.Rebus.ConnectionSupervisor},
+
       # System bus. --nofork so MuonTrap's port owns the process; --nopidfile
       # because /var/run may be read-only and we don't read a pidfile anyway.
       # The daemons are all MuonTrap.Daemon, so each needs a distinct child

@@ -21,7 +21,7 @@ defmodule Bluez.DBus do
   @bluez "org.bluez"
   @om_iface "org.freedesktop.DBus.ObjectManager"
 
-  # Rebus.Connection.send/2 uses GenServer.call's 5s default; keep parity.
+  # Bluez.Rebus.Connection.send/2 uses GenServer.call's 5s default; keep parity.
   @default_timeout 5_000
 
   @doc """
@@ -73,13 +73,13 @@ defmodule Bluez.DBus do
     ]
 
     opts = if signature == "", do: opts, else: Keyword.put(opts, :signature, signature)
-    msg = Rebus.Message.new!(:method_call, opts)
+    msg = Bluez.Rebus.Message.new!(:method_call, opts)
 
     case GenServer.call(conn, {:send, msg}, timeout) do
-      %Rebus.Message{type: :method_return, body: reply_body} ->
+      %Bluez.Rebus.Message{type: :method_return, body: reply_body} ->
         {:ok, reply_body}
 
-      %Rebus.Message{type: :error, header_fields: hf, body: eb} ->
+      %Bluez.Rebus.Message{type: :error, header_fields: hf, body: eb} ->
         Logger.warning("Bluez.DBus: #{member} error #{inspect(hf[:error_name])} #{inspect(eb)}")
         {:error, hf[:error_name]}
     end
@@ -99,9 +99,9 @@ defmodule Bluez.DBus do
   """
   @spec add_match(pid(), String.t()) :: term()
   def add_match(conn, rule) do
-    Rebus.Connection.send(
+    Bluez.Rebus.Connection.send(
       conn,
-      Rebus.Message.new!(:method_call,
+      Bluez.Rebus.Message.new!(:method_call,
         destination: "org.freedesktop.DBus",
         path: "/org/freedesktop/DBus",
         interface: "org.freedesktop.DBus",

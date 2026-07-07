@@ -71,23 +71,24 @@ The core modules carry the reference detail:
   `start_link/1` opts (funs, a PubSub, child specs); no
   `Application.get_env`, no callbacks into named host modules.
 
-## Installation (git, for now)
+## Installation
 
-Not yet on hex — the D-Bus layer uses a vendored
-[rebus](https://github.com/ausimian/rebus) fork
-([bbangert/rebus @ `dbus-service`](https://github.com/bbangert/rebus/tree/dbus-service))
-that adds the service-side API (exported objects, replies, signals) this
-library needs for passive scanning. It's pinned as a git submodule, so
-clone with:
-
-```sh
-git clone --recurse-submodules https://github.com/bbangert/bluez.git
-# or, after a plain clone:
-git submodule update --init
+```elixir
+def deps do
+  [
+    {:bluez, "~> 0.1"}
+  ]
+end
 ```
 
-Then take it as a path or git dependency. Hex publication follows once the
-rebus fork is reconciled upstream.
+A note on the D-Bus layer: exporting objects (which BlueZ's passive
+scanning requires) needs a service-side API that isn't in any released
+D-Bus client, so this library ships a vendored, **namespaced** copy of
+[rebus](https://github.com/ausimian/rebus) as `Bluez.Rebus.*` (MIT, with
+the service-side additions proposed upstream in
+[ausimian/rebus#9](https://github.com/ausimian/rebus/pull/9) — see
+`lib/bluez/rebus/VENDORED.md`). The namespacing means this can never
+collide with a rebus dependency of your own.
 
 ## Usage
 

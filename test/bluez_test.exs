@@ -21,6 +21,8 @@ defmodule BluezTest do
       ids = Bluez.children(extra_children: extra) |> Enum.map(&id_of/1)
 
       assert ids == [
+               Bluez.Rebus.SignalHandler,
+               DynamicSupervisor,
                :dbus_daemon,
                Bluez.BusReady,
                :bluetoothd,
@@ -81,6 +83,8 @@ defmodule BluezTest do
       ids = Bluez.children([]) |> Enum.map(&id_of/1)
 
       assert ids == [
+               Bluez.Rebus.SignalHandler,
+               DynamicSupervisor,
                :dbus_daemon,
                Bluez.BusReady,
                :bluetoothd,

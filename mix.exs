@@ -36,10 +36,11 @@ defmodule Bluez.MixProject do
 
   defp deps do
     [
-      # Vendored fork (bbangert/rebus @ dbus-service) until the service-side
-      # API lands upstream — pins the exact commit, keeps the lib
-      # self-contained. Swapped for hex rebus before `mix hex.publish`.
-      {:rebus, path: "deps_local/rebus"},
+      # NOTE: the D-Bus client is VENDORED (lib/bluez/rebus/, namespaced
+      # Bluez.Rebus) rather than a dep — hex refuses path/git deps and the
+      # service-side API isn't upstream yet (ausimian/rebus#9). typedstruct
+      # is the vendored code's compile-time macro dep.
+      {:typedstruct, "~> 0.5", runtime: false},
       {:muontrap, "~> 1.8"},
       {:phoenix_pubsub, "~> 2.1", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
@@ -73,6 +74,13 @@ defmodule Bluez.MixProject do
       ],
       groups_for_modules: [
         Supervision: [Bluez, Bluez.BusReady],
+        "Vendored D-Bus client": [
+          Bluez.Rebus,
+          Bluez.Rebus.Connection,
+          Bluez.Rebus.Message,
+          Bluez.Rebus.Encoder,
+          Bluez.Rebus.Decoder
+        ],
         Scanning: [Bluez.Client, Bluez.DeviceCache, Bluez.Advert],
         GATT: [
           Bluez.Gatt,
