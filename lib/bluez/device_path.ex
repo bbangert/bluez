@@ -52,8 +52,8 @@ defmodule Bluez.DevicePath do
   @doc """
   The `:persistent_term` key holding the user-selected radio MAC
   (`"AA:BB:CC:DD:EE:FF"` | `nil` = auto). Written by the host before
-  each subtree start (or via the `desired_adapter:` opt); read by
-  `Bluez.Client.desired_adapter/0` during setup.
+  each subtree start (or via the `desired_adapter:` opt); read via
+  `desired_adapter/0` during `Bluez.Client` setup.
   """
   @spec desired_adapter_key() :: tuple()
   def desired_adapter_key, do: @desired_adapter_key

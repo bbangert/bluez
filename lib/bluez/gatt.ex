@@ -168,41 +168,117 @@ defmodule Bluez.Gatt do
 
   # ── adapter-facing API (cast-style, results go to the subscriber pid) ────
 
+  @doc """
+  Open a BLE connection to `address` and capture `subscriber` as the pid
+  all of this connection's events route to (via the `on_gatt_event:` fun).
+
+  Cast-style: returns `:ok` immediately. The outcome arrives as
+  `{:gatt_connection, address, {:ok, mtu} | {:error, code}}` — deferred
+  until BlueZ has resolved services, so every handle-keyed request below
+  is valid the moment the success event lands. `opts` are accepted for
+  host-side compatibility and currently unused.
+
+  Refused (with an error event) when `address` is not a 48-bit MAC or all
+  `max_connections/0` slots are taken.
+  """
   @spec connect(address(), keyword(), pid()) :: :ok
   def connect(address, opts, subscriber),
     do: GenServer.cast(__MODULE__, {:connect, address, opts, subscriber})
 
+  @doc """
+  Tear down `address`'s connection. Requested disconnects emit no
+  follow-up event (the entry is dropped before BlueZ reports the link
+  down); unknown addresses are a no-op.
+  """
   @spec disconnect(address()) :: :ok
   def disconnect(address), do: GenServer.cast(__MODULE__, {:disconnect, address})
 
+  @doc """
+  Stream the connected device's GATT database to the subscriber: one
+  `{:gatt_service, address, %Bluez.Gatt.Service{}}` per service, then
+  `{:gatt_services_done, address}`. On a not-ready link the failure is
+  reported as `{:gatt_read, address, 0, {:error, -2}}` (the ESPHome
+  convention for a failed service listing).
+  """
   @spec get_services(address()) :: :ok
   def get_services(address), do: GenServer.cast(__MODULE__, {:get_services, address})
 
+  @doc """
+  Read the characteristic at `handle` (a *value* handle, as reported in
+  the service stream). Result: `{:gatt_read, address, handle, {:ok,
+  binary} | {:error, code}}`. Falls back to a descriptor read when the
+  handle names a descriptor.
+  """
   @spec read(address(), non_neg_integer()) :: :ok
   def read(address, handle), do: GenServer.cast(__MODULE__, {:read, address, handle})
 
+  @doc """
+  Write `data` to the characteristic at `handle`. `response?` selects
+  Write-With-Response (`true`) vs Write-Without-Response. Result:
+  `{:gatt_write, address, handle, {:ok, :done} | {:error, code}}`.
+  Writes larger than the 512-byte ATT attribute limit are refused
+  up front.
+  """
   @spec write(address(), non_neg_integer(), binary(), boolean()) :: :ok
   def write(address, handle, data, response?),
     do: GenServer.cast(__MODULE__, {:write, address, handle, data, response?})
 
+  @doc """
+  Read the descriptor at `handle`. Same result envelope as `read/2`
+  (`{:gatt_read, ...}`); falls back to a characteristic read when the
+  handle names one.
+  """
   @spec read_descriptor(address(), non_neg_integer()) :: :ok
   def read_descriptor(address, handle),
     do: GenServer.cast(__MODULE__, {:read_descriptor, address, handle})
 
+  @doc """
+  Write `data` to the descriptor at `handle` (always Write-With-Response).
+  Same result envelope as `write/4` (`{:gatt_write, ...}`).
+  """
   @spec write_descriptor(address(), non_neg_integer(), binary()) :: :ok
   def write_descriptor(address, handle, data),
     do: GenServer.cast(__MODULE__, {:write_descriptor, address, handle, data})
 
+  @doc """
+  Start (`enable?: true`) or stop notifications/indications on the
+  characteristic at `handle`. The call result arrives as
+  `{:gatt_notify, address, handle, {:ok, :done} | {:error, code}}`;
+  subsequent values arrive as `{:gatt_notify_data, address, handle,
+  binary}`. The value route is registered before StartNotify returns so
+  no early notification can be lost.
+  """
   @spec notify(address(), non_neg_integer(), boolean()) :: :ok
   def notify(address, handle, enable?),
     do: GenServer.cast(__MODULE__, {:notify, address, handle, enable?})
 
+  @doc """
+  Bond with the connected device (`Device1.Pair()`), with IO negotiated
+  through `Bluez.Agent` — only pairings initiated here are authorized.
+  Result: `{:gatt_pair, address, success? :: boolean(), code}`. A failed
+  pairing can drop the link (hardware-observed), in which case a
+  `{:gatt_connection, address, {:error, _}}` teardown event follows.
+  """
   @spec pair(address()) :: :ok
   def pair(address), do: GenServer.cast(__MODULE__, {:pair, address})
 
+  @doc """
+  Remove the device's bond via `Adapter1.RemoveDevice` — BlueZ's only
+  bond-removal API, which also destroys the device object and any live
+  link. Result: `{:gatt_unpair, address, success?, code}`, followed by a
+  `{:gatt_connection, address, {:error, -2}}` teardown event when a
+  connection was up.
+  """
   @spec unpair(address()) :: :ok
   def unpair(address), do: GenServer.cast(__MODULE__, {:unpair, address})
 
+  @doc """
+  Drop BlueZ's cached GATT database for the device. Same underlying
+  operation as `unpair/1` (`RemoveDevice` is the only D-Bus API for it —
+  the bond, if any, goes too; same observable semantics as ESP32's
+  `esp_ble_remove_bond_device`), differing only in the reply envelope:
+  `{:gatt_clear_cache, address, success?, code}`.
+  """
   @spec clear_cache(address()) :: :ok
   def clear_cache(address), do: GenServer.cast(__MODULE__, {:clear_cache, address})
 

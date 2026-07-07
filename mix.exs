@@ -50,15 +50,39 @@ defmodule Bluez.MixProject do
   defp package do
     [
       licenses: ["Apache-2.0"],
-      links: %{"GitHub" => @source_url}
+      links: %{"GitHub" => @source_url},
+      files: ~w(lib guides .formatter.exs mix.exs README.md CHANGELOG.md LICENSE)
     ]
   end
 
   defp docs do
     [
-      main: "Bluez",
-      extras: ["README.md"],
-      source_ref: "v#{@version}"
+      main: "readme",
+      source_url: @source_url,
+      source_ref: "v#{@version}",
+      extras: [
+        "README.md",
+        "CHANGELOG.md",
+        "guides/architecture.md",
+        "guides/host_integration.md"
+      ],
+      groups_for_extras: [
+        Guides: ~r"guides/.*"
+      ],
+      groups_for_modules: [
+        Supervision: [Bluez, Bluez.BusReady],
+        Scanning: [Bluez.Client, Bluez.DeviceCache, Bluez.Advert],
+        GATT: [
+          Bluez.Gatt,
+          Bluez.GattTree,
+          Bluez.Gatt.Service,
+          Bluez.Gatt.Characteristic,
+          Bluez.Gatt.Descriptor
+        ],
+        Pairing: [Bluez.Agent],
+        Audio: [Bluez.BlueAlsa],
+        "D-Bus plumbing": [Bluez.DBus, Bluez.DevicePath, Bluez.Variant]
+      ]
     ]
   end
 end

@@ -27,9 +27,11 @@ defmodule Bluez.DeviceCache do
   @type t :: %__MODULE__{devices: %{optional(String.t()) => map()}}
   defstruct devices: %{}
 
+  @doc "An empty cache."
   @spec new() :: t()
   def new, do: %__MODULE__{}
 
+  @doc "Number of device entries currently cached."
   @spec size(t()) :: non_neg_integer()
   def size(%__MODULE__{devices: devices}), do: map_size(devices)
 
@@ -62,6 +64,7 @@ defmodule Bluez.DeviceCache do
     {%{cache | devices: devices}, adverts}
   end
 
+  @doc "Drop `path`'s entry (BlueZ emitted `InterfacesRemoved` for it)."
   @spec remove(t(), String.t()) :: t()
   def remove(%__MODULE__{} = cache, path), do: %{cache | devices: Map.delete(cache.devices, path)}
 

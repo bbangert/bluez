@@ -4,7 +4,7 @@ defmodule Bluez.DBus do
   `rebus` connection, used by `Bluez.Client` (passive
   scanning) and `Bluez.Gatt` (active connections).
 
-  `Rebus.Connection` correlates in-flight calls by serial and replies via
+  The rebus connection correlates in-flight calls by serial and replies via
   `GenServer.reply/2`, so concurrent calls on one connection don't
   serialize — a slow `Device1.Connect` does not block a `ReadValue` to
   another device. The timeout here is purely the caller's patience
