@@ -48,13 +48,16 @@ defmodule Bluez.Gatt do
 
   ## Connection lifecycle
 
-      connect cast ─→ Device1.Connect (Task) ─→ ServicesResolved? ──true──┐
-                                                   │false                 │
-                                                   └─ wait for signal ────┤
-                                                      (resolve timeout)   ▼
-                                       GetManagedObjects ─→ GattTree.build
-                                                   │
-                            {:gatt_connection, addr, {:ok, mtu}} ──→ host
+  ```mermaid
+  flowchart LR
+      connect["connect cast"] --> dev1["Device1.Connect (Task)"]
+      dev1 --> resolved{"ServicesResolved?"}
+      resolved -- true --> gmo["GetManagedObjects"]
+      resolved -- false --> wait["wait for signal<br/>(resolve timeout)"]
+      wait --> gmo
+      gmo --> tree["GattTree.build"]
+      tree --> host(["{:gatt_connection, addr, {:ok, mtu}} → host"])
+  ```
 
   The connection reply is deliberately deferred until BlueZ has resolved
   services: every subsequent GATT request is handle-keyed, and the

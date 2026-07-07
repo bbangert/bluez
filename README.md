@@ -32,6 +32,10 @@ Start here once you're ready to go beyond the quickstart below:
   cookbook: every `Bluez.start_link/1` option, the full GATT event
   contract with a translator example, audio PCM discovery, and the
   runtime radio-switching pattern.
+- [Nerves system guide](guides/nerves_system.md) — the customized Nerves
+  system this library requires: buildroot packages, the kernel fragment
+  (and its silent-`olddefconfig` gotcha), radio firmware blobs, and the
+  app-side rootfs overlay.
 
 The core modules carry the reference detail:
 
@@ -121,6 +125,10 @@ option surface and event contract.
 - Optional: bluez-alsa v4 for `audio: true`.
 - Writable `/run/dbus` and `/data/bluetooth`; on a read-only rootfs point
   `/var/lib/bluetooth` at `/data/bluetooth` with an overlay symlink.
+
+On Nerves none of this is in the official systems — see the
+[Nerves system guide](guides/nerves_system.md) for the full customization
+list (buildroot packages, kernel fragment, firmware blobs, overlay).
 
 ## License
 

@@ -12,6 +12,22 @@ dependency on the host.
 child depends on everything above it, and a restart at level *N* rebuilds
 levels *N+1..end* while leaving *1..N-1* untouched:
 
+```mermaid
+flowchart TB
+    sup[["Bluez (Supervisor, :rest_for_one)"]]
+    sup --> dbus["1 · dbus-daemon --system<br/>(MuonTrap.Daemon)"]
+    dbus --> gate["2 · Bluez.BusReady<br/>(socket gate)"]
+    gate --> btd["3 · bluetoothd -n -E<br/>(MuonTrap.Daemon)"]
+    btd --> client["4 · Bluez.Client<br/>(scanner)"]
+    client --> agent["5 · Bluez.Agent<br/>(pairing)"]
+    agent --> gatt["6 · Gatt Task.Supervisor + Bluez.Gatt"]
+    gatt --> alsa["7 · bluealsad + Bluez.BlueAlsa<br/>(audio: true only)"]
+    alsa --> extra["8 · extra_children:<br/>(host consumers)"]
+
+    style alsa stroke-dasharray: 5 5
+    style extra stroke-dasharray: 5 5
+```
+
 1. **`dbus-daemon --system`** (`MuonTrap.Daemon`) — owns the system bus.
    This library expects to *own* the bus: don't run it next to a distro
    dbus.
@@ -68,6 +84,21 @@ Two runtime-switchable modes, matching what ESPHome-style hosts expose:
   `StartDiscovery`. Collects SCAN_RSP data (device names), at the cost
   of radio traffic.
 
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> passive : setup engages configured mode
+    passive --> active : set_mode(:active)
+    active --> passive : set_mode(:passive)
+    passive --> off : suspend_scan()
+    active --> off : suspend_scan()
+    off --> passive : resume_scan()*
+    off --> active : resume_scan()*
+```
+
+*`resume_scan/0` re-engages whatever mode the host last configured —
+suspension never overwrites it.
+
 Mode transitions run in a `Task` (BlueZ calls back into our exported
 objects *before* `RegisterMonitor` returns, so the GenServer must stay
 free), are serialized with a one-slot pending queue (latest target
@@ -99,13 +130,16 @@ Whatever survives the gate is handed to your `on_advertisement:` fun.
 
 Connection lifecycle:
 
-    connect cast ─→ Device1.Connect (Task) ─→ ServicesResolved? ──true──┐
-                                                 │false                 │
-                                                 └─ wait for signal ────┤
-                                                    (resolve timeout)   ▼
-                                     GetManagedObjects ─→ GattTree.build
-                                                 │
-                          {:gatt_connection, addr, {:ok, mtu}} ──→ host
+```mermaid
+flowchart LR
+    connect["connect cast"] --> dev1["Device1.Connect (Task)"]
+    dev1 --> resolved{"ServicesResolved?"}
+    resolved -- true --> gmo["GetManagedObjects"]
+    resolved -- false --> wait["wait for signal<br/>(resolve timeout)"]
+    wait --> gmo
+    gmo --> tree["GattTree.build"]
+    tree --> host(["{:gatt_connection, addr, {:ok, mtu}} → host"])
+```
 
 The success event is deferred until BlueZ resolves services because
 every subsequent request is *handle*-keyed, and the handle ↔ object-path
@@ -176,7 +210,9 @@ up.
 
 `bluetoothd` persists adapter identity and link keys under
 `/var/lib/bluetooth`; on a read-only rootfs, point that at
-`/data/bluetooth` with an overlay symlink. `Bluez.prepare_runtime/0`
+`/data/bluetooth` with an overlay symlink (see the
+[Nerves system guide](nerves_system.md) for the full system
+customization list). `Bluez.prepare_runtime/0`
 (called from `init/1`) creates `/run/dbus` + `/data/bluetooth`, removes
 a stale bus socket left by a previous incarnation (socket existence must
 imply a listener — hardware-found), and writes a machine-id.
