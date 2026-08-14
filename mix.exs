@@ -41,7 +41,7 @@ defmodule Bluez.MixProject do
       # service-side API isn't upstream yet (ausimian/rebus#9). typedstruct
       # is the vendored code's compile-time macro dep.
       {:typedstruct, "~> 0.5", runtime: false},
-      {:muontrap, "~> 1.8"},
+      {:muontrap, "~> 1.8 or ~> 2.0"},
       {:phoenix_pubsub, "~> 2.1", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
