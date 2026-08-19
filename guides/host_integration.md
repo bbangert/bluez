@@ -65,7 +65,8 @@ The fun runs **in the Client's GenServer loop** — treat it like a
 over subscriber pids works well); never make blocking calls from it.
 
 Emission is already gated (first sighting / payload change / RSSI
-heartbeat — see `Bluez.DeviceCache`), so forward every invocation.
+heartbeat — see `Bluez.DeviceCache`; configurable via `Bluez.Client`'s
+`rssi_heartbeat_ms:` option with default 10 s), so forward every invocation.
 
 Scanner mode is runtime-switchable with `Bluez.Client.set_mode/1`
 (`:passive`/`:active`), persists across Client crashes, and can be

@@ -124,8 +124,10 @@ properties (`ManufacturerData`, `ServiceData`, `ServiceUUIDs`, `Name`,
 element order and Flags are not recoverable, but faithful for the
 manufacturer/service-data elements consumers key on), and
 `Bluez.DeviceCache` emit-gates the stream: forward on first sighting,
-on payload change, or on a heartbeat interval (RSSI freshness), with an
-LRU cap so MAC-randomizing devices can't grow the cache without bound.
+on payload change, or on a heartbeat interval (RSSI freshness,
+configurable via `Bluez.Client`'s `rssi_heartbeat_ms:` option with
+default 10 s), with an LRU cap so MAC-randomizing devices can't grow
+the cache without bound.
 Whatever survives the gate is handed to your `on_advertisement:` fun.
 
 ## GATT (`Bluez.Gatt`)

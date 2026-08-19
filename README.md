@@ -56,8 +56,9 @@ The core modules carry the reference detail:
   don't burn battery answering); active mode collects SCAN_RSP data.
 - **Advertisement reconstruction** — BlueZ only exposes parsed properties;
   they're re-serialized into AD byte structures, emit-gated (first
-  sighting / payload change / RSSI heartbeat) and LRU-capped, then fanned
-  out through your `on_advertisement:` fun.
+  sighting / payload change / RSSI heartbeat, configurable via
+  `Bluez.Client`'s `rssi_heartbeat_ms:` option with default 10 s) and
+  LRU-capped, then fanned out through your `on_advertisement:` fun.
 - **Handle-keyed GATT client** — connect / service discovery / read /
   write / notify / pair / unpair / clear-cache, with a documented,
   host-agnostic event contract delivered through your `on_gatt_event:`

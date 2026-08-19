@@ -72,6 +72,42 @@ defmodule Bluez.DeviceCacheTest do
     end
   end
 
+  describe "new/1 heartbeat option" do
+    test "default heartbeat: identical upsert suppressed at 5_000, re-emits at 10_000" do
+      cache = DeviceCache.new()
+
+      {cache, adverts} = DeviceCache.upsert(cache, "/dev/a", @props, 0)
+      assert [%{}] = adverts
+
+      {cache, adverts} = DeviceCache.upsert(cache, "/dev/a", @props, 5_000)
+      assert adverts == []
+
+      {_cache, adverts} = DeviceCache.upsert(cache, "/dev/a", @props, 10_000)
+      assert [%{}] = adverts
+    end
+
+    test "custom heartbeat_ms: 1_500: suppressed at 1_400, re-emits at 1_500" do
+      cache = DeviceCache.new(heartbeat_ms: 1_500)
+
+      {cache, adverts} = DeviceCache.upsert(cache, "/dev/a", @props, 0)
+      assert [%{}] = adverts
+
+      {cache, adverts} = DeviceCache.upsert(cache, "/dev/a", @props, 1_400)
+      assert adverts == []
+
+      {_cache, adverts} = DeviceCache.upsert(cache, "/dev/a", @props, 1_500)
+      assert [%{}] = adverts
+    end
+
+    test "raises ArgumentError for a non-positive heartbeat_ms" do
+      assert_raise ArgumentError, fn -> DeviceCache.new(heartbeat_ms: 0) end
+    end
+
+    test "raises ArgumentError for a non-integer heartbeat_ms" do
+      assert_raise ArgumentError, fn -> DeviceCache.new(heartbeat_ms: :fast) end
+    end
+  end
+
   describe "remove/2" do
     test "drops a device path" do
       {cache, _} = DeviceCache.upsert(DeviceCache.new(), "/dev/a", @props, 0)
