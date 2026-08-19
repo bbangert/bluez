@@ -13,6 +13,12 @@ defmodule Bluez.DeviceCache do
     * the heartbeat interval has elapsed (keeps RSSI/last-seen fresh in HA
       without forwarding every PDU).
 
+  The heartbeat is configurable per cache instance (`new/1`'s
+  `heartbeat_ms:` opt) because it's the only refresh some devices ever get:
+  a static-payload beacon (fixed iBeacon UUID/major/minor) changes no AD
+  bytes ever, so without the heartbeat its RSSI/last-seen would freeze at
+  first sight for as long as it keeps advertising.
+
   The map is capped at `@max_devices` (LRU by `last_seen`) so a device spraying
   randomized MACs — each a new BlueZ object path — can't grow it without bound
   (BlueZ's `InterfacesRemoved` is the only other prune and is outside our
@@ -22,14 +28,35 @@ defmodule Bluez.DeviceCache do
   alias Bluez.Advert
 
   @max_devices 512
-  @rssi_heartbeat_ms 10_000
+  @default_rssi_heartbeat_ms 10_000
 
-  @type t :: %__MODULE__{devices: %{optional(String.t()) => map()}}
-  defstruct devices: %{}
+  @type t :: %__MODULE__{
+          devices: %{optional(String.t()) => map()},
+          heartbeat_ms: pos_integer()
+        }
+  defstruct devices: %{}, heartbeat_ms: @default_rssi_heartbeat_ms
 
-  @doc "An empty cache."
-  @spec new() :: t()
-  def new, do: %__MODULE__{}
+  @doc "The default heartbeat interval (ms) used when `new/1` is called without `heartbeat_ms:`."
+  @spec default_heartbeat_ms() :: pos_integer()
+  def default_heartbeat_ms, do: @default_rssi_heartbeat_ms
+
+  @doc """
+  An empty cache. `heartbeat_ms:` (default `#{@default_rssi_heartbeat_ms}`)
+  sets how long an unchanged advert is suppressed before `upsert/4`
+  re-emits it anyway — see the moduledoc. Raises `ArgumentError` unless
+  it's a positive integer.
+  """
+  @spec new(keyword()) :: t()
+  def new(opts \\ []) do
+    heartbeat_ms = Keyword.get(opts, :heartbeat_ms, @default_rssi_heartbeat_ms)
+
+    unless is_integer(heartbeat_ms) and heartbeat_ms > 0 do
+      raise ArgumentError,
+            "heartbeat_ms must be a positive integer, got: #{inspect(heartbeat_ms)}"
+    end
+
+    %__MODULE__{heartbeat_ms: heartbeat_ms}
+  end
 
   @doc "Number of device entries currently cached."
   @spec size(t()) :: non_neg_integer()
@@ -49,7 +76,7 @@ defmodule Bluez.DeviceCache do
     {adverts, last_raw, last_emit} =
       case Advert.reconstruct(merged) do
         {:ok, advert} ->
-          if emit?(advert.raw_data, entry.last_raw, entry.last_emit, now_ms, @rssi_heartbeat_ms) do
+          if emit?(advert.raw_data, entry.last_raw, entry.last_emit, now_ms, cache.heartbeat_ms) do
             {[advert], advert.raw_data, now_ms}
           else
             {[], entry.last_raw, entry.last_emit}

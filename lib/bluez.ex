@@ -38,7 +38,10 @@ defmodule Bluez do
   `{Bluez, opts}`):
 
     * `client:` — keyword opts for `Bluez.Client` (`on_advertisement:`,
-      `pubsub:`).
+      `pubsub:`, `rssi_heartbeat_ms:` — how long an unchanged advert is
+      suppressed before it's re-emitted anyway; 1-2 s suits BLE-presence
+      integrations (e.g. Bermuda), the 10 s default suits plain sensor
+      relaying).
     * `gatt:` — keyword opts for `Bluez.Gatt` (`on_gatt_event:`,
       `on_connections_changed:`).
     * `audio:` — boolean (default `true`): start the `bluealsad` daemon +

@@ -201,8 +201,11 @@ defmodule Bluez.Client do
   def init(opts) do
     # `connect_fun` / `apply_mode_fun` / `watchdog_ms` / `setup` are
     # test-only injection seams (host has no system D-Bus). Production
-    # callers pass `on_advertisement:` (per-advert fan-out fun) and
-    # `pubsub:` (adapter-change broadcasts).
+    # callers pass `on_advertisement:` (per-advert fan-out fun),
+    # `pubsub:` (adapter-change broadcasts), and optionally
+    # `rssi_heartbeat_ms:` (DeviceCache re-emit interval for unchanged
+    # adverts — 1-2 s suits BLE-presence integrations like Bermuda, the
+    # 10 s default suits plain sensor relaying).
     connect_fun = Keyword.get(opts, :connect_fun, fn -> Bluez.Rebus.connect(:system) end)
 
     case connect_fun.() do
@@ -221,7 +224,11 @@ defmodule Bluez.Client do
           conn: conn,
           conn_ref: conn_ref,
           sig_ref: ref,
-          cache: DeviceCache.new(),
+          cache:
+            DeviceCache.new(
+              heartbeat_ms:
+                Keyword.get(opts, :rssi_heartbeat_ms, DeviceCache.default_heartbeat_ms())
+            ),
           # mode = last successfully applied mode; engaged = what BlueZ is
           # actually doing for us right now (:none until setup engages).
           mode: nil,

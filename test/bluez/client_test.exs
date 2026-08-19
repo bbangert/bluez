@@ -100,6 +100,16 @@ defmodule Bluez.ClientTest do
     assert :ok = GenServer.call(client, {:set_mode, :passive}, 2_000)
   end
 
+  test "rssi_heartbeat_ms threads into the cache" do
+    {:ok, client} = start_client(rssi_heartbeat_ms: 1_500)
+    assert :sys.get_state(client).cache.heartbeat_ms == 1_500
+  end
+
+  test "rssi_heartbeat_ms defaults to 10_000 without the opt" do
+    {:ok, client} = start_client([])
+    assert :sys.get_state(client).cache.heartbeat_ms == 10_000
+  end
+
   test "adverts fan out through the injected on_advertisement fun" do
     test_pid = self()
 
