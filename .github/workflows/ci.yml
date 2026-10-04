@@ -114,4 +114,5 @@ jobs:
       # No file-level ignores: every finding must be fixed or carry a
       # reviewed entry in .argus-baseline.exs (see scripts/argus_baseline.exs).
       - run: mix argus --format json > argus.json
+      - run: elixir scripts/argus_baseline.exs --self-test
       - run: elixir scripts/argus_baseline.exs argus.json .argus-baseline.exs
