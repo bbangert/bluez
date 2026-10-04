@@ -31,7 +31,9 @@ rename. Each one must be re-applied when re-vendoring:
 2. **Origin headers.** Every file carries a vendored-origin header.
 3. **Owner-bound connections** (`rebus.ex`, `rebus/connection.ex`).
    `Bluez.Rebus.connect/2` passes `owner: self()` (overridable via the
-   `:owner` opt); `Connection.init/1` monitors the owner and the
+   `:owner` opt, which must be a pid — anything else, `nil` included, is
+   rejected with `{:error, {:invalid_owner, value}}`; there is no opt-out);
+   `Connection.init/1` monitors the owner and the
    connection stops with `{:shutdown, :owner_down}` when it exits (the
    `owner_ref` struct field plus a `:DOWN` clause ahead of the
    signal-handler one). Upstream connections live under the shared

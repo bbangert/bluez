@@ -62,13 +62,17 @@ defmodule Bluez.Rebus.Connection do
 
   @impl true
   def init(args) do
-    # Monitor first so an owner that dies while we connect is still seen.
-    owner_ref =
-      case Keyword.get(args, :owner) do
-        owner when is_pid(owner) -> Process.monitor(owner)
-        nil -> nil
-      end
+    # Every connection is bound to a live owner (see `Bluez.Rebus.connect/2`);
+    # there is no opt-out.
+    case Keyword.fetch(args, :owner) do
+      # Monitor first so an owner that dies while we connect is still seen.
+      {:ok, owner} when is_pid(owner) -> connect_and_auth(args, Process.monitor(owner))
+      {:ok, other} -> {:stop, {:invalid_owner, other}}
+      :error -> {:stop, {:invalid_owner, nil}}
+    end
+  end
 
+  defp connect_and_auth(args, owner_ref) do
     %{family: family} = addr = Keyword.fetch!(args, :addr)
 
     # bluez-local patch: the whole connect + AUTH handshake shares one

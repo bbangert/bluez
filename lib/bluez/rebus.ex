@@ -105,7 +105,9 @@ defmodule Bluez.Rebus do
     - `:owner` - The process whose lifetime bounds the connection (default:
       the caller). The connection monitors it and closes when it exits, so a
       restarted owner never leaves an orphaned connection (and socket) behind
-      under `Bluez.Rebus.ConnectionSupervisor` (bluez-local patch).
+      under `Bluez.Rebus.ConnectionSupervisor` (bluez-local patch). Must be a
+      pid; anything else (including `nil`) returns
+      `{:error, {:invalid_owner, value}}`.
     - Additional options are passed to the underlying connection process
 
   ## Return Values
@@ -152,13 +154,15 @@ defmodule Bluez.Rebus do
   end
 
   def connect(%{family: family} = addr, opts) when family in [:inet, :local] do
-    args =
-      opts
-      |> Keyword.put_new(:owner, self())
-      |> Keyword.put(:addr, addr)
+    case Keyword.get(opts, :owner, self()) do
+      owner when is_pid(owner) ->
+        args = opts |> Keyword.put(:owner, owner) |> Keyword.put(:addr, addr)
+        DynamicSupervisor.start_child(Bluez.Rebus.ConnectionSupervisor, {Connection, args})
 
-    child_spec = {Connection, args}
-    DynamicSupervisor.start_child(Bluez.Rebus.ConnectionSupervisor, child_spec)
+      # No opt-out: every connection must be bound to a live owner.
+      other ->
+        {:error, {:invalid_owner, other}}
+    end
   end
 
   @doc """

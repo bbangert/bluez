@@ -98,6 +98,17 @@ defmodule Bluez.RebusTest do
       assert DynamicSupervisor.count_children(Bluez.Rebus.ConnectionSupervisor).active == baseline
     end
 
+    test "rejects an :owner that is not a pid (no opt-out)", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      baseline = DynamicSupervisor.count_children(Bluez.Rebus.ConnectionSupervisor).active
+
+      assert {:error, {:invalid_owner, nil}} = Bluez.Rebus.connect(addr, owner: nil)
+      assert {:error, {:invalid_owner, :me}} = Bluez.Rebus.connect(addr, owner: :me)
+
+      refute_receive {^svr, %Message{}}, 100
+      assert DynamicSupervisor.count_children(Bluez.Rebus.ConnectionSupervisor).active == baseline
+    end
+
     test "connect! returns pid on success", %{svr: svr} do
       {:ok, addr} = TestServer.get_listen_addr(svr)
       pid = Bluez.Rebus.connect!(addr)
