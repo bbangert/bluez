@@ -20,6 +20,28 @@ defmodule Bluez.RebusTest do
       assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
     end
 
+    test "closes when its owner exits", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      test_pid = self()
+
+      owner =
+        spawn(fn ->
+          send(test_pid, {:conn, Bluez.Rebus.connect(addr)})
+
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      assert_receive {:conn, {:ok, conn}}
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+      handle_hello(hello, svr)
+      ref = Process.monitor(conn)
+      send(owner, :stop)
+
+      assert_receive {:DOWN, ^ref, :process, ^conn, {:shutdown, :owner_down}}
+    end
+
     test "connect! returns pid on success", %{svr: svr} do
       {:ok, addr} = TestServer.get_listen_addr(svr)
       pid = Bluez.Rebus.connect!(addr)

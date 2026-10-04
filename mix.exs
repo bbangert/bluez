@@ -27,6 +27,9 @@ defmodule Bluez.MixProject do
       #   an earlier sibling under the :rest_for_one tree, a Connection's
       #   init never calls back into its owner, and connecting in init is
       #   what makes a down bus fail start_link so the supervisor retries.
+      #   The connection's lifetime is still bound to its owner: it
+      #   monitors the caller (`:owner`) and closes when it exits, so an
+      #   owner restart never orphans a connection under that supervisor.
       # * lib/bluez/rebus/connection.ex — argus.mailbox: `{:dbus_call, _}`
       #   is only ever sent to the pid registered via set_method_handler/2
       #   (Client and Agent, which both handle it). Gatt and BlueAlsa never

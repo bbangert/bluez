@@ -53,10 +53,22 @@ defmodule Bluez.Rebus.Connection do
     # AdvertisementMonitor for passive scanning). Upstream rebus is client-only
     # and would crash on an inbound method call.
     field(:method_handler, pid() | nil, default: nil)
+    # bluez-local patch: monitor of the owning process (see
+    # `Bluez.Rebus.connect/2`'s `:owner`). The connection lives under the
+    # shared ConnectionSupervisor, so without this a stopped owner would
+    # leak it — the owner's restart opens a fresh connection.
+    field(:owner_ref, reference() | nil, default: nil)
   end
 
   @impl true
   def init(args) do
+    # Monitor first so an owner that dies while we connect is still seen.
+    owner_ref =
+      case Keyword.get(args, :owner) do
+        owner when is_pid(owner) -> Process.monitor(owner)
+        nil -> nil
+      end
+
     %{family: family} = addr = Keyword.fetch!(args, :addr)
     {:ok, sock} = :socket.open(family, :stream, :default)
     :ok = :socket.connect(sock, addr)
@@ -67,7 +79,9 @@ defmodule Bluez.Rebus.Connection do
     case :socket.recv(sock, 0) do
       {:ok, <<"OK ", guid::binary-size(32), "\r\n", rest::binary>>} ->
         :ok = :socket.send(sock, "BEGIN \r\n")
-        {:ok, %__MODULE__{sock: sock, guid: guid, prev: rest}, {:continue, :hello}}
+
+        {:ok, %__MODULE__{sock: sock, guid: guid, prev: rest, owner_ref: owner_ref},
+         {:continue, :hello}}
 
       {:ok, _} ->
         {:error, :auth_failed}
@@ -80,6 +94,12 @@ defmodule Bluez.Rebus.Connection do
   @impl true
   def handle_info({:"$socket", s, :select, h}, %__MODULE__{sock: s, rref: h} = state) do
     {:noreply, %{state | rref: nil}, {:continue, :recv}}
+  end
+
+  # The owner exited: close with it (the socket closes with this process).
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %__MODULE__{owner_ref: ref} = state)
+      when is_reference(ref) do
+    {:stop, {:shutdown, :owner_down}, state}
   end
 
   def handle_info({:DOWN, ref, _, _, _}, %__MODULE__{} = state) do

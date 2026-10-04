@@ -100,6 +100,10 @@ defmodule Bluez.Rebus do
   - `opts` - Optional keyword list of connection options:
     - `:timeout` - Connection timeout in milliseconds (default: 5000)
     - `:name` - Optional name for the connection process
+    - `:owner` - The process whose lifetime bounds the connection (default:
+      the caller). The connection monitors it and closes when it exits, so a
+      restarted owner never leaves an orphaned connection (and socket) behind
+      under `Bluez.Rebus.ConnectionSupervisor` (bluez-local patch).
     - Additional options are passed to the underlying connection process
 
   ## Return Values
@@ -148,6 +152,7 @@ defmodule Bluez.Rebus do
   def connect(%{family: family} = addr, opts) when family in [:inet, :local] do
     args =
       opts
+      |> Keyword.put_new(:owner, self())
       |> Keyword.put(:addr, addr)
 
     child_spec = {Connection, args}
