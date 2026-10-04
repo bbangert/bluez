@@ -20,6 +20,95 @@ defmodule Bluez.RebusTest do
       assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
     end
 
+    test "closes when its owner exits", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      test_pid = self()
+
+      owner =
+        spawn(fn ->
+          send(test_pid, {:conn, Bluez.Rebus.connect(addr)})
+
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      assert_receive {:conn, {:ok, conn}}
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+      handle_hello(hello, svr)
+      ref = Process.monitor(conn)
+      send(owner, :stop)
+
+      assert_receive {:DOWN, ^ref, :process, ^conn, {:shutdown, :owner_down}}
+    end
+
+    test "an explicit :owner, not the creator, bounds the connection", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      test_pid = self()
+
+      owner =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      # The creator connects on the owner's behalf, then exits.
+      creator =
+        spawn(fn -> send(test_pid, {:conn, Bluez.Rebus.connect(addr, owner: owner)}) end)
+
+      creator_ref = Process.monitor(creator)
+      assert_receive {:conn, {:ok, conn}}
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+      handle_hello(hello, svr)
+      ref = Process.monitor(conn)
+
+      assert_receive {:DOWN, ^creator_ref, :process, ^creator, _}
+      refute_receive {:DOWN, ^ref, :process, ^conn, _}, 200
+      assert Process.alive?(conn)
+
+      send(owner, :stop)
+      assert_receive {:DOWN, ^ref, :process, ^conn, {:shutdown, :owner_down}}
+    end
+
+    test "a bus that accepts but never answers AUTH times out cleanly" do
+      {:ok, lsock} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
+      {:ok, port} = :inet.port(lsock)
+      test_pid = self()
+
+      # Accept, swallow the AUTH line, never reply; report when the client
+      # side closes the socket.
+      spawn_link(fn ->
+        {:ok, s} = :gen_tcp.accept(lsock)
+        drain = fn drain -> if match?({:ok, _}, :gen_tcp.recv(s, 0)), do: drain.(drain) end
+        drain.(drain)
+        send(test_pid, :client_closed)
+      end)
+
+      baseline = DynamicSupervisor.count_children(Bluez.Rebus.ConnectionSupervisor).active
+      started = System.monotonic_time(:millisecond)
+
+      assert {:error, :timeout} =
+               Bluez.Rebus.connect(%{family: :inet, addr: {127, 0, 0, 1}, port: port},
+                 timeout: 200
+               )
+
+      assert System.monotonic_time(:millisecond) - started < 1_000
+      assert_receive :client_closed, 1_000
+      assert DynamicSupervisor.count_children(Bluez.Rebus.ConnectionSupervisor).active == baseline
+    end
+
+    test "rejects an :owner that is not a pid (no opt-out)", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      baseline = DynamicSupervisor.count_children(Bluez.Rebus.ConnectionSupervisor).active
+
+      assert {:error, {:invalid_owner, nil}} = Bluez.Rebus.connect(addr, owner: nil)
+      assert {:error, {:invalid_owner, :me}} = Bluez.Rebus.connect(addr, owner: :me)
+
+      refute_receive {^svr, %Message{}}, 100
+      assert DynamicSupervisor.count_children(Bluez.Rebus.ConnectionSupervisor).active == baseline
+    end
+
     test "connect! returns pid on success", %{svr: svr} do
       {:ok, addr} = TestServer.get_listen_addr(svr)
       pid = Bluez.Rebus.connect!(addr)
@@ -39,7 +128,13 @@ defmodule Bluez.RebusTest do
   describe "Unix socket connections" do
     test "can be established with unix socket" do
       # Use a short path to avoid Unix socket path length limit (108 bytes)
-      socket_path = "/tmp/rebus_test_#{:erlang.unique_integer([:positive])}.sock"
+      socket_path =
+        "/tmp/rebus_test_#{System.pid()}_#{:erlang.unique_integer([:positive])}.sock"
+
+      # TestServer only unlinks the socket file when it traps exits, so
+      # clean up here; a stale file from an earlier run is :eaddrinuse.
+      File.rm(socket_path)
+      on_exit(fn -> File.rm(socket_path) end)
 
       {:ok, svr} =
         start_supervised({Bluez.Rebus.TestServer, tap: self(), family: :local, path: socket_path})
@@ -114,7 +209,7 @@ defmodule Bluez.RebusTest do
 
     test "block when called", %{cli: cli, svr: svr} do
       method =
-        Bluez.Rebus.Message.new!(
+        Message.new!(
           :method_call,
           path: "/org/freedesktop/DBus",
           member: "FakeMethod",
@@ -131,7 +226,7 @@ defmodule Bluez.RebusTest do
 
       # Reply to the method call to unblock the caller
       reply =
-        Bluez.Rebus.Message.new!(
+        Message.new!(
           :method_return,
           reply_serial: rcvd.serial,
           signature: "s",
@@ -159,7 +254,7 @@ defmodule Bluez.RebusTest do
 
       # Send the NameAcquired signal
       signal =
-        Bluez.Rebus.Message.new!(
+        Message.new!(
           :signal,
           path: "/org/freedesktop/DBus",
           interface: "org.freedesktop.DBus",
@@ -225,7 +320,7 @@ defmodule Bluez.RebusTest do
 
   defp handle_hello(%Message{} = msg, svr) do
     reply =
-      Bluez.Rebus.Message.new!(
+      Message.new!(
         :method_return,
         reply_serial: msg.serial,
         signature: "s",
@@ -236,7 +331,7 @@ defmodule Bluez.RebusTest do
     :ok = TestServer.push(svr, reply)
 
     signal =
-      Bluez.Rebus.Message.new!(
+      Message.new!(
         :signal,
         path: "/org/freedesktop/DBus",
         interface: "org.freedesktop.DBus",

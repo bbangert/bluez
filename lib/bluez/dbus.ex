@@ -16,6 +16,8 @@ defmodule Bluez.DBus do
   timeout.
   """
 
+  alias Bluez.Rebus.{Connection, Message}
+
   require Logger
 
   @bluez "org.bluez"
@@ -73,13 +75,13 @@ defmodule Bluez.DBus do
     ]
 
     opts = if signature == "", do: opts, else: Keyword.put(opts, :signature, signature)
-    msg = Bluez.Rebus.Message.new!(:method_call, opts)
+    msg = Message.new!(:method_call, opts)
 
     case GenServer.call(conn, {:send, msg}, timeout) do
-      %Bluez.Rebus.Message{type: :method_return, body: reply_body} ->
+      %Message{type: :method_return, body: reply_body} ->
         {:ok, reply_body}
 
-      %Bluez.Rebus.Message{type: :error, header_fields: hf, body: eb} ->
+      %Message{type: :error, header_fields: hf, body: eb} ->
         Logger.warning("Bluez.DBus: #{member} error #{inspect(hf[:error_name])} #{inspect(eb)}")
         {:error, hf[:error_name]}
     end
@@ -99,9 +101,9 @@ defmodule Bluez.DBus do
   """
   @spec add_match(pid(), String.t()) :: term()
   def add_match(conn, rule) do
-    Bluez.Rebus.Connection.send(
+    Connection.send(
       conn,
-      Bluez.Rebus.Message.new!(:method_call,
+      Message.new!(:method_call,
         destination: "org.freedesktop.DBus",
         path: "/org/freedesktop/DBus",
         interface: "org.freedesktop.DBus",

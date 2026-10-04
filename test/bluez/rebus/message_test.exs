@@ -4,7 +4,7 @@
 # see lib/bluez/rebus/VENDORED.md. Upstreaming: ausimian/rebus#9.
 defmodule Bluez.Rebus.MessageTest do
   use ExUnit.Case, async: true
-  alias Bluez.Rebus.Message
+  alias Bluez.Rebus.{Encoder, Message}
 
   # Helper function to encode message and return binary for decoding.
   # (No error branch: encode/2 always returns {:ok, iodata} — the 1.20 type
@@ -606,7 +606,7 @@ defmodule Bluez.Rebus.MessageTest do
       header_fields_data = [signature_header_field]
 
       # Encode the header fields using our encoder
-      header_fields_encoded = Bluez.Rebus.Encoder.encode("a(yv)", [header_fields_data], :little)
+      header_fields_encoded = Encoder.encode("a(yv)", [header_fields_data], :little)
       header_fields_binary = IO.iodata_to_binary(header_fields_encoded)
 
       # Create invalid body data - string bytes instead of integer
@@ -657,7 +657,7 @@ defmodule Bluez.Rebus.MessageTest do
       header_fields_data = [signature_header_field]
 
       # Encode the header fields
-      header_fields_encoded = Bluez.Rebus.Encoder.encode("a(yv)", [header_fields_data], :little)
+      header_fields_encoded = Encoder.encode("a(yv)", [header_fields_data], :little)
       header_fields_binary = IO.iodata_to_binary(header_fields_encoded)
 
       # Create body data that looks like an integer (4 bytes) instead of a string

@@ -133,6 +133,9 @@ defmodule Bluez.Rebus.Decoder do
     end
   end
 
+  # A flat dispatch over the D-Bus type codes: the branch count is the
+  # number of types, not accidental complexity.
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp parse_single_type([type | rest]) do
     case type do
       @type_byte ->
