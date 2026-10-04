@@ -98,7 +98,9 @@ defmodule Bluez.Rebus do
     - `%{family: :inet, addr: {ip, port}}` - TCP/IP connection to a remote D-Bus daemon
 
   - `opts` - Optional keyword list of connection options:
-    - `:timeout` - Connection timeout in milliseconds (default: 5000)
+    - `:timeout` - Connection timeout in milliseconds (default: 5000). One
+      deadline covers the socket connect and the whole AUTH handshake; on
+      expiry `connect/2` returns `{:error, :timeout}` and the socket is closed.
     - `:name` - Optional name for the connection process
     - `:owner` - The process whose lifetime bounds the connection (default:
       the caller). The connection monitors it and closes when it exits, so a

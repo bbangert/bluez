@@ -70,26 +70,47 @@ defmodule Bluez.Rebus.Connection do
       end
 
     %{family: family} = addr = Keyword.fetch!(args, :addr)
+
+    # bluez-local patch: the whole connect + AUTH handshake shares one
+    # deadline (the documented `:timeout` opt), so a bus that accepts but
+    # never answers can't wedge init/1 — which would also keep the owner's
+    # :DOWN queued unseen and leak this connection.
+    deadline = System.monotonic_time(:millisecond) + Keyword.get(args, :timeout, 5_000)
     {:ok, sock} = :socket.open(family, :stream, :default)
-    :ok = :socket.connect(sock, addr)
 
-    auth = "AUTH EXTERNAL #{get_auth_id()}\r\n"
-    :ok = :socket.send(sock, [0, auth])
-
-    case :socket.recv(sock, 0) do
-      {:ok, <<"OK ", guid::binary-size(32), "\r\n", rest::binary>>} ->
-        :ok = :socket.send(sock, "BEGIN \r\n")
-
+    case handshake(sock, addr, deadline) do
+      {:ok, guid, rest} ->
         {:ok, %__MODULE__{sock: sock, guid: guid, prev: rest, owner_ref: owner_ref},
          {:continue, :hello}}
 
-      {:ok, _} ->
-        {:error, :auth_failed}
-
-      error ->
-        error
+      {:error, reason} ->
+        :socket.close(sock)
+        {:stop, reason}
     end
   end
+
+  defp handshake(sock, addr, deadline) do
+    auth = "AUTH EXTERNAL #{get_auth_id()}\r\n"
+
+    with :ok <- :socket.connect(sock, addr, remaining(deadline)),
+         :ok <- :socket.send(sock, [0, auth], remaining(deadline)),
+         {:ok, reply} <- :socket.recv(sock, 0, [], remaining(deadline)),
+         {:ok, guid, rest} <- parse_auth_reply(reply),
+         :ok <- :socket.send(sock, "BEGIN \r\n", remaining(deadline)) do
+      {:ok, guid, rest}
+    else
+      # A timed send/recv reports partial data as {reason, rest}.
+      {:error, {reason, _rest}} -> {:error, reason}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp parse_auth_reply(<<"OK ", guid::binary-size(32), "\r\n", rest::binary>>),
+    do: {:ok, guid, rest}
+
+  defp parse_auth_reply(_reply), do: {:error, :auth_failed}
+
+  defp remaining(deadline), do: max(deadline - System.monotonic_time(:millisecond), 0)
 
   @impl true
   def handle_info({:"$socket", s, :select, h}, %__MODULE__{sock: s, rref: h} = state) do

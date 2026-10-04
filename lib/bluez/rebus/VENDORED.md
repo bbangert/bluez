@@ -38,6 +38,11 @@ rename. Each one must be re-applied when re-vendoring:
    `DynamicSupervisor` with no tie to the caller, so a restarted owner
    would orphan its old connection and socket. Tested in
    `test/bluez/rebus_test.exs` and `test/bluez/client_test.exs`.
+   Relatedly, `Connection.init/1` runs the socket connect and AUTH
+   handshake under one deadline (the documented `:timeout` opt, default
+   5000 ms) and returns `{:stop, reason}` (closing the socket) on any
+   failure; upstream blocks without a timeout and returns a bare
+   `{:error, _}` from init/1.
 4. **Credo `--strict` cleanups** (no behaviour change), made when credo
    became a CI gate:
    - aliases for nested `Bluez.Rebus.*` modules in code (doc examples

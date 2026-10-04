@@ -53,6 +53,20 @@ defmodule Bluez.ClientTest do
     {:ok, client}
   end
 
+  defp eventually(fun, tries \\ 50) do
+    cond do
+      fun.() ->
+        true
+
+      tries == 0 ->
+        false
+
+      true ->
+        Process.sleep(10)
+        eventually(fun, tries - 1)
+    end
+  end
+
   test "a stopped client does not leave its D-Bus connection behind" do
     alias Bluez.Rebus.{Message, TestServer}
 
@@ -96,7 +110,10 @@ defmodule Bluez.ClientTest do
     Process.exit(client, :kill)
 
     assert_receive {:DOWN, ^ref, :process, ^conn, {:shutdown, :owner_down}}
-    assert DynamicSupervisor.count_children(Bluez.Rebus.ConnectionSupervisor).active == baseline
+    # The supervisor handles the child's EXIT asynchronously: poll briefly.
+    assert eventually(fn ->
+             DynamicSupervisor.count_children(Bluez.Rebus.ConnectionSupervisor).active == baseline
+           end)
   end
 
   test "watchdog stops the client when a transition neither completes nor dies" do

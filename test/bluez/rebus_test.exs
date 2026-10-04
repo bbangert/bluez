@@ -71,6 +71,33 @@ defmodule Bluez.RebusTest do
       assert_receive {:DOWN, ^ref, :process, ^conn, {:shutdown, :owner_down}}
     end
 
+    test "a bus that accepts but never answers AUTH times out cleanly" do
+      {:ok, lsock} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
+      {:ok, port} = :inet.port(lsock)
+      test_pid = self()
+
+      # Accept, swallow the AUTH line, never reply; report when the client
+      # side closes the socket.
+      spawn_link(fn ->
+        {:ok, s} = :gen_tcp.accept(lsock)
+        drain = fn drain -> if match?({:ok, _}, :gen_tcp.recv(s, 0)), do: drain.(drain) end
+        drain.(drain)
+        send(test_pid, :client_closed)
+      end)
+
+      baseline = DynamicSupervisor.count_children(Bluez.Rebus.ConnectionSupervisor).active
+      started = System.monotonic_time(:millisecond)
+
+      assert {:error, :timeout} =
+               Bluez.Rebus.connect(%{family: :inet, addr: {127, 0, 0, 1}, port: port},
+                 timeout: 200
+               )
+
+      assert System.monotonic_time(:millisecond) - started < 1_000
+      assert_receive :client_closed, 1_000
+      assert DynamicSupervisor.count_children(Bluez.Rebus.ConnectionSupervisor).active == baseline
+    end
+
     test "connect! returns pid on success", %{svr: svr} do
       {:ok, addr} = TestServer.get_listen_addr(svr)
       pid = Bluez.Rebus.connect!(addr)
@@ -90,7 +117,13 @@ defmodule Bluez.RebusTest do
   describe "Unix socket connections" do
     test "can be established with unix socket" do
       # Use a short path to avoid Unix socket path length limit (108 bytes)
-      socket_path = "/tmp/rebus_test_#{:erlang.unique_integer([:positive])}.sock"
+      socket_path =
+        "/tmp/rebus_test_#{System.pid()}_#{:erlang.unique_integer([:positive])}.sock"
+
+      # TestServer only unlinks the socket file when it traps exits, so
+      # clean up here; a stale file from an earlier run is :eaddrinuse.
+      File.rm(socket_path)
+      on_exit(fn -> File.rm(socket_path) end)
 
       {:ok, svr} =
         start_supervised({Bluez.Rebus.TestServer, tap: self(), family: :local, path: socket_path})
