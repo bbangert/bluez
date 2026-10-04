@@ -106,7 +106,7 @@ jobs:
             _build
           key: mix-sobelow-${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock') }}
       - run: mix deps.get
-      - run: mix sobelow --skip --exit --threshold medium
+      - run: mix sobelow --private --skip --exit --threshold medium
 
   audit:
     name: Dependency audit
