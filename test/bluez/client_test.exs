@@ -72,7 +72,6 @@ defmodule Bluez.ClientTest do
 
     {:ok, svr} = start_supervised({TestServer, tap: self()})
     {:ok, addr} = TestServer.get_listen_addr(svr)
-    baseline = DynamicSupervisor.count_children(Bluez.Rebus.ConnectionSupervisor).active
     test_pid = self()
 
     connect_fun = fn ->
@@ -89,6 +88,7 @@ defmodule Bluez.ClientTest do
       end)
 
     assert_receive {:conn, conn}
+    ref = Process.monitor(conn)
     assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
 
     :ok =
@@ -103,7 +103,6 @@ defmodule Bluez.ClientTest do
       )
 
     {:ok, client} = Task.await(starter)
-    ref = Process.monitor(conn)
 
     # Any client exit (a :no_adapter stop, a supervisor restart) must take
     # its connection with it.
@@ -112,7 +111,9 @@ defmodule Bluez.ClientTest do
     assert_receive {:DOWN, ^ref, :process, ^conn, {:shutdown, :owner_down}}
     # The supervisor handles the child's EXIT asynchronously: poll briefly.
     assert eventually(fn ->
-             DynamicSupervisor.count_children(Bluez.Rebus.ConnectionSupervisor).active == baseline
+             Bluez.Rebus.ConnectionSupervisor
+             |> DynamicSupervisor.which_children()
+             |> Enum.all?(fn {_, pid, _, _} -> pid != conn end)
            end)
   end
 

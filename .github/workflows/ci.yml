@@ -109,4 +109,9 @@ jobs:
             _build
           key: mix-argus-${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock') }}
       - run: mix deps.get
-      - run: mix argus --fail-above 0
+      # Compile first so build output never mixes into the JSON report.
+      - run: mix compile
+      # No file-level ignores: every finding must be fixed or carry a
+      # reviewed entry in .argus-baseline.exs (see scripts/argus_baseline.exs).
+      - run: mix argus --format json > argus.json
+      - run: elixir scripts/argus_baseline.exs argus.json .argus-baseline.exs

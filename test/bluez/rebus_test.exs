@@ -85,7 +85,7 @@ defmodule Bluez.RebusTest do
         send(test_pid, :client_closed)
       end)
 
-      baseline = DynamicSupervisor.count_children(Bluez.Rebus.ConnectionSupervisor).active
+      before = connection_pids()
       started = System.monotonic_time(:millisecond)
 
       assert {:error, :timeout} =
@@ -95,18 +95,18 @@ defmodule Bluez.RebusTest do
 
       assert System.monotonic_time(:millisecond) - started < 1_000
       assert_receive :client_closed, 1_000
-      assert DynamicSupervisor.count_children(Bluez.Rebus.ConnectionSupervisor).active == baseline
+      assert MapSet.subset?(connection_pids(), before)
     end
 
     test "rejects an :owner that is not a pid (no opt-out)", %{svr: svr} do
       {:ok, addr} = TestServer.get_listen_addr(svr)
-      baseline = DynamicSupervisor.count_children(Bluez.Rebus.ConnectionSupervisor).active
+      before = connection_pids()
 
       assert {:error, {:invalid_owner, nil}} = Bluez.Rebus.connect(addr, owner: nil)
       assert {:error, {:invalid_owner, :me}} = Bluez.Rebus.connect(addr, owner: :me)
 
       refute_receive {^svr, %Message{}}, 100
-      assert DynamicSupervisor.count_children(Bluez.Rebus.ConnectionSupervisor).active == baseline
+      assert MapSet.subset?(connection_pids(), before)
     end
 
     test "connect! returns pid on success", %{svr: svr} do
@@ -306,6 +306,14 @@ defmodule Bluez.RebusTest do
     # The server does not respond to any messages unless instructed to do so.
     {:ok, svr} = start_supervised({Bluez.Rebus.TestServer, tap: self()})
     %{svr: svr}
+  end
+
+  # Compare child pids, not counts: an earlier test's connection may still
+  # be shutting down (and leave the supervisor) while this one runs.
+  defp connection_pids do
+    Bluez.Rebus.ConnectionSupervisor
+    |> DynamicSupervisor.which_children()
+    |> MapSet.new(fn {_, pid, _, _} -> pid end)
   end
 
   defp client_setup(%{svr: svr}) do
