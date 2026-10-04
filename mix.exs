@@ -46,6 +46,7 @@ defmodule Bluez.MixProject do
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:sobelow, "~> 0.14", only: [:dev, :test], runtime: false},
       {:argus_beam, "~> 0.20", only: [:dev, :test], runtime: false}
     ]
   end
