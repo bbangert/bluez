@@ -42,6 +42,35 @@ defmodule Bluez.RebusTest do
       assert_receive {:DOWN, ^ref, :process, ^conn, {:shutdown, :owner_down}}
     end
 
+    test "an explicit :owner, not the creator, bounds the connection", %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      test_pid = self()
+
+      owner =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      # The creator connects on the owner's behalf, then exits.
+      creator =
+        spawn(fn -> send(test_pid, {:conn, Bluez.Rebus.connect(addr, owner: owner)}) end)
+
+      creator_ref = Process.monitor(creator)
+      assert_receive {:conn, {:ok, conn}}
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+      handle_hello(hello, svr)
+      ref = Process.monitor(conn)
+
+      assert_receive {:DOWN, ^creator_ref, :process, ^creator, _}
+      refute_receive {:DOWN, ^ref, :process, ^conn, _}, 200
+      assert Process.alive?(conn)
+
+      send(owner, :stop)
+      assert_receive {:DOWN, ^ref, :process, ^conn, {:shutdown, :owner_down}}
+    end
+
     test "connect! returns pid on success", %{svr: svr} do
       {:ok, addr} = TestServer.get_listen_addr(svr)
       pid = Bluez.Rebus.connect!(addr)
