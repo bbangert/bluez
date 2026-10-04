@@ -54,3 +54,64 @@ jobs:
           restore-keys: plt-${{ env.ELIXIR_VERSION }}-
       - run: mix deps.get
       - run: mix dialyzer
+
+  credo:
+    name: Credo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-dev-${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock') }}
+      - run: mix deps.get
+      - run: mix credo --strict
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+      - run: mix deps.get
+      - run: mix deps.unlock --check-unused
+      - run: mix hex.audit
+
+  argus:
+    name: Argus
+    # Souffle's PPA package needs libffi7, which Ubuntu 24.04 lacks.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Souffle
+        run: |
+          sudo wget https://souffle-lang.github.io/ppa/souffle-key.public -O /usr/share/keyrings/souffle-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/souffle-archive-keyring.gpg] https://souffle-lang.github.io/ppa/ubuntu/ stable main" | sudo tee /etc/apt/sources.list.d/souffle.list
+          sudo apt-get update
+          sudo apt-get install -y souffle
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-argus-${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock') }}
+      - run: mix deps.get
+      # Compile first so build output never mixes into the JSON report.
+      - run: mix compile
+      # No file-level ignores: every finding must be fixed or carry a
+      # reviewed entry in .argus-baseline.exs (see scripts/argus_baseline.exs).
+      - run: mix argus --format json > argus.json
+      - run: elixir scripts/argus_baseline.exs argus.json .argus-baseline.exs

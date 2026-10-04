@@ -64,7 +64,7 @@ defmodule Bluez.Rebus.EncoderTest do
     end
 
     test "encodes uint16" do
-      result = Encoder.encode("q", [65000])
+      result = Encoder.encode("q", [65_000])
       # Little endian: 65000 = 0xFDE8
       assert IO.iodata_to_binary(result) == <<232, 253>>
     end

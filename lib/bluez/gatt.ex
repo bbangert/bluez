@@ -113,8 +113,8 @@ defmodule Bluez.Gatt do
   use GenServer
   require Logger
 
-  alias Bluez.{DBus, DevicePath, GattTree, Variant}
   alias Bluez.Agent, as: PairingAgent
+  alias Bluez.{DBus, DevicePath, GattTree, Variant}
 
   @adapter_iface "org.bluez.Adapter1"
   @device_iface "org.bluez.Device1"
@@ -342,31 +342,14 @@ defmodule Bluez.Gatt do
 
   @impl GenServer
   def handle_cast({:connect, address, _opts, subscriber}, state) do
-    cond do
-      # The wire address is uint64; only 48-bit MACs are representable.
-      # Refuse cleanly — a crafted address must not crash this server.
-      not DevicePath.valid?(address) ->
-        Logger.warning("Bluez.Gatt: connect refused — invalid address #{inspect(address)}")
-        emit(state, subscriber, {:gatt_connection, address, {:error, @err_generic}})
-        {:noreply, state}
-
-      true ->
-        state = teardown_stale_entry(state, address)
-
-        if map_size(state.conns) >= @max_connections do
-          Logger.warning("Bluez.Gatt: connect #{fmt(address)} refused — no free slots")
-          emit(state, subscriber, {:gatt_connection, address, {:error, @err_generic}})
-          {:noreply, state}
-        else
-          gen = state.gen_seq + 1
-          path = DevicePath.from_address(address)
-          run_connect(state.conn, address, gen, path)
-          notify_connections_changed(state)
-
-          {:noreply,
-           %{state | gen_seq: gen}
-           |> put_in([:conns, address], new_entry(path, subscriber, gen))}
-        end
+    # The wire address is uint64; only 48-bit MACs are representable.
+    # Refuse cleanly — a crafted address must not crash this server.
+    if DevicePath.valid?(address) do
+      start_connect(state, address, subscriber)
+    else
+      Logger.warning("Bluez.Gatt: connect refused — invalid address #{inspect(address)}")
+      emit(state, subscriber, {:gatt_connection, address, {:error, @err_generic}})
+      {:noreply, state}
     end
   end
 
@@ -446,12 +429,10 @@ defmodule Bluez.Gatt do
     with_ready_entry(state, address, {:gatt_notify, address, handle}, fn entry ->
       case entry.tree.by_handle[handle] do
         {:characteristic, path} ->
-          member = if enable?, do: "StartNotify", else: "StopNotify"
-
           run_notify(
             state.conn,
             path,
-            member,
+            notify_member(enable?),
             entry.gen,
             {:gatt_notify, address, handle, enable?, path}
           )
@@ -459,12 +440,7 @@ defmodule Bluez.Gatt do
           # Register the notification route BEFORE StartNotify completes so
           # an immediate first Value can't race past us; rolled back if the
           # call errors (see :op_result below).
-          state =
-            if enable?,
-              do: put_in(state.notify_paths[path], {address, handle}),
-              else: update_in(state.notify_paths, &Map.delete(&1, path))
-
-          {:noreply, state}
+          {:noreply, route_notify(state, path, address, handle, enable?)}
 
         _other ->
           emit(state, entry.subscriber, {:gatt_notify, address, handle, {:error, @err_generic}})
@@ -862,18 +838,48 @@ defmodule Bluez.Gatt do
 
   defp error_msg({tag, address, handle}, code), do: {tag, address, handle, {:error, code}}
 
+  defp start_connect(state, address, subscriber) do
+    state = teardown_stale_entry(state, address)
+
+    if map_size(state.conns) >= @max_connections do
+      Logger.warning("Bluez.Gatt: connect #{fmt(address)} refused — no free slots")
+      emit(state, subscriber, {:gatt_connection, address, {:error, @err_generic}})
+      {:noreply, state}
+    else
+      gen = state.gen_seq + 1
+      path = DevicePath.from_address(address)
+      run_connect(state.conn, address, gen, path)
+      notify_connections_changed(state)
+
+      {:noreply,
+       %{state | gen_seq: gen}
+       |> put_in([:conns, address], new_entry(path, subscriber, gen))}
+    end
+  end
+
+  defp notify_member(enable?), do: if(enable?, do: "StartNotify", else: "StopNotify")
+
+  defp route_notify(state, path, address, handle, enable?) do
+    if enable?,
+      do: put_in(state.notify_paths[path], {address, handle}),
+      else: update_in(state.notify_paths, &Map.delete(&1, path))
+  end
+
   # ── BlueZ calls (always from Tasks) ──────────────────────────────────────
 
   defp run_connect(conn, address, gen, path) do
     run_task(fn ->
       with {:ok, _} <- DBus.call(conn, path, @device_iface, "Connect", "", [], @connect_timeout),
            {:ok, resolved?} <- services_resolved?(conn, path) do
-        {:connect_step, address, gen, if(resolved?, do: :resolved, else: :unresolved)}
+        {:connect_step, address, gen, resolve_step(resolved?)}
       else
         {:error, reason} -> {:connect_step, address, gen, {:failed, reason}}
       end
     end)
   end
+
+  defp resolve_step(true), do: :resolved
+  defp resolve_step(false), do: :unresolved
 
   defp services_resolved?(conn, path) do
     case DBus.call(conn, path, @props_iface, "Get", "ss", [@device_iface, "ServicesResolved"]) do
@@ -993,17 +999,15 @@ defmodule Bluez.Gatt do
     end)
   end
 
+  defp report_to(_server, :noreply_to_server), do: :ok
+  defp report_to(server, msg), do: send(server, msg)
+
   # Run a BlueZ call off-loop; the task's return message (unless flagged
   # :noreply_to_server) is delivered to this GenServer's mailbox.
   defp run_task(fun) do
     server = self()
 
-    case Task.Supervisor.start_child(@task_sup, fn ->
-           case fun.() do
-             :noreply_to_server -> :ok
-             msg -> send(server, msg)
-           end
-         end) do
+    case Task.Supervisor.start_child(@task_sup, fn -> report_to(server, fun.()) end) do
       {:ok, _pid} ->
         :ok
 

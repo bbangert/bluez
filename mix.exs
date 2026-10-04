@@ -44,7 +44,9 @@ defmodule Bluez.MixProject do
       {:muontrap, "~> 1.8 or ~> 2.0"},
       {:phoenix_pubsub, "~> 2.1", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
-      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:argus_beam, "~> 0.20", only: [:dev, :test], runtime: false}
     ]
   end
 

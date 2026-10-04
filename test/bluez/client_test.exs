@@ -53,6 +53,70 @@ defmodule Bluez.ClientTest do
     {:ok, client}
   end
 
+  defp eventually(fun, tries \\ 50) do
+    cond do
+      fun.() ->
+        true
+
+      tries == 0 ->
+        false
+
+      true ->
+        Process.sleep(10)
+        eventually(fun, tries - 1)
+    end
+  end
+
+  test "a stopped client does not leave its D-Bus connection behind" do
+    alias Bluez.Rebus.{Message, TestServer}
+
+    {:ok, svr} = start_supervised({TestServer, tap: self()})
+    {:ok, addr} = TestServer.get_listen_addr(svr)
+    test_pid = self()
+
+    connect_fun = fn ->
+      {:ok, conn} = Bluez.Rebus.connect(addr)
+      send(test_pid, {:conn, conn})
+      {:ok, conn}
+    end
+
+    # Started unlinked from a task: Client.init/1 blocks on the connection
+    # until this test answers the bus Hello below.
+    starter =
+      Task.async(fn ->
+        GenServer.start(Client, [connect_fun: connect_fun, setup: false], name: Client)
+      end)
+
+    assert_receive {:conn, conn}
+    ref = Process.monitor(conn)
+    assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}
+
+    :ok =
+      TestServer.push(
+        svr,
+        Message.new!(:method_return,
+          reply_serial: hello.serial,
+          signature: "s",
+          flags: [],
+          body: [":1.100"]
+        )
+      )
+
+    {:ok, client} = Task.await(starter)
+
+    # Any client exit (a :no_adapter stop, a supervisor restart) must take
+    # its connection with it.
+    Process.exit(client, :kill)
+
+    assert_receive {:DOWN, ^ref, :process, ^conn, {:shutdown, :owner_down}}
+    # The supervisor handles the child's EXIT asynchronously: poll briefly.
+    assert eventually(fn ->
+             Bluez.Rebus.ConnectionSupervisor
+             |> DynamicSupervisor.which_children()
+             |> Enum.all?(fn {_, pid, _, _} -> pid != conn end)
+           end)
+  end
+
   test "watchdog stops the client when a transition neither completes nor dies" do
     Process.flag(:trap_exit, true)
 

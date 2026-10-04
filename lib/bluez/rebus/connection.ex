@@ -7,8 +7,8 @@ defmodule Bluez.Rebus.Connection do
   use GenServer, restart: :temporary
   use TypedStruct
 
-  alias Bluez.Rebus.SignalHandler
   alias Bluez.Rebus.Message
+  alias Bluez.Rebus.SignalHandler
 
   def send(pid, %Message{} = msg) when is_pid(pid) do
     GenServer.call(pid, {:send, msg})
@@ -53,33 +53,78 @@ defmodule Bluez.Rebus.Connection do
     # AdvertisementMonitor for passive scanning). Upstream rebus is client-only
     # and would crash on an inbound method call.
     field(:method_handler, pid() | nil, default: nil)
+    # bluez-local patch: monitor of the owning process (see
+    # `Bluez.Rebus.connect/2`'s `:owner`). The connection lives under the
+    # shared ConnectionSupervisor, so without this a stopped owner would
+    # leak it — the owner's restart opens a fresh connection.
+    field(:owner_ref, reference() | nil, default: nil)
   end
 
   @impl true
   def init(args) do
-    %{family: family} = addr = Keyword.fetch!(args, :addr)
-    {:ok, sock} = :socket.open(family, :stream, :default)
-    :ok = :socket.connect(sock, addr)
-
-    auth = "AUTH EXTERNAL #{get_auth_id()}\r\n"
-    :ok = :socket.send(sock, [0, auth])
-
-    case :socket.recv(sock, 0) do
-      {:ok, <<"OK ", guid::binary-size(32), "\r\n", rest::binary>>} ->
-        :ok = :socket.send(sock, "BEGIN \r\n")
-        {:ok, %__MODULE__{sock: sock, guid: guid, prev: rest}, {:continue, :hello}}
-
-      {:ok, _} ->
-        {:error, :auth_failed}
-
-      error ->
-        error
+    # Every connection is bound to a live owner (see `Bluez.Rebus.connect/2`);
+    # there is no opt-out.
+    case Keyword.fetch(args, :owner) do
+      # Monitor first so an owner that dies while we connect is still seen.
+      {:ok, owner} when is_pid(owner) -> connect_and_auth(args, Process.monitor(owner))
+      {:ok, other} -> {:stop, {:invalid_owner, other}}
+      :error -> {:stop, {:invalid_owner, nil}}
     end
   end
+
+  defp connect_and_auth(args, owner_ref) do
+    %{family: family} = addr = Keyword.fetch!(args, :addr)
+
+    # bluez-local patch: the whole connect + AUTH handshake shares one
+    # deadline (the documented `:timeout` opt), so a bus that accepts but
+    # never answers can't wedge init/1 — which would also keep the owner's
+    # :DOWN queued unseen and leak this connection.
+    deadline = System.monotonic_time(:millisecond) + Keyword.get(args, :timeout, 5_000)
+    {:ok, sock} = :socket.open(family, :stream, :default)
+
+    case handshake(sock, addr, deadline) do
+      {:ok, guid, rest} ->
+        {:ok, %__MODULE__{sock: sock, guid: guid, prev: rest, owner_ref: owner_ref},
+         {:continue, :hello}}
+
+      {:error, reason} ->
+        :socket.close(sock)
+        {:stop, reason}
+    end
+  end
+
+  defp handshake(sock, addr, deadline) do
+    auth = "AUTH EXTERNAL #{get_auth_id()}\r\n"
+
+    with :ok <- :socket.connect(sock, addr, remaining(deadline)),
+         :ok <- :socket.send(sock, [0, auth], remaining(deadline)),
+         {:ok, reply} <- :socket.recv(sock, 0, [], remaining(deadline)),
+         {:ok, guid, rest} <- parse_auth_reply(reply),
+         :ok <- :socket.send(sock, "BEGIN \r\n", remaining(deadline)) do
+      {:ok, guid, rest}
+    else
+      # A timed send/recv reports partial data as {reason, rest}.
+      {:error, {reason, _rest}} -> {:error, reason}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp parse_auth_reply(<<"OK ", guid::binary-size(32), "\r\n", rest::binary>>),
+    do: {:ok, guid, rest}
+
+  defp parse_auth_reply(_reply), do: {:error, :auth_failed}
+
+  defp remaining(deadline), do: max(deadline - System.monotonic_time(:millisecond), 0)
 
   @impl true
   def handle_info({:"$socket", s, :select, h}, %__MODULE__{sock: s, rref: h} = state) do
     {:noreply, %{state | rref: nil}, {:continue, :recv}}
+  end
+
+  # The owner exited: close with it (the socket closes with this process).
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %__MODULE__{owner_ref: ref} = state)
+      when is_reference(ref) do
+    {:stop, {:shutdown, :owner_down}, state}
   end
 
   def handle_info({:DOWN, ref, _, _, _}, %__MODULE__{} = state) do
@@ -224,7 +269,7 @@ defmodule Bluez.Rebus.Connection do
         :ok
 
       _ ->
-        Bluez.Rebus.SignalHandler.notify(msg)
+        SignalHandler.notify(msg)
     end
 
     state

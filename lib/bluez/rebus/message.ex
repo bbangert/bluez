@@ -76,8 +76,8 @@ defmodule Bluez.Rebus.Message do
 
   use TypedStruct
 
-  alias Bluez.Rebus.Encoder
   alias Bluez.Rebus.Decoder
+  alias Bluez.Rebus.Encoder
 
   import Bitwise, only: [bor: 2, band: 2]
 
@@ -374,12 +374,7 @@ defmodule Bluez.Rebus.Message do
         # Decode body if present
         signature = Map.get(header_fields, :signature, "")
 
-        body =
-          if signature == "" or body_length == 0 do
-            []
-          else
-            Decoder.decode(signature, body_binary, endianness)
-          end
+        body = decode_body(signature, body_binary, body_length, endianness)
 
         message = %__MODULE__{
           type: type,
@@ -462,19 +457,28 @@ defmodule Bluez.Rebus.Message do
         # Total message size = padded header + body
         total_message_size = header_padded_length + body_length
 
-        # Check if we have enough data for the complete message
-        if byte_size(binary) >= total_message_size do
-          # Extract exactly the right amount of data and decode it
-          <<message_binary::binary-size(^total_message_size), remaining_data::binary>> =
-            binary
-
-          with {:ok, message} <- decode(message_binary) do
-            {:ok, message, remaining_data}
-          end
-        end
+        take_message(binary, total_message_size)
       end
     end
   end
+
+  # Decode exactly one complete message off the front of `binary`; nil when
+  # not all of it has arrived yet.
+  defp take_message(binary, total_message_size) when byte_size(binary) >= total_message_size do
+    <<message_binary::binary-size(^total_message_size), remaining_data::binary>> = binary
+
+    with {:ok, message} <- decode(message_binary) do
+      {:ok, message, remaining_data}
+    end
+  end
+
+  defp take_message(_binary, _total_message_size), do: nil
+
+  defp decode_body("", _body_binary, _body_length, _endianness), do: []
+  defp decode_body(_signature, _body_binary, 0, _endianness), do: []
+
+  defp decode_body(signature, body_binary, _body_length, endianness),
+    do: Decoder.decode(signature, body_binary, endianness)
 
   @doc """
   Validates that a message is well-formed according to D-Bus rules.
@@ -501,9 +505,8 @@ defmodule Bluez.Rebus.Message do
 
     with :ok <- validate_message_type(message.type),
          :ok <- validate_required_fields(message.type, message.header_fields),
-         :ok <- validate_header_field_types(message.header_fields),
-         :ok <- validate_signature_format(signature) do
-      :ok
+         :ok <- validate_header_field_types(message.header_fields) do
+      validate_signature_format(signature)
     end
   end
 
@@ -599,9 +602,7 @@ defmodule Bluez.Rebus.Message do
 
   defp generate_signature(body) do
     # This is a simple signature generation - in practice you'd want more sophisticated logic
-    body
-    |> Enum.map(&infer_type/1)
-    |> Enum.join("")
+    Enum.map_join(body, "", &infer_type/1)
   end
 
   defp infer_type(value)
@@ -652,6 +653,9 @@ defmodule Bluez.Rebus.Message do
     end)
   end
 
+  # One branch per D-Bus header field: the branch count is the number of
+  # fields, not accidental complexity.
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp validate_header_field(field, value) do
     expected_type = Map.get(@field_types, field)
 
@@ -730,7 +734,7 @@ defmodule Bluez.Rebus.Message do
 
   defp valid_interface_name?(name) when is_binary(name) do
     parts = String.split(name, ".")
-    length(parts) >= 1 and Enum.all?(parts, &valid_name_element/1)
+    parts != [] and Enum.all?(parts, &valid_name_element/1)
   end
 
   defp valid_member_name?(name) when is_binary(name) do
@@ -738,15 +742,13 @@ defmodule Bluez.Rebus.Message do
   end
 
   defp valid_bus_name?(name) when is_binary(name) do
-    cond do
-      String.starts_with?(name, ":") ->
-        # Unique connection name
-        String.match?(name, ~r{^:[A-Za-z0-9._-]+$})
-
-      true ->
-        # Well-known bus name
-        parts = String.split(name, ".")
-        length(parts) >= 2 and Enum.all?(parts, &valid_name_element/1)
+    if String.starts_with?(name, ":") do
+      # Unique connection name
+      String.match?(name, ~r{^:[A-Za-z0-9._-]+$})
+    else
+      # Well-known bus name
+      parts = String.split(name, ".")
+      length(parts) >= 2 and Enum.all?(parts, &valid_name_element/1)
     end
   end
 
@@ -854,14 +856,12 @@ defmodule Bluez.Rebus.Message do
 
   defp estimate_header_fields_size(header_fields_data, endianness) do
     # Encode the header fields to calculate their size using position-aware encoding
-    try do
-      encoded_buffer = Encoder.encode_at_position("a(yv)", [header_fields_data], endianness, 12)
-      encoded_buffer |> IO.iodata_to_binary() |> byte_size()
-    rescue
-      _ -> 0
-    catch
-      _ -> 0
-    end
+    encoded_buffer = Encoder.encode_at_position("a(yv)", [header_fields_data], endianness, 12)
+    encoded_buffer |> IO.iodata_to_binary() |> byte_size()
+  rescue
+    _ -> 0
+  catch
+    _ -> 0
   end
 
   defp validate_message_type(type) when type in [:method_call, :method_return, :error, :signal] do

@@ -69,6 +69,7 @@ defmodule Bluez.Client do
   require Logger
 
   alias Bluez.{DBus, DeviceCache, DevicePath, Variant}
+  alias Bluez.Rebus.Message
 
   @adapter_iface "org.bluez.Adapter1"
   @device_iface "org.bluez.Device1"
@@ -345,12 +346,12 @@ defmodule Bluez.Client do
   def handle_info({:setup_retry, retries}, state), do: attempt_setup(state, retries)
 
   # org.bluez device signals arrive as {handler_ref, %Message{type: :signal}}.
-  def handle_info({ref, %Bluez.Rebus.Message{type: :signal} = msg}, %{sig_ref: ref} = state) do
+  def handle_info({ref, %Message{type: :signal} = msg}, %{sig_ref: ref} = state) do
     {:noreply, handle_signal(msg, state)}
   end
 
   # Inbound method calls from BlueZ into our exported monitor/ObjectManager.
-  def handle_info({:dbus_call, %Bluez.Rebus.Message{} = msg}, state) do
+  def handle_info({:dbus_call, %Message{} = msg}, state) do
     dispatch_method_call(msg, state)
     {:noreply, state}
   end
@@ -627,7 +628,7 @@ defmodule Bluez.Client do
 
   defp register_monitor(conn) do
     msg =
-      Bluez.Rebus.Message.new!(:method_call,
+      Message.new!(:method_call,
         destination: @bluez,
         path: adapter_path(),
         interface: @advmon_mgr_iface,
@@ -637,8 +638,8 @@ defmodule Bluez.Client do
       )
 
     case GenServer.call(conn, {:send, msg}, @register_timeout_ms) do
-      %Bluez.Rebus.Message{type: :method_return} -> :ok
-      %Bluez.Rebus.Message{type: :error, header_fields: hf} -> {:error, hf[:error_name]}
+      %Message{type: :method_return} -> :ok
+      %Message{type: :error, header_fields: hf} -> {:error, hf[:error_name]}
     end
   rescue
     e -> {:error, e}
@@ -649,7 +650,17 @@ defmodule Bluez.Client do
 
   # ── inbound method-call dispatch (we are the service BlueZ calls) ────────
 
-  defp dispatch_method_call(%Bluez.Rebus.Message{header_fields: hf} = msg, state) do
+  defp reply_property(conn, msg, prop) do
+    case List.keyfind(monitor_props(), prop, 0) do
+      {_p, variant} ->
+        Bluez.Rebus.reply(conn, msg, [variant], "v")
+
+      nil ->
+        Bluez.Rebus.reply_error(conn, msg, "org.freedesktop.DBus.Error.UnknownProperty", prop)
+    end
+  end
+
+  defp dispatch_method_call(%Message{header_fields: hf} = msg, state) do
     conn = state.conn
 
     case {hf[:interface], hf[:member]} do
@@ -660,15 +671,7 @@ defmodule Bluez.Client do
         Bluez.Rebus.reply(conn, msg, [monitor_props()], "a{sv}")
 
       {@props_iface, "Get"} ->
-        prop = msg.body |> Enum.at(1)
-
-        case List.keyfind(monitor_props(), prop, 0) do
-          {_p, variant} ->
-            Bluez.Rebus.reply(conn, msg, [variant], "v")
-
-          nil ->
-            Bluez.Rebus.reply_error(conn, msg, "org.freedesktop.DBus.Error.UnknownProperty", prop)
-        end
+        reply_property(conn, msg, Enum.at(msg.body, 1))
 
       {@advmon_iface, "Activate"} ->
         Logger.info("Bluez.Client: AdvertisementMonitor activated (passive scanning)")
@@ -733,7 +736,7 @@ defmodule Bluez.Client do
   # ── org.bluez device signal handling (advert source) ────────────────────
 
   defp handle_signal(
-         %Bluez.Rebus.Message{header_fields: %{member: "InterfacesAdded"}, body: body},
+         %Message{header_fields: %{member: "InterfacesAdded"}, body: body},
          state
        ) do
     [path, interfaces] = body
@@ -769,7 +772,7 @@ defmodule Bluez.Client do
   end
 
   defp handle_signal(
-         %Bluez.Rebus.Message{
+         %Message{
            header_fields: %{member: "PropertiesChanged", path: path},
            body: body
          },
@@ -789,7 +792,7 @@ defmodule Bluez.Client do
   end
 
   defp handle_signal(
-         %Bluez.Rebus.Message{header_fields: %{member: "InterfacesRemoved"}, body: body},
+         %Message{header_fields: %{member: "InterfacesRemoved"}, body: body},
          state
        ) do
     case body do
@@ -961,21 +964,21 @@ defmodule Bluez.Client do
   defp seed_existing(state) do
     case get_managed_objects(state.conn) do
       {:ok, objects} ->
-        Enum.reduce(objects, state, fn
-          {path, ifaces}, acc ->
-            case List.keyfind(ifaces, @device_iface, 0) do
-              {_i, props} -> ingest(acc, path, Variant.unwrap_props(props))
-              nil -> acc
-            end
-
-          _, acc ->
-            acc
-        end)
+        Enum.reduce(objects, state, &seed_object/2)
 
       _ ->
         state
     end
   end
+
+  defp seed_object({path, ifaces}, state) do
+    case List.keyfind(ifaces, @device_iface, 0) do
+      {_i, props} -> ingest(state, path, Variant.unwrap_props(props))
+      nil -> state
+    end
+  end
+
+  defp seed_object(_other, state), do: state
 
   defp get_managed_objects(conn), do: DBus.get_managed_objects(conn)
 
