@@ -74,6 +74,8 @@ defmodule Bluez.Rebus do
   modules in this package.
   """
 
+  alias Bluez.Rebus.{Connection, Message}
+
   @type address :: :system | :session | :socket.sockaddr_in() | :socket.sockaddr_un()
 
   @default_system_bus_address "unix:path=/run/dbus/system_bus_socket"
@@ -148,7 +150,7 @@ defmodule Bluez.Rebus do
       opts
       |> Keyword.put(:addr, addr)
 
-    child_spec = {Bluez.Rebus.Connection, args}
+    child_spec = {Connection, args}
     DynamicSupervisor.start_child(Bluez.Rebus.ConnectionSupervisor, child_spec)
   end
 
@@ -215,7 +217,7 @@ defmodule Bluez.Rebus do
   Signal handlers are automatically cleaned up when the connection is closed
   or when the handler exits.
   """
-  defdelegate add_signal_handler(conn), to: Bluez.Rebus.Connection
+  defdelegate add_signal_handler(conn), to: Connection
 
   @doc """
   Removes a previously registered signal handler from the connection.
@@ -251,7 +253,7 @@ defmodule Bluez.Rebus do
   It's safe to call this function multiple times with the same reference -
   subsequent calls will simply return `:ok` without error.
   """
-  defdelegate delete_signal_handler(conn, ref), to: Bluez.Rebus.Connection
+  defdelegate delete_signal_handler(conn, ref), to: Connection
 
   # ── Service-side API (fork addition: bbangert/rebus, branch dbus-service) ──
   #
@@ -265,16 +267,16 @@ defmodule Bluez.Rebus do
   `{:dbus_call, %Bluez.Rebus.Message{type: :method_call}}` messages. The handler
   replies with `reply/4` or `reply_error/4`.
   """
-  defdelegate set_method_handler(conn, handler), to: Bluez.Rebus.Connection
+  defdelegate set_method_handler(conn, handler), to: Connection
 
   @doc """
   Reply to an inbound method call `request` with a `:method_return`. `body` is
   the reply arguments (default none); pass `signature` when the body is
   non-empty (e.g. `"a{sv}"`).
   """
-  @spec reply(pid(), Bluez.Rebus.Message.t(), [term()], String.t() | nil) ::
+  @spec reply(pid(), Message.t(), [term()], String.t() | nil) ::
           :ok | {:error, term()}
-  def reply(conn, %Bluez.Rebus.Message{} = request, body \\ [], signature \\ nil) do
+  def reply(conn, %Message{} = request, body \\ [], signature \\ nil) do
     if no_reply_expected?(request) do
       # The caller flagged the method call NO_REPLY_EXPECTED (e.g. org.bluez
       # AdvertisementMonitor1.DeviceFound). Sending a method_return anyway is an
@@ -290,7 +292,7 @@ defmodule Bluez.Rebus do
       ]
 
       opts = if signature, do: Keyword.put(opts, :signature, signature), else: opts
-      Bluez.Rebus.Connection.send(conn, Bluez.Rebus.Message.new!(:method_return, opts))
+      Connection.send(conn, Message.new!(:method_return, opts))
     end
   end
 
@@ -298,15 +300,15 @@ defmodule Bluez.Rebus do
   Reply to an inbound method call `request` with a D-Bus error
   (e.g. `"org.freedesktop.DBus.Error.UnknownMethod"`).
   """
-  @spec reply_error(pid(), Bluez.Rebus.Message.t(), String.t(), String.t()) ::
+  @spec reply_error(pid(), Message.t(), String.t(), String.t()) ::
           :ok | {:error, term()}
-  def reply_error(conn, %Bluez.Rebus.Message{} = request, error_name, message) do
+  def reply_error(conn, %Message{} = request, error_name, message) do
     if no_reply_expected?(request) do
       :ok
     else
-      Bluez.Rebus.Connection.send(
+      Connection.send(
         conn,
-        Bluez.Rebus.Message.new!(:error,
+        Message.new!(:error,
           error_name: error_name,
           reply_serial: request.serial,
           destination: request.header_fields[:sender],
@@ -318,7 +320,7 @@ defmodule Bluez.Rebus do
     end
   end
 
-  defp no_reply_expected?(%Bluez.Rebus.Message{flags: flags}) do
+  defp no_reply_expected?(%Message{flags: flags}) do
     is_list(flags) and :no_reply_expected in flags
   end
 
@@ -337,6 +339,6 @@ defmodule Bluez.Rebus do
   """
   @spec emit_signal(pid(), keyword()) :: :ok | {:error, term()}
   def emit_signal(conn, opts) when is_pid(conn) and is_list(opts) do
-    Bluez.Rebus.Connection.send(conn, Bluez.Rebus.Message.new!(:signal, opts))
+    Connection.send(conn, Message.new!(:signal, opts))
   end
 end

@@ -17,6 +17,24 @@ defmodule Bluez.MixProject do
         plt_core_path: "priv/plts",
         plt_add_apps: [:phoenix_pubsub]
       ],
+      # `mix argus` is a separate CI gate (not in `compilers:`). Both
+      # suppressions are scoped to the vendored D-Bus client's files:
+      #
+      # * lib/bluez/rebus.ex — argus.startup: every client GenServer
+      #   (Client, Agent, Gatt, BlueAlsa) calls `Bluez.Rebus.connect/2` in
+      #   init/1, which is a `DynamicSupervisor.start_child` on
+      #   Bluez.Rebus.ConnectionSupervisor. Deliberate: that supervisor is
+      #   an earlier sibling under the :rest_for_one tree, a Connection's
+      #   init never calls back into its owner, and connecting in init is
+      #   what makes a down bus fail start_link so the supervisor retries.
+      # * lib/bluez/rebus/connection.ex — argus.mailbox: `{:dbus_call, _}`
+      #   is only ever sent to the pid registered via set_method_handler/2
+      #   (Client and Agent, which both handle it). Gatt and BlueAlsa never
+      #   register, so argus' "reaches Gatt/BlueAlsa's catch-all" path is
+      #   not reachable.
+      argus: [
+        ignore: [files: ["lib/bluez/rebus.ex", "lib/bluez/rebus/connection.ex"]]
+      ],
       description:
         "BlueZ-over-D-Bus client for Elixir: BLE scanning, GATT, pairing, and bluez-alsa audio",
       package: package(),

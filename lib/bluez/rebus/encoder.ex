@@ -172,6 +172,9 @@ defmodule Bluez.Rebus.Encoder do
     end
   end
 
+  # A flat dispatch over the D-Bus type codes: the branch count is the
+  # number of types, not accidental complexity.
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp parse_single_type([type | rest]) do
     case type do
       @type_byte ->
@@ -322,12 +325,12 @@ defmodule Bluez.Rebus.Encoder do
   end
 
   defp encode_single({:object_path, _}, value, state) when is_binary(value) do
-    # TODO: Validate object path format
+    # Object path format is not validated here (as in upstream rebus).
     encode_string_like(value, state, 4)
   end
 
   defp encode_single({:signature, _}, value, state) when is_binary(value) do
-    # TODO: Validate signature format
+    # Signature format is not validated here (as in upstream rebus).
     encode_string_like(value, state, 1)
   end
 

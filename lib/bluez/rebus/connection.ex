@@ -7,8 +7,8 @@ defmodule Bluez.Rebus.Connection do
   use GenServer, restart: :temporary
   use TypedStruct
 
-  alias Bluez.Rebus.SignalHandler
   alias Bluez.Rebus.Message
+  alias Bluez.Rebus.SignalHandler
 
   def send(pid, %Message{} = msg) when is_pid(pid) do
     GenServer.call(pid, {:send, msg})
@@ -224,7 +224,7 @@ defmodule Bluez.Rebus.Connection do
         :ok
 
       _ ->
-        Bluez.Rebus.SignalHandler.notify(msg)
+        SignalHandler.notify(msg)
     end
 
     state

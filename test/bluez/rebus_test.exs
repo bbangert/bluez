@@ -114,7 +114,7 @@ defmodule Bluez.RebusTest do
 
     test "block when called", %{cli: cli, svr: svr} do
       method =
-        Bluez.Rebus.Message.new!(
+        Message.new!(
           :method_call,
           path: "/org/freedesktop/DBus",
           member: "FakeMethod",
@@ -131,7 +131,7 @@ defmodule Bluez.RebusTest do
 
       # Reply to the method call to unblock the caller
       reply =
-        Bluez.Rebus.Message.new!(
+        Message.new!(
           :method_return,
           reply_serial: rcvd.serial,
           signature: "s",
@@ -159,7 +159,7 @@ defmodule Bluez.RebusTest do
 
       # Send the NameAcquired signal
       signal =
-        Bluez.Rebus.Message.new!(
+        Message.new!(
           :signal,
           path: "/org/freedesktop/DBus",
           interface: "org.freedesktop.DBus",
@@ -225,7 +225,7 @@ defmodule Bluez.RebusTest do
 
   defp handle_hello(%Message{} = msg, svr) do
     reply =
-      Bluez.Rebus.Message.new!(
+      Message.new!(
         :method_return,
         reply_serial: msg.serial,
         signature: "s",
@@ -236,7 +236,7 @@ defmodule Bluez.RebusTest do
     :ok = TestServer.push(svr, reply)
 
     signal =
-      Bluez.Rebus.Message.new!(
+      Message.new!(
         :signal,
         path: "/org/freedesktop/DBus",
         interface: "org.freedesktop.DBus",

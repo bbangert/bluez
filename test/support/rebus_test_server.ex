@@ -100,7 +100,7 @@ defmodule Bluez.Rebus.TestServer do
 
   @impl true
   def handle_cast({:push, %Message{} = msg}, %__MODULE__{} = state) do
-    {:ok, bin} = Bluez.Rebus.Message.encode(%{msg | serial: state.serial})
+    {:ok, bin} = Message.encode(%{msg | serial: state.serial})
     :ok = :socket.send(state.cli_sock, bin)
     {:noreply, %{state | serial: state.serial + 1}}
   end
