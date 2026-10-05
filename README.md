@@ -77,7 +77,7 @@ The core modules carry the reference detail:
 ```elixir
 def deps do
   [
-    {:bluez, "~> 0.1"}
+    {:bluez, "~> 0.3"}
   ]
 end
 ```
