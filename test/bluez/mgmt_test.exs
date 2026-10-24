@@ -265,6 +265,44 @@ defmodule Bluez.MgmtTest do
     assert expect_command(kernel, @remove) == <<7>>
   end
 
+  test "the default instance skips one held by someone else" do
+    {mgmt, kernel} = start_mgmt()
+    task = advertise_async(mgmt, <<2, 1, 6>>, [])
+
+    expect_command(kernel, @read_features)
+    # Max 5; instance 5 is occupied (e.g. bluetoothd on a small controller).
+    complete(kernel, @read_features, 0, <<0::little-32, 31, 31, 5, 1, 5>>)
+
+    assert <<4, _::binary>> = expect_command(kernel, @params)
+    complete(kernel, @params, 0, <<4, 0, 31, 31>>)
+    expect_command(kernel, @data)
+    complete(kernel, @data, 0, <<4>>)
+    assert Task.await(task) == {:ok, 4}
+  end
+
+  test "the default instance reuses our own, even though the kernel lists it" do
+    {mgmt, kernel} = start_mgmt()
+    advertise_ok(mgmt, kernel, 5)
+
+    task = advertise_async(mgmt, <<2, 1, 6>>, [])
+    expect_command(kernel, @read_features)
+    complete(kernel, @read_features, 0, <<0::little-32, 31, 31, 5, 1, 5>>)
+    assert <<5, _::binary>> = expect_command(kernel, @params)
+    complete(kernel, @params, 0, <<5, 0, 31, 31>>)
+    expect_command(kernel, @data)
+    complete(kernel, @data, 0, <<5>>)
+    assert Task.await(task) == {:ok, 5}
+  end
+
+  test "no free instance is an error, not a takeover" do
+    {mgmt, kernel} = start_mgmt()
+    task = advertise_async(mgmt, <<2, 1, 6>>, [])
+    expect_command(kernel, @read_features)
+    complete(kernel, @read_features, 0, <<0::little-32, 31, 31, 1, 1, 1>>)
+    assert Task.await(task) == {:error, :no_free_instance}
+    assert {:error, :timeout} = :socket.recv(kernel, 0, 100)
+  end
+
   test "rejects bad input in the caller, before reaching the server" do
     assert Mgmt.advertise(:binary.copy(<<0>>, 256)) == {:error, :too_long}
     assert Mgmt.advertise(<<>>, instance: 0) == {:error, {:invalid, "instance"}}

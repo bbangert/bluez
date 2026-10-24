@@ -27,6 +27,14 @@ defmodule Bluez.Advertiser do
   because `bluetoothd` calls `Properties.GetAll` back on us before
   `RegisterAdvertisement` returns.
 
+  ## Start options
+
+    * `adapter_path:` — the adapter object path to advertise on (default:
+      the one `Bluez.Client` resolves; until it has, `advertise/2` returns
+      `{:error, :no_adapter}`). Each advertisement is unregistered from
+      the adapter it was registered on.
+    * `name:` — registered name (default `Bluez.Advertiser`).
+
   ## Advertisement spec
 
   A map; every key is optional except `:type`:
@@ -91,16 +99,34 @@ defmodule Bluez.Advertiser do
     * `:owner` — pid whose exit unregisters it (default: the caller;
       `nil` = none).
     * `:server` — the Advertiser to use (default `Bluez.Advertiser`).
+
+  Until `Bluez.Client` has resolved the adapter (and without the
+  `adapter_path:` start option) this returns `{:error, :no_adapter}`
+  rather than registering on the `hci0` fallback.
   """
   @spec advertise(spec(), keyword()) :: {:ok, pos_integer()} | {:error, term()}
   def advertise(%{type: type} = spec, opts \\ []) when type in [:broadcast, :peripheral] do
     opts = Keyword.put_new(opts, :owner, self())
     server = Keyword.get(opts, :server, __MODULE__)
 
-    with {:ok, props} <- properties(spec) do
+    # Validated here, in the caller: a bad option must not crash the
+    # shared server and lose every other advertisement's state.
+    with :ok <- validate_opts(opts),
+         {:ok, props} <- properties(spec) do
       server_call(server, {:advertise, props, opts})
     end
   end
+
+  defp validate_opts(opts) do
+    cond do
+      not (is_nil(opts[:owner]) or is_pid(opts[:owner])) -> {:error, {:invalid, "owner"}}
+      not valid_duration?(opts[:duration_ms]) -> {:error, {:invalid, "duration_ms"}}
+      true -> :ok
+    end
+  end
+
+  defp valid_duration?(nil), do: true
+  defp valid_duration?(ms), do: is_integer(ms) and ms > 0
 
   @doc "Unregister an advertisement early. `:ok` also when already gone."
   @spec stop(pos_integer(), GenServer.server()) :: :ok
@@ -155,10 +181,11 @@ defmodule Bluez.Advertiser do
 
   defp property(:includes, list), do: [{"Includes", {"as", strings!(list)}}]
 
-  defp property(:min_interval_ms, ms) when is_integer(ms) and ms > 0,
+  # D-Bus `u`: anything wider would be truncated into a different interval.
+  defp property(:min_interval_ms, ms) when ms in 1..0xFFFFFFFF,
     do: [{"MinInterval", {"u", ms}}]
 
-  defp property(:max_interval_ms, ms) when is_integer(ms) and ms > 0,
+  defp property(:max_interval_ms, ms) when ms in 1..0xFFFFFFFF,
     do: [{"MaxInterval", {"u", ms}}]
 
   defp property(:tx_power, dbm) when dbm in -127..20, do: [{"TxPower", {"n", dbm}}]
@@ -186,6 +213,7 @@ defmodule Bluez.Advertiser do
   @impl GenServer
   def init(opts) do
     connect = Keyword.get(opts, :connect_fun, fn -> Bluez.Rebus.connect(:system) end)
+    adapter_path = Keyword.get(opts, :adapter_path)
 
     case connect.() do
       {:ok, conn} ->
@@ -194,8 +222,10 @@ defmodule Bluez.Advertiser do
         state = %{
           conn: conn,
           conn_ref: Process.monitor(conn),
+          # Explicit adapter, else the one Bluez.Client resolves.
+          adapter_path: adapter_path,
           next_id: 1,
-          # id => %{props, owner_ref, timer, status: :registering | :active}
+          # id => %{props, adapter, owner_ref, timer, status: :registering | :active}
           ads: %{}
         }
 
@@ -208,6 +238,16 @@ defmodule Bluez.Advertiser do
 
   @impl GenServer
   def handle_call({:advertise, props, opts}, from, state) do
+    case adapter_path(state) do
+      {:ok, adapter} -> start_registration(state, adapter, props, opts, from)
+      :error -> {:reply, {:error, :no_adapter}, state}
+    end
+  end
+
+  def handle_call({:stop, id}, _from, state), do: {:reply, :ok, unregister(state, id)}
+
+  # Every later cleanup goes to the adapter captured here, never a re-read.
+  defp start_registration(state, adapter, props, opts, from) do
     id = state.next_id
     path = path(id)
     conn = state.conn
@@ -219,27 +259,31 @@ defmodule Bluez.Advertiser do
         nil -> nil
       end
 
-    entry = %{props: props, owner_ref: owner_ref, timer: nil, status: :registering}
+    entry = %{
+      props: props,
+      adapter: adapter,
+      owner_ref: owner_ref,
+      timer: nil,
+      status: :registering
+    }
 
     # RegisterAdvertisement re-enters us (GetAll), so it can't run here.
     {:ok, _pid} =
       Task.start(fn ->
         result =
-          DBus.call(conn, adapter_path(), @adv_mgr_iface, "RegisterAdvertisement", "oa{sv}", [
+          DBus.call(conn, adapter, @adv_mgr_iface, "RegisterAdvertisement", "oa{sv}", [
             path,
             []
           ])
 
-        send(me, {:registered, id, from, opts[:duration_ms], result})
+        send(me, {:registered, id, adapter, from, opts[:duration_ms], result})
       end)
 
     {:noreply, %{state | next_id: id + 1, ads: Map.put(state.ads, id, entry)}}
   end
 
-  def handle_call({:stop, id}, _from, state), do: {:reply, :ok, unregister(state, id)}
-
   @impl GenServer
-  def handle_info({:registered, id, from, duration_ms, result}, state) do
+  def handle_info({:registered, id, adapter, from, duration_ms, result}, state) do
     case {result, Map.fetch(state.ads, id)} do
       {{:ok, _}, {:ok, entry}} ->
         timer =
@@ -253,7 +297,7 @@ defmodule Bluez.Advertiser do
       {{:ok, _}, :error} ->
         # Stopped (owner died) while registering: take it back off air.
         GenServer.reply(from, {:error, :stopped})
-        unregister_async(state.conn, id)
+        unregister_async(state.conn, adapter, id)
         {:noreply, state}
 
       # Our call timed out (or the connection hiccuped): BlueZ may still
@@ -261,7 +305,7 @@ defmodule Bluez.Advertiser do
       # leave an untracked advertisement running.
       {{:error, {:exit, _}} = error, _} ->
         GenServer.reply(from, error)
-        unregister_async(state.conn, id)
+        unregister_async(state.conn, adapter, id)
         {:noreply, drop(state, id)}
 
       {{:error, reason}, _} ->
@@ -289,8 +333,8 @@ defmodule Bluez.Advertiser do
   # :registered handler unregisters once BlueZ has answered.
   defp unregister(state, id) do
     case Map.fetch(state.ads, id) do
-      {:ok, %{status: :active}} ->
-        unregister_async(state.conn, id)
+      {:ok, %{status: :active, adapter: adapter}} ->
+        unregister_async(state.conn, adapter, id)
         drop(state, id)
 
       {:ok, %{status: :registering}} ->
@@ -301,10 +345,10 @@ defmodule Bluez.Advertiser do
     end
   end
 
-  defp unregister_async(conn, id) do
+  defp unregister_async(conn, adapter, id) do
     {:ok, _pid} =
       Task.start(fn ->
-        DBus.call(conn, adapter_path(), @adv_mgr_iface, "UnregisterAdvertisement", "o", [path(id)])
+        DBus.call(conn, adapter, @adv_mgr_iface, "UnregisterAdvertisement", "o", [path(id)])
       end)
 
     :ok
@@ -403,5 +447,6 @@ defmodule Bluez.Advertiser do
 
   defp id_from_path(_path), do: :error
 
-  defp adapter_path, do: DevicePath.adapter_path()
+  defp adapter_path(%{adapter_path: path}) when is_binary(path), do: {:ok, path}
+  defp adapter_path(_state), do: DevicePath.resolved_adapter_path()
 end

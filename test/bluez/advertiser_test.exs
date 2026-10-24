@@ -60,7 +60,11 @@ defmodule Bluez.AdvertiserTest do
       connect_fun = fn -> Bluez.Rebus.connect(addr) end
 
       # init/1 blocks on the bus Hello until this test answers it.
-      starter = Task.async(fn -> GenServer.start(Advertiser, connect_fun: connect_fun) end)
+      starter =
+        Task.async(fn ->
+          GenServer.start(Advertiser, connect_fun: connect_fun, adapter_path: @adapter)
+        end)
+
       assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}, 1_000
       reply(svr, hello, "s", [":1.100"])
       {:ok, adv} = Task.await(starter)
@@ -144,6 +148,15 @@ defmodule Bluez.AdvertiserTest do
                       }},
                      1_000
     end
+  end
+
+  test "rejects bad options in the caller, before reaching the server" do
+    spec = %{type: :broadcast}
+    assert Advertiser.advertise(spec, owner: :worker) == {:error, {:invalid, "owner"}}
+    assert Advertiser.advertise(spec, duration_ms: 0) == {:error, {:invalid, "duration_ms"}}
+
+    assert {:error, {:invalid_spec, _}} =
+             Advertiser.properties(%{type: :broadcast, min_interval_ms: 4_294_967_316})
   end
 
   test "public API degrades when not running" do

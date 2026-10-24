@@ -160,10 +160,12 @@ payload as a 16-bit Service UUID list, where order and repeated values
   response of connectable adverts. Uses *Add Extended Advertising
   Parameters/Data* (legacy PDUs unless a secondary PHY is requested) so
   the interval can be set — the kernel default of 1.28 s misses short
-  bursts. Instances default to the controller's highest number to stay
-  clear of `bluetoothd`'s, which allocates from 1; commands are
-  serialized one at a time; every instance is removed on duration,
-  owner exit, `stop_advertising/1`, or shutdown.
+  bursts. Instances default to the highest number that is free or
+  already ours, so `bluetoothd`'s (allocated from 1) are never taken
+  over; commands are serialized one at a time; every instance is removed
+  on duration, owner exit, `stop_advertising/1`, or shutdown. Both
+  advertisers wait for `Bluez.Client` to resolve the adapter rather than
+  act on the `hci0` fallback, and clean up on the adapter they used.
 - **`Bluez.AdvertReceiver`** (`HCI_CHANNEL_RAW` socket with a kernel
   filter for LE Meta events). Listens to the controller's legacy and
   extended advertising reports while `Bluez.Client` scans, and hands each

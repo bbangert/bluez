@@ -43,6 +43,20 @@ defmodule Bluez.DevicePath do
   def adapter_path, do: :persistent_term.get(@adapter_path_key, @default_adapter_path)
 
   @doc """
+  The adapter path `Bluez.Client` resolved, or `:error` while it hasn't
+  yet (when `adapter_path/0` still answers the `/org/bluez/hci0`
+  default). For callers that must not act on the fallback — e.g. anything
+  that leaves state on a controller and has to clean it up on the same one.
+  """
+  @spec resolved_adapter_path() :: {:ok, String.t()} | :error
+  def resolved_adapter_path do
+    case :persistent_term.get(@adapter_path_key, nil) do
+      nil -> :error
+      path -> {:ok, path}
+    end
+  end
+
+  @doc """
   The `:persistent_term` key the resolved adapter path is published
   under. Written by `Bluez.Client` at setup (and tests).
   """

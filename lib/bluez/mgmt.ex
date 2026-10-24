@@ -17,12 +17,19 @@ defmodule Bluez.Mgmt do
   kernel default of 1.28 s is useless for short bursts.
 
   Advertising instances are a per-controller namespace shared with
-  `bluetoothd`, which allocates its own from 1 upward. Instances added
-  here default to the controller's *highest* instance number
-  (`read_advertising_features/0`) to stay clear of it; pass `instance:`
-  to manage several. Every instance added here is removed again when its
-  `duration_ms:` elapses, when its owner process exits, on
-  `stop_advertising/1`, and when this process stops.
+  `bluetoothd`, which allocates its own from 1 upward. Without
+  `instance:`, an advertisement goes to the highest instance number that
+  is free or already ours (`read_advertising_features/0` lists the
+  occupied ones), so it never takes over `bluetoothd`'s; repeated default
+  sends reuse that one instance, each replacing the last. An explicit
+  `instance:` is used as given — replacing whatever occupies it. Every
+  instance added here is removed again when its `duration_ms:` elapses,
+  when its owner process exits, on `stop_advertising/1`, and when this
+  process stops.
+
+  Without the `adapter_index:` start option, requests are refused with
+  `{:error, :no_adapter_index}` until `Bluez.Client` has resolved the
+  adapter, so nothing is ever left on the `hci0` fallback.
 
   ## Address
 
@@ -42,7 +49,6 @@ defmodule Bluez.Mgmt do
 
   alias Bluez.{AdData, DevicePath, Hci}
 
-  @call_timeout 10_000
   # Per-command patience for the kernel's reply; MGMT always answers, so
   # hitting this means the socket is wedged — restart with a fresh one.
   @command_timeout 5_000
@@ -152,9 +158,14 @@ defmodule Bluez.Mgmt do
     data
   end
 
-  # `catch :exit` idiom (see `Bluez`): not running / wedged → error tuple.
+  # `catch :exit` idiom (see `Bluez`): not running → error tuple. No call
+  # timeout: queued jobs can legitimately take longer than any fixed
+  # deadline, and giving up early would leave work running whose outcome
+  # (an instance on air) the caller never learns. The server can't stall a
+  # caller forever — every MGMT command has a watchdog that restarts it,
+  # which exits this call.
   defp server_call(server, request) do
-    GenServer.call(server, request, @call_timeout)
+    GenServer.call(server, request, :infinity)
   catch
     :exit, _reason -> {:error, :not_running}
   end
@@ -342,8 +353,10 @@ defmodule Bluez.Mgmt do
         Process.send_after(self(), {:command_timeout, ref}, state.command_timeout)
         %{state | job: Map.put(job, :ref, ref)}
 
+      # Through failed/3, so a data command that can't be sent still gets
+      # its half-made instance rolled back.
       {:error, reason} ->
-        finish(state, job, {:error, reason})
+        failed(state, job, {:error, reason})
     end
   end
 
@@ -367,12 +380,11 @@ defmodule Bluez.Mgmt do
   defp step_done(state, _opcode, _result), do: state
 
   defp complete(state, %{kind: {:pick_instance, index, adv_data, opts}} = job, params) do
-    case Hci.decode_adv_features(params) do
-      {:ok, %{max_instances: max}} when max > 0 ->
-        start_advertise(state, job, index, max, adv_data, opts)
-
-      _other ->
-        finish(state, job, {:error, :no_advertising_instances})
+    with {:ok, features} <- Hci.decode_adv_features(params),
+         instance when is_integer(instance) <- pick_instance(state, index, features) do
+      start_advertise(state, job, index, instance, adv_data, opts)
+    else
+      _other -> finish(state, job, {:error, :no_free_instance})
     end
   end
 
@@ -464,6 +476,16 @@ defmodule Bluez.Mgmt do
     enqueue(state, remove_job(entry.index, instance, entry.gen, from))
   end
 
+  # Highest instance that is free on the controller or already ours there
+  # (re-advertising replaces our own); never one someone else holds.
+  defp pick_instance(state, index, %{max_instances: max, instances: in_use}) when max > 0 do
+    Enum.find(max..1//-1, fn instance ->
+      match?(%{index: ^index}, state.instances[instance]) or instance not in in_use
+    end)
+  end
+
+  defp pick_instance(_state, _index, _features), do: nil
+
   defp current?(state, instance, gen), do: match?(%{gen: ^gen}, state.instances[instance])
 
   defp removed(state, instance, :rollback), do: untrack(state, instance)
@@ -520,5 +542,8 @@ defmodule Bluez.Mgmt do
   end
 
   defp index(%{adapter_index: index}) when is_integer(index), do: {:ok, index}
-  defp index(_state), do: Hci.adapter_index(DevicePath.adapter_path())
+
+  defp index(_state) do
+    with {:ok, path} <- DevicePath.resolved_adapter_path(), do: Hci.adapter_index(path)
+  end
 end
