@@ -79,6 +79,34 @@ defmodule BluezTest do
                Enum.find(children, &match?(%{id: :bluetoothd}, &1))
     end
 
+    test "radio children are opt-in and land between audio and extra_children" do
+      on_report = fn _report -> :ok end
+
+      children =
+        Bluez.children(
+          advertiser: true,
+          mgmt: [adapter_index: 1],
+          advert_receiver: [on_report: on_report],
+          extra_children: [__MODULE__.ExtraChild]
+        )
+
+      assert children |> Enum.map(&id_of/1) |> Enum.take(-5) == [
+               Bluez.BlueAlsa,
+               Bluez.Advertiser,
+               Bluez.Mgmt,
+               Bluez.AdvertReceiver,
+               __MODULE__.ExtraChild
+             ]
+
+      assert {Bluez.Advertiser, []} in children
+      assert {Bluez.Mgmt, [adapter_index: 1]} in children
+      assert {Bluez.AdvertReceiver, [on_report: ^on_report]} = Enum.at(children, -2)
+
+      ids = Bluez.children(advertiser: false, mgmt: nil) |> Enum.map(&id_of/1)
+      refute Bluez.Advertiser in ids
+      refute Bluez.Mgmt in ids
+    end
+
     test "no opts yields the default children with an empty extra slot" do
       ids = Bluez.children([]) |> Enum.map(&id_of/1)
 

@@ -30,7 +30,12 @@ defmodule Bluez do
        after the scanning/GATT clients so an audio-daemon fault never
        restarts the scanning stack — the children that follow *do* restart
        with it under `:rest_for_one`, which is intended (same audio path).
-    8. `extra_children:` — host-supplied child specs, appended last.
+    8. Opt-in raw radio access, each only when its option is given:
+       `Bluez.Advertiser` (`advertiser:`), `Bluez.Mgmt` (`mgmt:`) and
+       `Bluez.AdvertReceiver` (`advert_receiver:`). After audio so their
+       faults never touch it; a bluetoothd restart rebuilds them (their
+       registrations die with it anyway).
+    9. `extra_children:` — host-supplied child specs, appended last.
 
   ## Options
 
@@ -48,6 +53,13 @@ defmodule Bluez do
       `Bluez.BlueAlsa` client. Requires bluez-alsa (v4 recommended) on the
       device.
     * `blue_alsa:` — keyword opts for `Bluez.BlueAlsa` (`pubsub:`).
+    * `advertiser:` — `true` or keyword opts: start `Bluez.Advertiser`
+      (LE advertising via `LEAdvertisingManager1`). Off by default.
+    * `mgmt:` — `true` or keyword opts: start `Bluez.Mgmt` (raw-AD
+      advertising via the kernel MGMT socket). Off by default.
+    * `advert_receiver:` — `true` or keyword opts (`on_report:`, …): start
+      `Bluez.AdvertReceiver` (verbatim advertising reports off the HCI
+      raw channel). Off by default.
     * `extra_children:` — host child specs appended at the end of the tree.
       Under `:rest_for_one` they restart with the audio path, and a fault
       there never disturbs the scanning/GATT stack above them. Ordering
@@ -208,6 +220,7 @@ defmodule Bluez do
       {__MODULE__.Gatt, Keyword.get(opts, :gatt, [])}
     ] ++
       audio_children(opts) ++
+      radio_children(opts) ++
       Keyword.get(opts, :extra_children, [])
   end
 
@@ -243,6 +256,20 @@ defmodule Bluez do
       ]
     else
       []
+    end
+  end
+
+  # Opt-in raw radio access (advertising TX, verbatim advert RX). After
+  # audio: a fault here only restarts these and extra_children.
+  defp radio_children(opts) do
+    for {key, module} <- [
+          advertiser: __MODULE__.Advertiser,
+          mgmt: __MODULE__.Mgmt,
+          advert_receiver: __MODULE__.AdvertReceiver
+        ],
+        child_opts = Keyword.get(opts, key, false),
+        child_opts != false and child_opts != nil do
+      {module, if(child_opts == true, do: [], else: child_opts)}
     end
   end
 

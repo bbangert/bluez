@@ -84,6 +84,13 @@ defmodule Bluez.MixProject do
           Bluez.Rebus.Decoder
         ],
         Scanning: [Bluez.Client, Bluez.DeviceCache, Bluez.Advert],
+        "Raw radio access": [
+          Bluez.Advertiser,
+          Bluez.Mgmt,
+          Bluez.AdvertReceiver,
+          Bluez.AdData,
+          Bluez.Hci
+        ],
         GATT: [
           Bluez.Gatt,
           Bluez.GattTree,
