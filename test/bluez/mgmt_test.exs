@@ -90,6 +90,29 @@ defmodule Bluez.MgmtTest do
     assert expect_command(kernel, @remove) == <<3>>
   end
 
+  test "a half-made instance whose rollback fails stays tracked and removable" do
+    {mgmt, kernel} = start_mgmt()
+    task = advertise_async(mgmt, <<2, 1, 6>>, instance: 3)
+    expect_command(kernel, @params)
+    complete(kernel, @params, 0, <<3, 0, 31, 31>>)
+    expect_command(kernel, @data)
+    complete(kernel, @data, 0x0D)
+    assert Task.await(task) == {:error, :invalid_params}
+
+    assert expect_command(kernel, @remove) == <<3>>
+    complete(kernel, @remove, 0x0A)
+
+    assert eventually(fn ->
+             match?(%{3 => %{removing: false}}, :sys.get_state(mgmt).instances)
+           end)
+
+    stopper = Task.async(fn -> Mgmt.stop_advertising(3, mgmt) end)
+    assert expect_command(kernel, @remove) == <<3>>
+    complete(kernel, @remove, 0, <<3>>)
+    assert Task.await(stopper) == :ok
+    assert :sys.get_state(mgmt).instances == %{}
+  end
+
   test "a refused params step reports the status and sends nothing more" do
     {mgmt, kernel} = start_mgmt()
     task = advertise_async(mgmt, <<2, 1, 6>>, instance: 3)

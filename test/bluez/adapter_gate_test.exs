@@ -1,27 +1,35 @@
 defmodule Bluez.AdapterGateTest do
-  # Not async: drives the global adapter-path :persistent_term.
+  # Not async: drives the global resolved-adapter :persistent_term.
   use ExUnit.Case, async: false
 
-  alias Bluez.{Advertiser, DevicePath, Mgmt, TestSocketPair}
+  alias Bluez.{Advertiser, Client, DevicePath, Mgmt, TestSocketPair}
   alias Bluez.Rebus.{Message, TestServer}
 
   setup do
-    previous = :persistent_term.get(DevicePath.adapter_path_key(), nil)
-    :persistent_term.erase(DevicePath.adapter_path_key())
+    previous = :persistent_term.get(DevicePath.resolved_adapter_key(), nil)
+    :persistent_term.erase(DevicePath.resolved_adapter_key())
 
     on_exit(fn ->
       if previous,
-        do: :persistent_term.put(DevicePath.adapter_path_key(), previous),
-        else: :persistent_term.erase(DevicePath.adapter_path_key())
+        do: :persistent_term.put(DevicePath.resolved_adapter_key(), previous),
+        else: :persistent_term.erase(DevicePath.resolved_adapter_key())
     end)
   end
 
   test "resolved_adapter_path/0 is :error until the Client publishes one" do
     assert DevicePath.resolved_adapter_path() == :error
-    assert DevicePath.adapter_path() == "/org/bluez/hci0"
 
-    :persistent_term.put(DevicePath.adapter_path_key(), "/org/bluez/hci1")
+    :persistent_term.put(DevicePath.resolved_adapter_key(), "/org/bluez/hci1")
     assert DevicePath.resolved_adapter_path() == {:ok, "/org/bluez/hci1"}
+  end
+
+  test "a (re)starting Client clears the previous incarnation's resolution" do
+    :persistent_term.put(DevicePath.resolved_adapter_key(), "/org/bluez/hci1")
+
+    # Fails to connect right after init clears the marker — the point is
+    # that a new incarnation never inherits the old selection.
+    assert {:error, _} = GenServer.start(Client, connect_fun: fn -> {:error, :no_bus} end)
+    assert DevicePath.resolved_adapter_path() == :error
   end
 
   test "Mgmt refuses to act on the hci0 fallback" do

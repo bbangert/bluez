@@ -128,7 +128,11 @@ defmodule Bluez.Advertiser do
   defp valid_duration?(nil), do: true
   defp valid_duration?(ms), do: is_integer(ms) and ms > 0
 
-  @doc "Unregister an advertisement early. `:ok` also when already gone."
+  @doc """
+  Unregister an advertisement early. Returns once BlueZ has answered the
+  `UnregisterAdvertisement` call, so a following `advertise/2` can reuse
+  the freed slot. `:ok` also when already gone.
+  """
   @spec stop(pos_integer(), GenServer.server()) :: :ok
   def stop(id, server \\ __MODULE__) do
     case server_call(server, {:stop, id}) do
@@ -244,7 +248,18 @@ defmodule Bluez.Advertiser do
     end
   end
 
-  def handle_call({:stop, id}, _from, state), do: {:reply, :ok, unregister(state, id)}
+  # An active advertisement replies once BlueZ has unregistered it (from
+  # the Task, keeping this loop free); anything else replies at once.
+  def handle_call({:stop, id}, from, state) do
+    case Map.fetch(state.ads, id) do
+      {:ok, %{status: :active, adapter: adapter}} ->
+        unregister_async(state.conn, adapter, id, from)
+        {:noreply, drop(state, id)}
+
+      _registering_or_gone ->
+        {:reply, :ok, unregister(state, id)}
+    end
+  end
 
   # Every later cleanup goes to the adapter captured here, never a re-read.
   defp start_registration(state, adapter, props, opts, from) do
@@ -345,10 +360,11 @@ defmodule Bluez.Advertiser do
     end
   end
 
-  defp unregister_async(conn, adapter, id) do
+  defp unregister_async(conn, adapter, id, from \\ nil) do
     {:ok, _pid} =
       Task.start(fn ->
         DBus.call(conn, adapter, @adv_mgr_iface, "UnregisterAdvertisement", "o", [path(id)])
+        if from, do: GenServer.reply(from, :ok)
       end)
 
     :ok

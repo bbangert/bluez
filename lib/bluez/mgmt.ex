@@ -293,7 +293,7 @@ defmodule Bluez.Mgmt do
 
   # `gen` ties a removal to the advertisement it was queued for: if the
   # instance has been re-advertised by the time it runs, the removal is
-  # stale and skipped (see start_job/2). `:rollback` removes unconditionally.
+  # stale and skipped (see start_job/2).
   defp remove_job(index, instance, gen, from) do
     %{
       from: from,
@@ -327,7 +327,7 @@ defmodule Bluez.Mgmt do
   end
 
   defp start_job(state, %{kind: {:remove, instance, gen}} = job) do
-    if gen == :rollback or current?(state, instance, gen),
+    if current?(state, instance, gen),
       do: send_step(state, job),
       else: finish(state, job, :ok)
   end
@@ -411,7 +411,16 @@ defmodule Bluez.Mgmt do
   # anything queued, which may be a new advertisement on the same instance.
   defp failed(state, %{kind: {:advertising, index, instance, _opts}, steps: [_data]} = job, error) do
     if job.from, do: GenServer.reply(job.from, error)
-    rollback = remove_job(index, instance, :rollback, nil)
+
+    # Track it (as being removed, replacing any older entry — the accepted
+    # parameters already overwrote that advertisement) so a failed rollback
+    # is still covered by stop_advertising/1 and shutdown.
+    state = untrack(state, instance)
+    gen = make_ref()
+    entry = %{index: index, owner_ref: nil, timer: nil, gen: gen, removing: true}
+    state = put_in(state.instances[instance], entry)
+
+    rollback = remove_job(index, instance, gen, nil)
     next(%{state | job: nil, queue: :queue.in_r(rollback, state.queue)})
   end
 
@@ -487,8 +496,6 @@ defmodule Bluez.Mgmt do
   defp pick_instance(_state, _index, _features), do: nil
 
   defp current?(state, instance, gen), do: match?(%{gen: ^gen}, state.instances[instance])
-
-  defp removed(state, instance, :rollback), do: untrack(state, instance)
 
   defp removed(state, instance, gen),
     do: if(current?(state, instance, gen), do: untrack(state, instance), else: state)

@@ -77,7 +77,14 @@ defmodule Bluez.AdvertiserTest do
          %{svr: svr, adv: adv} do
       uuids = AdData.uuid16_strings(<<1, 2, 1, 2>>)
       spec = %{type: :broadcast, service_uuids: uuids}
-      task = Task.async(fn -> Advertiser.advertise(spec, server: adv, duration_ms: 50) end)
+      # Owned by the test process: with the default (the Task) owner-exit
+      # cleanup would unregister it and mask a broken duration_ms.
+      owner = self()
+
+      task =
+        Task.async(fn ->
+          Advertiser.advertise(spec, server: adv, duration_ms: 50, owner: owner)
+        end)
 
       assert_receive {^svr,
                       %Message{
@@ -105,6 +112,29 @@ defmodule Bluez.AdvertiserTest do
                         body: [^path]
                       }},
                      1_000
+    end
+
+    test "stop/2 returns only once BlueZ has answered the unregister", %{svr: svr, adv: adv} do
+      owner = self()
+
+      task =
+        Task.async(fn -> Advertiser.advertise(%{type: :broadcast}, server: adv, owner: owner) end)
+
+      assert_receive {^svr, %Message{header_fields: %{member: "RegisterAdvertisement"}} = reg},
+                     1_000
+
+      reply(svr, reg)
+      assert {:ok, id} = Task.await(task)
+
+      stopper = Task.async(fn -> Advertiser.stop(id, adv) end)
+
+      assert_receive {^svr,
+                      %Message{header_fields: %{member: "UnregisterAdvertisement"}} = unreg},
+                     1_000
+
+      refute Task.yield(stopper, 100)
+      reply(svr, unreg)
+      assert Task.await(stopper) == :ok
     end
 
     test "a BlueZ error is returned and the object is dropped", %{svr: svr, adv: adv} do
