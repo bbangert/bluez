@@ -256,6 +256,14 @@ defmodule Bluez.Advertiser do
         unregister_async(state.conn, id)
         {:noreply, state}
 
+      # Our call timed out (or the connection hiccuped): BlueZ may still
+      # accept the registration later, so take it back off air rather than
+      # leave an untracked advertisement running.
+      {{:error, {:exit, _}} = error, _} ->
+        GenServer.reply(from, error)
+        unregister_async(state.conn, id)
+        {:noreply, drop(state, id)}
+
       {{:error, reason}, _} ->
         GenServer.reply(from, {:error, reason})
         {:noreply, drop(state, id)}

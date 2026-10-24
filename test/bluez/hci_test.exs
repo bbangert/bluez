@@ -156,6 +156,21 @@ defmodule Bluez.HciTest do
       assert_raise ArgumentError, fn -> Hci.add_ext_adv_params(1, flags: [:bogus]) end
     end
 
+    test "add_ext_adv_params/2 refuses values its fixed-width fields would truncate" do
+      for opts <- [
+            [tx_power: 256],
+            [tx_power: 21],
+            [tx_power: -128],
+            [duration_s: 65_536],
+            [timeout_s: -1],
+            [tx_power: :loud]
+          ] do
+        assert_raise ArgumentError, fn -> Hci.add_ext_adv_params(1, opts) end
+      end
+
+      assert <<1, _::binary>> = Hci.add_ext_adv_params(1, tx_power: 20, duration_s: 65_535)
+    end
+
     test "add_ext_adv_data/3 carries adv data then scan response" do
       assert Hci.add_ext_adv_data(3, <<1, 2>>, <<9>>) == <<3, 2, 1, 1, 2, 9>>
     end

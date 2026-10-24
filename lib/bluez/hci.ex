@@ -389,9 +389,9 @@ defmodule Bluez.Hci do
   def add_ext_adv_params(instance, opts \\ []) when instance in 1..254 do
     flags = adv_flags(Keyword.get(opts, :flags, []))
 
-    {duration, flags} = optional_param(opts, :duration_s, flags, @adv_param_duration)
-    {timeout, flags} = optional_param(opts, :timeout_s, flags, @adv_param_timeout)
-    {tx_power, flags} = optional_param(opts, :tx_power, flags, @adv_param_tx_power)
+    {duration, flags} = optional_param(opts, :duration_s, 0..0xFFFF, flags, @adv_param_duration)
+    {timeout, flags} = optional_param(opts, :timeout_s, 0..0xFFFF, flags, @adv_param_timeout)
+    {tx_power, flags} = optional_param(opts, :tx_power, -127..20, flags, @adv_param_tx_power)
 
     {min_i, max_i, flags} =
       case {opts[:min_interval_ms], opts[:max_interval_ms]} do
@@ -405,10 +405,20 @@ defmodule Bluez.Hci do
       max_i::little-32, tx_power::signed>>
   end
 
-  defp optional_param(opts, key, flags, bit) do
+  # Range-checked: the fixed-width fields would otherwise silently truncate
+  # an out-of-range value into a different setting.
+  defp optional_param(opts, key, range, flags, bit) do
     case opts[key] do
-      nil -> {0, flags}
-      value when is_integer(value) -> {value, flags ||| bit}
+      nil ->
+        {0, flags}
+
+      value when is_integer(value) ->
+        if value in range,
+          do: {value, flags ||| bit},
+          else: raise(ArgumentError, "#{key} #{value} outside #{inspect(range)}")
+
+      other ->
+        raise ArgumentError, "#{key} must be an integer, got #{inspect(other)}"
     end
   end
 

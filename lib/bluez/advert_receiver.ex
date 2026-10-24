@@ -30,8 +30,10 @@ defmodule Bluez.AdvertReceiver do
     * `on_report:` — `fun(report) -> any`, called in this process for every
       report (default: discard). Keep it fast: it runs on the receive
       path. Raises crash this process (the supervisor restarts it).
-    * `adapter_index:` — controller index to listen on; default: resolved
-      from `Bluez.DevicePath.adapter_path/0` at each (re)open.
+    * `adapter_index:` — controller index to listen on; default: follow
+      `Bluez.DevicePath.adapter_path/0`, re-checked every 2 s so the
+      socket moves once `Bluez.Client` resolves (or the host switches)
+      the selected radio.
     * `name:` — registered name (default `Bluez.AdvertReceiver`).
 
   When the socket can't be opened (no adapter yet, no Bluetooth in the
@@ -45,6 +47,7 @@ defmodule Bluez.AdvertReceiver do
   alias Bluez.{DevicePath, Hci}
 
   @retry_ms 2_000
+  @adapter_check_ms 2_000
   # Bounded drain per wakeup so a flood of reports can't starve the mailbox.
   @drain_batch 64
 
@@ -72,8 +75,16 @@ defmodule Bluez.AdvertReceiver do
       adapter_index: Keyword.get(opts, :adapter_index),
       # Test seam: fun(index) -> {:ok, socket} | {:error, reason}.
       open: Keyword.get(opts, :open, &Hci.open(:raw, &1)),
-      retry_ms: Keyword.get(opts, :retry_ms, @retry_ms)
+      retry_ms: Keyword.get(opts, :retry_ms, @retry_ms),
+      adapter_check_ms: Keyword.get(opts, :adapter_check_ms, @adapter_check_ms),
+      # The controller the open socket is bound to.
+      bound_index: nil
     }
+
+    # Following the selected adapter: the default path can still be the
+    # hci0 fallback when we first open (Bluez.Client resolves the selection
+    # asynchronously), so keep checking and move when it changes.
+    if state.adapter_index == nil, do: schedule_adapter_check(state)
 
     {:ok, state, {:continue, :open}}
   end
@@ -87,6 +98,20 @@ defmodule Bluez.AdvertReceiver do
   @impl GenServer
   def handle_info(:reopen, state), do: {:noreply, open(state)}
 
+  def handle_info(:check_adapter, state) do
+    schedule_adapter_check(state)
+
+    case {state.sock, index(state)} do
+      {sock, {:ok, index}} when sock != nil and index != state.bound_index ->
+        Logger.info("Bluez.AdvertReceiver: selected adapter changed to hci#{index}, moving")
+        :socket.close(sock)
+        {:noreply, open(%{state | sock: nil, bound_index: nil})}
+
+      _other ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:"$socket", sock, :select, _handle}, %{sock: sock} = state),
     do: {:noreply, drain(state, @drain_batch)}
 
@@ -99,7 +124,7 @@ defmodule Bluez.AdvertReceiver do
     with {:ok, index} <- index(state),
          {:ok, sock} <- state.open.(index) do
       Logger.info("Bluez.AdvertReceiver: listening for LE advertising reports on hci#{index}")
-      drain(%{state | sock: sock}, @drain_batch)
+      drain(%{state | sock: sock, bound_index: index}, @drain_batch)
     else
       {:error, reason} -> retry(state, reason)
       :error -> retry(state, :no_adapter_index)
@@ -108,6 +133,9 @@ defmodule Bluez.AdvertReceiver do
 
   defp index(%{adapter_index: index}) when is_integer(index), do: {:ok, index}
   defp index(_state), do: Hci.adapter_index(DevicePath.adapter_path())
+
+  defp schedule_adapter_check(state),
+    do: Process.send_after(self(), :check_adapter, state.adapter_check_ms)
 
   defp retry(state, reason) do
     Logger.debug("Bluez.AdvertReceiver: HCI socket unavailable (#{inspect(reason)}), retrying")

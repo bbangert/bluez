@@ -208,9 +208,8 @@ defmodule Bluez.Mgmt do
 
   def handle_call({:stop_advertising, instance}, from, state) do
     case Map.fetch(state.instances, instance) do
-      {:ok, entry} ->
-        state = untrack(state, instance)
-        {:noreply, enqueue(state, remove_job(entry.index, instance, from))}
+      {:ok, _entry} ->
+        {:noreply, cleanup(state, instance, from)}
 
       :error ->
         {:reply, {:error, :unknown_instance}, state}
@@ -244,9 +243,8 @@ defmodule Bluez.Mgmt do
 
   def handle_info({:expire, instance, timer}, state) do
     case state.instances do
-      %{^instance => %{timer: ^timer} = entry} ->
-        state = untrack(state, instance)
-        {:noreply, enqueue(state, remove_job(entry.index, instance, nil))}
+      %{^instance => %{timer: ^timer}} ->
+        {:noreply, cleanup(state, instance, nil)}
 
       _other ->
         {:noreply, state}
@@ -254,26 +252,27 @@ defmodule Bluez.Mgmt do
   end
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
-    owned = for {instance, %{owner_ref: ^ref} = entry} <- state.instances, do: {instance, entry}
-
-    state =
-      Enum.reduce(owned, state, fn {instance, entry}, acc ->
-        acc |> untrack(instance) |> enqueue(remove_job(entry.index, instance, nil))
-      end)
-
-    {:noreply, state}
+    owned = for {instance, %{owner_ref: ^ref}} <- state.instances, do: instance
+    {:noreply, Enum.reduce(owned, state, &cleanup(&2, &1, nil))}
   end
 
   def handle_info(_other, state), do: {:noreply, state}
 
   @impl GenServer
   def terminate(_reason, state) do
-    # Best effort: don't leave our instances on air after we're gone.
-    Enum.each(state.instances, fn {instance, entry} ->
-      :socket.send(
-        state.sock,
-        Hci.mgmt_command(Hci.op_remove_advertising(), entry.index, <<instance>>)
-      )
+    # Best effort: don't leave our instances on air after we're gone —
+    # including one whose parameters the kernel may already have accepted
+    # while its data command is still in flight.
+    tracked = for {instance, entry} <- state.instances, do: {entry.index, instance}
+
+    in_flight =
+      case state.job do
+        %{kind: {:advertising, index, instance, _opts}} -> [{index, instance}]
+        _other -> []
+      end
+
+    Enum.each(Enum.uniq(in_flight ++ tracked), fn {index, instance} ->
+      :socket.send(state.sock, Hci.mgmt_command(Hci.op_remove_advertising(), index, <<instance>>))
     end)
 
     :socket.close(state.sock)
@@ -281,10 +280,13 @@ defmodule Bluez.Mgmt do
 
   # ── job queue ─────────────────────────────────────────────────────────────
 
-  defp remove_job(index, instance, from) do
+  # `gen` ties a removal to the advertisement it was queued for: if the
+  # instance has been re-advertised by the time it runs, the removal is
+  # stale and skipped (see start_job/2). `:rollback` removes unconditionally.
+  defp remove_job(index, instance, gen, from) do
     %{
       from: from,
-      kind: :remove,
+      kind: {:remove, instance, gen},
       steps: [{Hci.op_remove_advertising(), index, <<instance>>}]
     }
   end
@@ -311,6 +313,12 @@ defmodule Bluez.Mgmt do
       instance ->
         start_advertise(state, job, index, instance, adv_data, opts)
     end
+  end
+
+  defp start_job(state, %{kind: {:remove, instance, gen}} = job) do
+    if gen == :rollback or current?(state, instance, gen),
+      do: send_step(state, job),
+      else: finish(state, job, :ok)
   end
 
   defp start_job(state, job), do: send_step(state, job)
@@ -383,13 +391,32 @@ defmodule Bluez.Mgmt do
     finish(state, job, result)
   end
 
-  defp complete(state, %{kind: :remove} = job, _params), do: finish(state, job, :ok)
+  defp complete(state, %{kind: {:remove, instance, gen}} = job, _params),
+    do: finish(removed(state, instance, gen), job, :ok)
 
   # Parameters accepted but data refused leaves a half-made instance:
-  # remove it (no reply owed) before reporting the failure.
+  # report the failure, then remove it as the very next job — ahead of
+  # anything queued, which may be a new advertisement on the same instance.
   defp failed(state, %{kind: {:advertising, index, instance, _opts}, steps: [_data]} = job, error) do
-    state = finish(state, job, error)
-    enqueue(state, remove_job(index, instance, nil))
+    if job.from, do: GenServer.reply(job.from, error)
+    rollback = remove_job(index, instance, :rollback, nil)
+    next(%{state | job: nil, queue: :queue.in_r(rollback, state.queue)})
+  end
+
+  # Remove Advertising for an instance the kernel no longer has: it's gone,
+  # which is what was asked.
+  defp failed(state, %{kind: {:remove, instance, gen}} = job, {:error, :invalid_params}),
+    do: finish(removed(state, instance, gen), job, :ok)
+
+  # Any other removal failure: keep tracking it (owner/duration cleanup is
+  # spent, but stop_advertising/1 and shutdown still cover it).
+  defp failed(state, %{kind: {:remove, instance, gen}} = job, error) do
+    state =
+      if current?(state, instance, gen),
+        do: update_in(state.instances[instance], &%{&1 | removing: false}),
+        else: state
+
+    finish(state, job, error)
   end
 
   defp failed(state, job, error), do: finish(state, job, error)
@@ -422,9 +449,27 @@ defmodule Bluez.Mgmt do
           nil
       end
 
-    entry = %{index: index, owner_ref: owner_ref, timer: timer}
+    entry = %{index: index, owner_ref: owner_ref, timer: timer, gen: make_ref(), removing: false}
     %{state | instances: Map.put(state.instances, instance, entry)}
   end
+
+  # Start taking `instance` off air. It stays tracked (flagged `removing`)
+  # until the kernel confirms, so a failed removal is still covered by
+  # stop_advertising/1 and shutdown; owner and duration triggers are spent.
+  defp cleanup(state, instance, from) do
+    entry = Map.fetch!(state.instances, instance)
+    if entry.owner_ref, do: Process.demonitor(entry.owner_ref, [:flush])
+    entry = %{entry | owner_ref: nil, timer: nil, removing: true}
+    state = put_in(state.instances[instance], entry)
+    enqueue(state, remove_job(entry.index, instance, entry.gen, from))
+  end
+
+  defp current?(state, instance, gen), do: match?(%{gen: ^gen}, state.instances[instance])
+
+  defp removed(state, instance, :rollback), do: untrack(state, instance)
+
+  defp removed(state, instance, gen),
+    do: if(current?(state, instance, gen), do: untrack(state, instance), else: state)
 
   defp untrack(state, instance) do
     case Map.pop(state.instances, instance) do
@@ -461,9 +506,13 @@ defmodule Bluez.Mgmt do
         step_done(state, opcode, {:error, status})
 
       # Someone else (bluetoothd restarting, an expiring kernel timeout)
-      # removed one of our instances: stop tracking it.
-      {:ok, {:advertising_removed, _index, instance}} ->
-        untrack(state, instance)
+      # removed one of our instances: stop tracking it. The socket sees
+      # every controller's events, so match the index too.
+      {:ok, {:advertising_removed, index, instance}} ->
+        case state.instances[instance] do
+          %{index: ^index} -> untrack(state, instance)
+          _other -> state
+        end
 
       _other ->
         state

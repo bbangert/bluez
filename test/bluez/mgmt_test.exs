@@ -14,6 +14,8 @@ defmodule Bluez.MgmtTest do
 
     open = fn ->
       {proc, kernel} = TestSocketPair.open()
+      # The test owns the kernel side, so it outlives the server.
+      :ok = :socket.setopt(kernel, :otp, :controlling_process, test_pid)
       send(test_pid, {:kernel, kernel})
       {:ok, proc}
     end
@@ -160,6 +162,107 @@ defmodule Bluez.MgmtTest do
     # MGMT Advertising Removed event (bluetoothd restart cleared it).
     :ok = :socket.send(kernel, <<0x24, 0, 0, 0, 1, 0, 6>>)
     assert eventually(fn -> :sys.get_state(mgmt).instances == %{} end)
+  end
+
+  # Accept an advertisement on `instance` end to end.
+  defp advertise_ok(mgmt, kernel, instance, opts \\ []) do
+    task = advertise_async(mgmt, <<2, 1, 6>>, [instance: instance] ++ opts)
+    expect_command(kernel, @params)
+    complete(kernel, @params, 0, <<instance, 0, 31, 31>>)
+    expect_command(kernel, @data)
+    complete(kernel, @data, 0, <<instance>>)
+    assert Task.await(task) == {:ok, instance}
+  end
+
+  test "an expiry racing a replacement on the same instance doesn't remove the replacement" do
+    {mgmt, kernel} = start_mgmt()
+    advertise_ok(mgmt, kernel, 5, duration_ms: 30)
+
+    # Re-advertise instance 5 and hold the kernel's reply until the old
+    # advertisement's duration has elapsed (its removal queues behind).
+    task = advertise_async(mgmt, <<2, 1, 6>>, instance: 5)
+    expect_command(kernel, @params)
+    Process.sleep(60)
+    complete(kernel, @params, 0, <<5, 0, 31, 31>>)
+    expect_command(kernel, @data)
+    complete(kernel, @data, 0, <<5>>)
+    assert Task.await(task) == {:ok, 5}
+
+    # The stale removal is skipped: nothing else goes to the kernel, and the
+    # replacement is still tracked.
+    assert {:error, :timeout} = :socket.recv(kernel, 0, 100)
+    assert %{5 => %{removing: false}} = :sys.get_state(mgmt).instances
+  end
+
+  test "a failed data step's rollback runs before queued work for the same instance" do
+    {mgmt, kernel} = start_mgmt()
+    first = advertise_async(mgmt, <<2, 1, 6>>, instance: 3)
+    expect_command(kernel, @params)
+    complete(kernel, @params, 0, <<3, 0, 31, 31>>)
+    expect_command(kernel, @data)
+
+    second = advertise_async(mgmt, <<2, 1, 6>>, instance: 3)
+    # Let the second request reach the queue before the first fails.
+    _ = :sys.get_state(mgmt)
+    complete(kernel, @data, 0x0D)
+    assert Task.await(first) == {:error, :invalid_params}
+
+    assert expect_command(kernel, @remove) == <<3>>
+    complete(kernel, @remove, 0, <<3>>)
+    expect_command(kernel, @params)
+    complete(kernel, @params, 0, <<3, 0, 31, 31>>)
+    expect_command(kernel, @data)
+    complete(kernel, @data, 0, <<3>>)
+    assert Task.await(second) == {:ok, 3}
+    assert {:error, :timeout} = :socket.recv(kernel, 0, 100)
+  end
+
+  test "a failed removal keeps the instance tracked so it can be retried" do
+    {mgmt, kernel} = start_mgmt()
+    advertise_ok(mgmt, kernel, 4)
+
+    stopper = Task.async(fn -> Mgmt.stop_advertising(4, mgmt) end)
+    expect_command(kernel, @remove)
+    complete(kernel, @remove, 0x0A)
+    assert Task.await(stopper) == {:error, :busy}
+
+    stopper = Task.async(fn -> Mgmt.stop_advertising(4, mgmt) end)
+    assert expect_command(kernel, @remove) == <<4>>
+    complete(kernel, @remove, 0, <<4>>)
+    assert Task.await(stopper) == :ok
+    assert :sys.get_state(mgmt).instances == %{}
+  end
+
+  test "removing an instance the kernel no longer has counts as removed" do
+    {mgmt, kernel} = start_mgmt()
+    advertise_ok(mgmt, kernel, 4)
+
+    stopper = Task.async(fn -> Mgmt.stop_advertising(4, mgmt) end)
+    expect_command(kernel, @remove)
+    complete(kernel, @remove, 0x0D)
+    assert Task.await(stopper) == :ok
+    assert :sys.get_state(mgmt).instances == %{}
+  end
+
+  test "an Advertising Removed event for another controller is ignored" do
+    {mgmt, kernel} = start_mgmt()
+    advertise_ok(mgmt, kernel, 6)
+
+    # Instance 6 removed on hci1; ours is on hci0.
+    :ok = :socket.send(kernel, <<0x24, 0, 1, 0, 1, 0, 6>>)
+    _ = :sys.get_state(mgmt)
+    assert %{6 => _} = :sys.get_state(mgmt).instances
+  end
+
+  test "shutdown also removes an instance whose data command is still in flight" do
+    {mgmt, kernel} = start_mgmt()
+    _task = advertise_async(mgmt, <<2, 1, 6>>, instance: 7)
+    expect_command(kernel, @params)
+    complete(kernel, @params, 0, <<7, 0, 31, 31>>)
+    expect_command(kernel, @data)
+
+    :ok = GenServer.stop(mgmt)
+    assert expect_command(kernel, @remove) == <<7>>
   end
 
   test "rejects bad input in the caller, before reaching the server" do
