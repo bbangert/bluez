@@ -129,11 +129,13 @@ defmodule Bluez.Advertiser do
   defp valid_duration?(ms), do: is_integer(ms) and ms > 0
 
   @doc """
-  Unregister an advertisement early. Returns once BlueZ has answered the
-  `UnregisterAdvertisement` call, so a following `advertise/2` can reuse
-  the freed slot. `:ok` also when already gone.
+  Unregister an advertisement early. Returns `:ok` once BlueZ has
+  confirmed the unregistration, so a following `advertise/2` can reuse
+  the freed slot (`:ok` also when already gone). If BlueZ refuses or the
+  call times out, returns `{:error, reason}` and the advertisement stays
+  tracked, so `stop/2` can be retried.
   """
-  @spec stop(pos_integer(), GenServer.server()) :: :ok
+  @spec stop(pos_integer(), GenServer.server()) :: :ok | {:error, term()}
   def stop(id, server \\ __MODULE__) do
     case server_call(server, {:stop, id}) do
       {:error, :not_running} -> :ok
@@ -160,20 +162,16 @@ defmodule Bluez.Advertiser do
   defp property(:service_uuids, uuids), do: [{"ServiceUUIDs", {"as", strings!(uuids)}}]
   defp property(:solicit_uuids, uuids), do: [{"SolicitUUIDs", {"as", strings!(uuids)}}]
 
-  defp property(:manufacturer_data, map) when is_map(map) do
-    entries = for {id, bytes} <- map, id in 0..0xFFFF, do: {id, {"ay", bytes!(bytes)}}
-    [{"ManufacturerData", {"a{qv}", entries}}]
-  end
+  # Every key is checked (never filtered out): a bad entry must fail the
+  # spec, not register an advertisement silently missing that payload.
+  defp property(:manufacturer_data, map) when is_map(map),
+    do: [{"ManufacturerData", {"a{qv}", byte_entries(map, &(&1 in 0..0xFFFF))}}]
 
-  defp property(:service_data, map) when is_map(map) do
-    entries = for {uuid, bytes} <- map, is_binary(uuid), do: {uuid, {"ay", bytes!(bytes)}}
-    [{"ServiceData", {"a{sv}", entries}}]
-  end
+  defp property(:service_data, map) when is_map(map),
+    do: [{"ServiceData", {"a{sv}", byte_entries(map, &is_binary/1)}}]
 
-  defp property(:data, map) when is_map(map) do
-    entries = for {type, bytes} <- map, type in 0..255, do: {type, {"ay", bytes!(bytes)}}
-    [{"Data", {"a{yv}", entries}}]
-  end
+  defp property(:data, map) when is_map(map),
+    do: [{"Data", {"a{yv}", byte_entries(map, &(&1 in 0..255))}}]
 
   defp property(:local_name, name) when is_binary(name), do: [{"LocalName", {"s", name}}]
 
@@ -205,6 +203,13 @@ defmodule Bluez.Advertiser do
 
   defp bytes!(bin) when is_binary(bin), do: :binary.bin_to_list(bin)
 
+  defp byte_entries(map, valid_key?) do
+    for {key, bytes} <- map do
+      unless valid_key?.(key), do: raise(ArgumentError, "invalid key #{inspect(key)}")
+      {key, {"ay", bytes!(bytes)}}
+    end
+  end
+
   # `catch :exit` idiom (see `Bluez`).
   defp server_call(server, request) do
     GenServer.call(server, request, @call_timeout)
@@ -229,7 +234,8 @@ defmodule Bluez.Advertiser do
           # Explicit adapter, else the one Bluez.Client resolves.
           adapter_path: adapter_path,
           next_id: 1,
-          # id => %{props, adapter, owner_ref, timer, status: :registering | :active}
+          # id => %{props, adapter, owner_ref, timer, cancelled, waiters,
+          #         status: :registering | :active | :unregistering}
           ads: %{}
         }
 
@@ -248,16 +254,21 @@ defmodule Bluez.Advertiser do
     end
   end
 
-  # An active advertisement replies once BlueZ has unregistered it (from
-  # the Task, keeping this loop free); anything else replies at once.
+  # Replies once BlueZ has confirmed the unregistration (or refused it);
+  # a stop arriving mid-registration or mid-unregistration waits too.
   def handle_call({:stop, id}, from, state) do
     case Map.fetch(state.ads, id) do
-      {:ok, %{status: :active, adapter: adapter}} ->
-        unregister_async(state.conn, adapter, id, from)
-        {:noreply, drop(state, id)}
+      {:ok, %{status: :active}} ->
+        {:noreply, begin_unregister(state, id, [from])}
 
-      _registering_or_gone ->
-        {:reply, :ok, unregister(state, id)}
+      {:ok, %{status: :unregistering} = entry} ->
+        {:noreply, put_in(state.ads[id], %{entry | waiters: [from | entry.waiters]})}
+
+      {:ok, %{status: :registering}} ->
+        {:noreply, cancel_registration(state, id, [from])}
+
+      :error ->
+        {:reply, :ok, state}
     end
   end
 
@@ -279,7 +290,11 @@ defmodule Bluez.Advertiser do
       adapter: adapter,
       owner_ref: owner_ref,
       timer: nil,
-      status: :registering
+      status: :registering,
+      # Stopped while registering: unregister as soon as BlueZ answers.
+      cancelled: false,
+      # stop/2 callers waiting for the unregistration to be confirmed.
+      waiters: []
     }
 
     # RegisterAdvertisement re-enters us (GetAll), so it can't run here.
@@ -291,16 +306,16 @@ defmodule Bluez.Advertiser do
             []
           ])
 
-        send(me, {:registered, id, adapter, from, opts[:duration_ms], result})
+        send(me, {:registered, id, from, opts[:duration_ms], result})
       end)
 
     {:noreply, %{state | next_id: id + 1, ads: Map.put(state.ads, id, entry)}}
   end
 
   @impl GenServer
-  def handle_info({:registered, id, adapter, from, duration_ms, result}, state) do
+  def handle_info({:registered, id, from, duration_ms, result}, state) do
     case {result, Map.fetch(state.ads, id)} do
-      {{:ok, _}, {:ok, entry}} ->
+      {{:ok, _}, {:ok, %{cancelled: false} = entry}} ->
         timer =
           if is_integer(duration_ms) and duration_ms > 0,
             do: Process.send_after(self(), {:expire, id}, duration_ms)
@@ -309,23 +324,48 @@ defmodule Bluez.Advertiser do
         entry = %{entry | status: :active, timer: timer}
         {:noreply, %{state | ads: Map.put(state.ads, id, entry)}}
 
-      {{:ok, _}, :error} ->
-        # Stopped (owner died) while registering: take it back off air.
+      # Stopped (stop/2, owner exit, expiry) while registering: take it
+      # straight back off air, answering the waiting stop callers when done.
+      {{:ok, _}, {:ok, entry}} ->
         GenServer.reply(from, {:error, :stopped})
-        unregister_async(state.conn, adapter, id)
-        {:noreply, state}
+        {:noreply, begin_unregister(state, id, entry.waiters)}
 
       # Our call timed out (or the connection hiccuped): BlueZ may still
-      # accept the registration later, so take it back off air rather than
-      # leave an untracked advertisement running.
-      {{:error, {:exit, _}} = error, _} ->
+      # accept the registration later, so unregister rather than leave an
+      # untracked advertisement running — tracked until that is confirmed.
+      {{:error, {:exit, _}} = error, {:ok, entry}} ->
         GenServer.reply(from, error)
-        unregister_async(state.conn, adapter, id)
+        {:noreply, begin_unregister(state, id, entry.waiters)}
+
+      {{:error, reason}, {:ok, entry}} ->
+        GenServer.reply(from, {:error, reason})
+        Enum.each(entry.waiters, &GenServer.reply(&1, :ok))
         {:noreply, drop(state, id)}
 
-      {{:error, reason}, _} ->
-        GenServer.reply(from, {:error, reason})
-        {:noreply, drop(state, id)}
+      {_result, :error} ->
+        GenServer.reply(from, {:error, :stopped})
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:unregistered, id, result}, state) do
+    case {result, Map.fetch(state.ads, id)} do
+      {_result, :error} ->
+        {:noreply, state}
+
+      # Gone either way: BlueZ removed it, or never had it.
+      {{:ok, _}, {:ok, entry}} ->
+        {:noreply, unregistered(state, id, entry)}
+
+      {{:error, "org.bluez.Error.DoesNotExist"}, {:ok, entry}} ->
+        {:noreply, unregistered(state, id, entry)}
+
+      # Refused or timed out: it may still be on air, so keep tracking it
+      # (stop/2 can retry; its owner and duration triggers are spent).
+      {{:error, reason}, {:ok, entry}} ->
+        Logger.warning("Bluez.Advertiser: unregistering #{path(id)} failed: #{inspect(reason)}")
+        Enum.each(entry.waiters, &GenServer.reply(&1, {:error, reason}))
+        {:noreply, put_in(state.ads[id], %{entry | status: :active, waiters: []})}
     end
   end
 
@@ -344,30 +384,50 @@ defmodule Bluez.Advertiser do
 
   def handle_info(_other, state), do: {:noreply, state}
 
-  # Active: unregister on the bus. Still registering: just forget it — the
-  # :registered handler unregisters once BlueZ has answered.
+  defp unregistered(state, id, entry) do
+    Enum.each(entry.waiters, &GenServer.reply(&1, :ok))
+    drop(state, id)
+  end
+
+  # Owner exit / expiry: start taking it off air, whatever stage it's at.
   defp unregister(state, id) do
     case Map.fetch(state.ads, id) do
-      {:ok, %{status: :active, adapter: adapter}} ->
-        unregister_async(state.conn, adapter, id)
-        drop(state, id)
-
-      {:ok, %{status: :registering}} ->
-        drop(state, id)
-
-      :error ->
-        state
+      {:ok, %{status: :active}} -> begin_unregister(state, id, [])
+      {:ok, %{status: :registering}} -> cancel_registration(state, id, [])
+      _unregistering_or_gone -> state
     end
   end
 
-  defp unregister_async(conn, adapter, id, from \\ nil) do
+  defp cancel_registration(state, id, waiters) do
+    entry = spend_triggers(Map.fetch!(state.ads, id))
+    put_in(state.ads[id], %{entry | cancelled: true, waiters: waiters ++ entry.waiters})
+  end
+
+  # The entry stays (status :unregistering) until the Task's result
+  # arrives, so a failure leaves it tracked and retryable.
+  defp begin_unregister(state, id, waiters) do
+    entry = spend_triggers(Map.fetch!(state.ads, id))
+    conn = state.conn
+    adapter = entry.adapter
+    me = self()
+
     {:ok, _pid} =
       Task.start(fn ->
-        DBus.call(conn, adapter, @adv_mgr_iface, "UnregisterAdvertisement", "o", [path(id)])
-        if from, do: GenServer.reply(from, :ok)
+        result =
+          DBus.call(conn, adapter, @adv_mgr_iface, "UnregisterAdvertisement", "o", [path(id)])
+
+        send(me, {:unregistered, id, result})
       end)
 
-    :ok
+    entry = %{entry | status: :unregistering, waiters: waiters ++ entry.waiters}
+    put_in(state.ads[id], entry)
+  end
+
+  # Owner and duration triggers fire at most once per advertisement.
+  defp spend_triggers(entry) do
+    if entry.owner_ref, do: Process.demonitor(entry.owner_ref, [:flush])
+    if entry.timer, do: Process.cancel_timer(entry.timer)
+    %{entry | owner_ref: nil, timer: nil}
   end
 
   defp drop(state, id) do
@@ -403,9 +463,10 @@ defmodule Bluez.Advertiser do
         state
 
       # bluetoothd dropped it (adapter powered off, daemon exiting).
-      {@adv_iface, "Release", %{} = _entry} ->
+      {@adv_iface, "Release", %{} = entry} ->
         Bluez.Rebus.reply(conn, msg)
         {:ok, id} = id_from_path(hf[:path])
+        Enum.each(entry.waiters, &GenServer.reply(&1, :ok))
         drop(state, id)
 
       {@introspect_iface, "Introspect", _entry} ->

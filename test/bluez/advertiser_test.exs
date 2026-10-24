@@ -42,6 +42,16 @@ defmodule Bluez.AdvertiserTest do
       assert {"TxPower", {"n", -4}} in props
     end
 
+    test "rejects invalid map keys instead of silently dropping them" do
+      for spec <- [
+            %{type: :broadcast, manufacturer_data: %{65_536 => <<1>>}},
+            %{type: :broadcast, service_data: %{0xFCD2 => <<1>>}},
+            %{type: :broadcast, data: %{256 => <<1>>}}
+          ] do
+        assert {:error, {:invalid_spec, _}} = Advertiser.properties(spec)
+      end
+    end
+
     test "rejects unknown or ill-typed fields" do
       assert {:error, {:invalid_spec, _}} = Advertiser.properties(%{type: :broadcast, bogus: 1})
 
@@ -137,6 +147,34 @@ defmodule Bluez.AdvertiserTest do
       assert Task.await(stopper) == :ok
     end
 
+    test "a refused unregister keeps the advertisement tracked and stop/2 retryable",
+         %{svr: svr, adv: adv} do
+      {id, path} = registered(svr, adv)
+
+      first = Task.async(fn -> Advertiser.stop(id, adv) end)
+      unreg = assert_unregister(svr, path)
+      # A concurrent stop waits on the same unregistration.
+      second = Task.async(fn -> Advertiser.stop(id, adv) end)
+      wait_until(fn -> match?(%{^id => %{waiters: [_, _]}}, :sys.get_state(adv).ads) end)
+      error(svr, unreg, "org.bluez.Error.Failed")
+
+      assert Task.await(first) == {:error, "org.bluez.Error.Failed"}
+      assert Task.await(second) == {:error, "org.bluez.Error.Failed"}
+      assert %{^id => %{status: :active}} = :sys.get_state(adv).ads
+
+      retry = Task.async(fn -> Advertiser.stop(id, adv) end)
+      reply(svr, assert_unregister(svr, path))
+      assert Task.await(retry) == :ok
+      assert :sys.get_state(adv).ads == %{}
+    end
+
+    test "DoesNotExist from BlueZ counts as unregistered", %{svr: svr, adv: adv} do
+      {id, path} = registered(svr, adv)
+      stopper = Task.async(fn -> Advertiser.stop(id, adv) end)
+      error(svr, assert_unregister(svr, path), "org.bluez.Error.DoesNotExist")
+      assert Task.await(stopper) == :ok
+    end
+
     test "a BlueZ error is returned and the object is dropped", %{svr: svr, adv: adv} do
       task = Task.async(fn -> Advertiser.advertise(%{type: :broadcast}, server: adv) end)
 
@@ -194,6 +232,51 @@ defmodule Bluez.AdvertiserTest do
              {:error, :not_running}
 
     assert Advertiser.stop(1, :no_such_adv) == :ok
+  end
+
+  defp wait_until(fun, tries \\ 50) do
+    cond do
+      fun.() ->
+        :ok
+
+      tries == 0 ->
+        flunk("condition never held")
+
+      true ->
+        Process.sleep(10)
+        wait_until(fun, tries - 1)
+    end
+  end
+
+  # Register an advertisement owned by the test process; {id, path}.
+  defp registered(svr, adv) do
+    owner = self()
+
+    task =
+      Task.async(fn -> Advertiser.advertise(%{type: :broadcast}, server: adv, owner: owner) end)
+
+    assert_receive {^svr, %Message{header_fields: %{member: "RegisterAdvertisement"}} = reg},
+                   1_000
+
+    reply(svr, reg)
+    assert {:ok, id} = Task.await(task)
+    {id, "/org/exbluez/advertiser/adv#{id}"}
+  end
+
+  defp assert_unregister(svr, path) do
+    assert_receive {^svr,
+                    %Message{header_fields: %{member: "UnregisterAdvertisement"}, body: [^path]} =
+                      msg},
+                   1_000
+
+    msg
+  end
+
+  defp error(svr, %Message{serial: serial}, name) do
+    TestServer.push(
+      svr,
+      Message.new!(:error, reply_serial: serial, error_name: name, flags: [])
+    )
   end
 
   defp reply(svr, %Message{serial: serial}, signature \\ nil, body \\ []) do
