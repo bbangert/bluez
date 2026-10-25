@@ -23,9 +23,11 @@ flowchart TB
     client --> agent["5 · Bluez.Agent<br/>(pairing)"]
     agent --> gatt["6 · Gatt Task.Supervisor + Bluez.Gatt"]
     gatt --> alsa["7 · bluealsad + Bluez.BlueAlsa<br/>(audio: true only)"]
-    alsa --> extra["8 · extra_children:<br/>(host consumers)"]
+    alsa --> radio["8 · Radio / Mgmt / Advertiser / AdvertReceiver<br/>(opt-in only)"]
+    radio --> extra["9 · extra_children:<br/>(host consumers)"]
 
     style alsa stroke-dasharray: 5 5
+    style radio stroke-dasharray: 5 5
     style extra stroke-dasharray: 5 5
 ```
 
@@ -50,7 +52,15 @@ flowchart TB
    default). Placed *after* the scanning/GATT clients so an audio-daemon
    fault never restarts the scanning stack; the children that follow it
    do restart with it, which is intended — they're the same audio path.
-8. **`extra_children:`** — host-supplied child specs, appended last.
+8. **`Bluez.Mgmt`, `Bluez.Advertiser`, `Bluez.AdvertReceiver`** — each
+   only when its option (`mgmt:`, `advertiser:`, `advert_receiver:`) is
+   given, in that order. After audio so a fault here never touches it.
+   Mgmt comes before the D-Bus Advertiser so an Advertiser crash never
+   restarts it (a `Bluez.Mgmt` restart takes its raw advertisements off
+   air); the receiver — stateless, and running the host's `on_report:`
+   code, which may raise — comes last so its crashes restart neither
+   transmitter. A `bluetoothd` restart rebuilds all three.
+9. **`extra_children:`** — host-supplied child specs, appended last.
    They restart with the audio path; a fault there never disturbs
    anything above. Ordering within the slot is the caller's contract.
 
@@ -129,6 +139,67 @@ configurable via `Bluez.Client`'s `rssi_heartbeat_ms:` option with
 default 10 s), with an LRU cap so MAC-randomizing devices can't grow
 the cache without bound.
 Whatever survives the gate is handed to your `on_advertisement:` fun.
+
+## Raw radio access (advertising and verbatim reports)
+
+Everything above goes through `bluetoothd`. Two things it can't do:
+hand out the advertising bytes it received (only per-device properties,
+deduped and merged), and transmit an advertising PDU with an arbitrary
+layout. Some protocols need both — e.g. lights that carry an encrypted
+payload as a 16-bit Service UUID list, where order and repeated values
+*are* the data. Opt-in children cover that:
+
+- **`Bluez.Radio`** — transmit leases, one per controller, started
+  whenever either advertiser is. A process `acquire/1`s a controller,
+  sends through the advertisers with the lease, and `release/1`s it (or
+  exits); only the holder may send, and the lease ending takes
+  everything sent under it off air — the controller is handed on only
+  once that has finished, so a successor's sends can't collide with the
+  old lease's leftovers. The controller's advertising
+  instances are one namespace the two transmit paths share without
+  seeing each other's use of it, so a single holder issuing every send,
+  one call at a time, is what lets each path check the other's state
+  exactly. It defaults to the adapter `Bluez.Client` resolved, refusing
+  (`{:error, :no_adapter_index}`) to lease the `hci0` fallback.
+
+- **`Bluez.Advertiser`** (D-Bus, `LEAdvertisingManager1`). Each
+  advertisement is an `LEAdvertisement1` object exported on its own rebus
+  connection, registered from a Task (BlueZ calls `Properties.GetAll`
+  back before `RegisterAdvertisement` returns). BlueZ keeps
+  `ServiceUUIDs` in order with duplicates and writes 16-bit UUIDs
+  little-endian, so `Bluez.AdData.uuid16_strings/1` puts a payload on air
+  verbatim. Lifetime: `duration_ms:` (ms-precise, unlike BlueZ's
+  whole-second `Timeout`), `stop/3`, or the lease ending. Like
+  `Bluez.Mgmt`, it refuses a finite duration (`{:error, :rotation_busy}`)
+  on a controller that rotates instances in software while another is
+  registered, since it could expire before its first transmission.
+- **`Bluez.Mgmt`** (kernel MGMT over an `HCI_CHANNEL_CONTROL` socket).
+  For AD layouts BlueZ refuses: its `Data` property rejects Flags, UUID
+  lists, names and service data, and it moves `LocalName` to the scan
+  response of connectable adverts. Uses *Add Extended Advertising
+  Parameters/Data* (legacy PDUs unless a secondary PHY is requested) so
+  the interval can be set — the kernel default of 1.28 s misses short
+  bursts. Instances default to the highest number that is free or
+  already ours, so `bluetoothd`'s (allocated from 1) are never taken
+  over; commands are serialized one at a time; every instance is removed
+  on duration, lease end, `stop_advertising/3`, or shutdown. Because
+  `bluetoothd` can't see `Bluez.Mgmt`'s instances, the Advertiser
+  refuses (`{:error, :instance_conflict}`) to register while bluetoothd's
+  next allocation could land on one of them — exact, since the lease
+  holder is the only sender on the controller.
+- **`Bluez.AdvertReceiver`** (`HCI_CHANNEL_RAW` socket with a kernel
+  filter for LE Meta events). Listens to the controller's legacy and
+  extended advertising reports while `Bluez.Client` scans, and hands each
+  one — AD bytes untouched — to `on_report:`. Read-only, so it never
+  conflicts with `bluetoothd`, and needs no lease. Like `Bluez.Radio` it
+  waits for `Bluez.Client` to resolve the adapter (never listening on the
+  `hci0` fallback); it moves its socket if the selection changes, and retries
+  opening instead of crash-looping when no adapter is present.
+
+`Bluez.Hci` holds the socket setup and the pure codecs (HCI reports,
+MGMT framing), and `Bluez.AdData` the AD TLV helpers — both host-tested
+with byte fixtures; the socket-owning processes are tested against
+AF_UNIX datagram sockets standing in for the kernel.
 
 ## GATT (`Bluez.Gatt`)
 

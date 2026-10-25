@@ -209,6 +209,11 @@ defmodule Bluez.Client do
     # 10 s default suits plain sensor relaying).
     connect_fun = Keyword.get(opts, :connect_fun, fn -> Bluez.Rebus.connect(:system) end)
 
+    # A previous incarnation's resolution must not vouch for this one:
+    # consumers gating on DevicePath.resolved_adapter_path/0 wait until
+    # claim_adapter/1 has run again (it may pick a different radio).
+    :persistent_term.erase(DevicePath.resolved_adapter_key())
+
     case connect_fun.() do
       {:ok, conn} ->
         ref = Bluez.Rebus.add_signal_handler(conn)
@@ -872,6 +877,7 @@ defmodule Bluez.Client do
         fallback_adapter(adapters, desired)
 
     :persistent_term.put(DevicePath.adapter_path_key(), chosen.path)
+    :persistent_term.put(DevicePath.resolved_adapter_key(), chosen.path)
     Logger.info("Bluez.Client: driving #{chosen.path} (#{chosen.address})")
   end
 
