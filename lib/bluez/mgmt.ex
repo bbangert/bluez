@@ -12,9 +12,14 @@ defmodule Bluez.Mgmt do
   ordered 16-bit UUID list with repeated values — need the bytes handed to
   the kernel as they are. This process does that over an
   `HCI_CHANNEL_CONTROL` socket (`Bluez.Hci.open/2`), using *Add Extended
-  Advertising Parameters* + *Add Extended Advertising Data* (kernel ≥
-  5.11; legacy PDUs unless a secondary-PHY flag is set) so the interval
-  can be set — the kernel default of 1.28 s misses short bursts.
+  Advertising Parameters* + *Add Extended Advertising Data* (legacy PDUs
+  unless a secondary-PHY flag is set) so the interval can be set — the
+  kernel default of 1.28 s misses short bursts.
+
+  Requires Linux 5.17 or later. The commands exist since 5.11, but before
+  5.17 the kernel refuses an advertising command as busy while another
+  one (from any socket, `bluetoothd`'s included) is still pending, rather
+  than queueing it; this module's cleanup relies on the queueing.
 
   ## Leases
 

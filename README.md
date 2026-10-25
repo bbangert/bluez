@@ -140,8 +140,9 @@ option surface and event contract.
   distro dbus/bluetoothd).
 - Optional: bluez-alsa v4 for `audio: true`.
 - Optional: `CAP_NET_RAW`/`CAP_NET_ADMIN` (root on Nerves) for
-  `Bluez.AdvertReceiver`/`Bluez.Mgmt`; Linux ≥ 5.11 for `Bluez.Mgmt`'s
-  extended advertising commands.
+  `Bluez.AdvertReceiver`/`Bluez.Mgmt`; Linux ≥ 5.17 for `Bluez.Mgmt`
+  (extended advertising commands, queued by the kernel instead of refused
+  as busy while another is pending).
 - Writable `/run/dbus` and `/data/bluetooth`; on a read-only rootfs point
   `/var/lib/bluetooth` at `/data/bluetooth` with an overlay symlink.
 
