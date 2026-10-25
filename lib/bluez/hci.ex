@@ -389,8 +389,10 @@ defmodule Bluez.Hci do
     * `:flags` — list of `adv_flag_names/0` (default `[]`: non-connectable,
       no kernel-managed Flags/name/appearance/TX power elements).
     * `:min_interval_ms` / `:max_interval_ms` — advertising interval range;
-      both or neither (20 ms minimum). The kernel default is 1.28 s, far
-      too slow for short bursts.
+      both or neither, 20 ms to 10.24 s (the legacy maximum: on a
+      legacy-only controller the kernel truncates anything longer into a
+      16-bit field). The kernel default is 1.28 s, far too slow for short
+      bursts.
     * `:tx_power` — requested dBm (`-127..20`).
     * `:duration_s` / `:timeout_s` — the kernel's own whole-second
       rotation duration and lifetime.
@@ -433,14 +435,17 @@ defmodule Bluez.Hci do
     end
   end
 
-  # Interval units are 0.625 ms; the HCI range is 0x20..0xFFFFFF.
+  # Interval units are 0.625 ms. Capped at the legacy range 0x20..0x4000:
+  # extended advertising allows up to 0xFFFFFF, but on a legacy-only
+  # controller the kernel copies the interval into a 16-bit HCI field
+  # unchecked, so a longer one would wrap into a much shorter interval.
   defp intervals(min_ms, max_ms, flags)
        when is_number(min_ms) and is_number(max_ms) and min_ms <= max_ms do
     min = round(min_ms / 0.625)
     max = round(max_ms / 0.625)
 
-    unless min >= 0x20 and max <= 0xFFFFFF,
-      do: raise(ArgumentError, "advertising interval out of range (20 ms .. 10485 s)")
+    unless min >= 0x20 and max <= 0x4000,
+      do: raise(ArgumentError, "advertising interval out of range (20 ms .. 10.24 s)")
 
     {min, max, flags ||| @adv_param_intervals}
   end

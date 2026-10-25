@@ -161,6 +161,15 @@ defmodule Bluez.HciTest do
         Hci.add_ext_adv_params(1, min_interval_ms: 40, max_interval_ms: 30)
       end
 
+      # Above the legacy maximum a legacy-only controller would wrap it
+      # (41 s → 40 ms); 10.24 s itself is fine.
+      assert_raise ArgumentError, fn ->
+        Hci.add_ext_adv_params(1, min_interval_ms: 20, max_interval_ms: 10_241)
+      end
+
+      assert <<1, _flags::little-32, _d::16, _t::16, 0x4000::little-32, 0x4000::little-32, _p>> =
+               Hci.add_ext_adv_params(1, min_interval_ms: 10_240, max_interval_ms: 10_240)
+
       assert_raise ArgumentError, fn -> Hci.add_ext_adv_params(1, flags: [:bogus]) end
     end
 
