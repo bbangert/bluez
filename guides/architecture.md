@@ -23,7 +23,7 @@ flowchart TB
     client --> agent["5 · Bluez.Agent<br/>(pairing)"]
     agent --> gatt["6 · Gatt Task.Supervisor + Bluez.Gatt"]
     gatt --> alsa["7 · bluealsad + Bluez.BlueAlsa<br/>(audio: true only)"]
-    alsa --> radio["8 · AdvertReceiver / Mgmt / Advertiser<br/>(opt-in only)"]
+    alsa --> radio["8 · Mgmt / Advertiser / AdvertReceiver<br/>(opt-in only)"]
     radio --> extra["9 · extra_children:<br/>(host consumers)"]
 
     style alsa stroke-dasharray: 5 5
@@ -52,12 +52,14 @@ flowchart TB
    default). Placed *after* the scanning/GATT clients so an audio-daemon
    fault never restarts the scanning stack; the children that follow it
    do restart with it, which is intended — they're the same audio path.
-8. **`Bluez.AdvertReceiver`, `Bluez.Mgmt`, `Bluez.Advertiser`** — each
-   only when its option (`advert_receiver:`, `mgmt:`, `advertiser:`) is
+8. **`Bluez.Mgmt`, `Bluez.Advertiser`, `Bluez.AdvertReceiver`** — each
+   only when its option (`mgmt:`, `advertiser:`, `advert_receiver:`) is
    given, in that order. After audio so a fault here never touches it.
-   The kernel-socket children come before the D-Bus Advertiser so an
-   Advertiser crash never restarts them (a `Bluez.Mgmt` restart takes its
-   raw advertisements off air). A `bluetoothd` restart rebuilds all three.
+   Mgmt comes before the D-Bus Advertiser so an Advertiser crash never
+   restarts it (a `Bluez.Mgmt` restart takes its raw advertisements off
+   air); the receiver — stateless, and running the host's `on_report:`
+   code, which may raise — comes last so its crashes restart neither
+   transmitter. A `bluetoothd` restart rebuilds all three.
 9. **`extra_children:`** — host-supplied child specs, appended last.
    They restart with the audio path; a fault there never disturbs
    anything above. Ordering within the slot is the caller's contract.

@@ -35,7 +35,7 @@ defmodule Bluez.AdvertReceiverAdapterTest do
     receiver = start_receiver([])
 
     # Not resolved yet: never listens on the hci0 fallback.
-    refute_receive {:opened, _, _}, 100
+    refute_receive {:opened, _, _}, 250
     refute AdvertReceiver.listening?(receiver)
 
     :persistent_term.put(DevicePath.resolved_adapter_key(), "/org/bluez/hci1")
@@ -47,7 +47,7 @@ defmodule Bluez.AdvertReceiverAdapterTest do
 
     # ...while a Client restart in progress (unresolved) keeps it.
     :persistent_term.erase(DevicePath.resolved_adapter_key())
-    refute_receive {:opened, _, _}, 100
+    refute_receive {:opened, _, _}, 250
     assert AdvertReceiver.listening?(receiver)
   end
 
@@ -56,6 +56,6 @@ defmodule Bluez.AdvertReceiverAdapterTest do
     start_receiver(adapter_index: 0)
 
     assert_receive {:opened, 0, _kernel}, 1_000
-    refute_receive {:opened, _, _}, 100
+    refute_receive {:opened, _, _}, 250
   end
 end

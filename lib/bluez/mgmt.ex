@@ -328,11 +328,17 @@ defmodule Bluez.Mgmt do
 
     # Bounded sends: we may be stopping *because* the socket is wedged
     # (:mgmt_command_timeout), and an unbounded send would then block until
-    # the supervisor kills us, losing every cleanup after it.
-    Enum.each(Enum.uniq(in_flight ++ tracked), fn {index, instance} ->
-      command = Hci.mgmt_command(Hci.op_remove_advertising(), index, <<instance>>)
-      :socket.send(state.sock, command, [], @terminate_send_timeout)
-    end)
+    # the supervisor kills us. The first send that times out ends the
+    # attempt, so the total stays bounded too.
+    _ =
+      Enum.reduce_while(Enum.uniq(in_flight ++ tracked), :ok, fn {index, instance}, :ok ->
+        command = Hci.mgmt_command(Hci.op_remove_advertising(), index, <<instance>>)
+
+        case :socket.send(state.sock, command, [], @terminate_send_timeout) do
+          {:error, :timeout} -> {:halt, :timeout}
+          _sent_or_failed -> {:cont, :ok}
+        end
+      end)
 
     :socket.close(state.sock)
   end

@@ -90,19 +90,20 @@ defmodule BluezTest do
           extra_children: [__MODULE__.ExtraChild]
         )
 
-      # Kernel-socket children before the D-Bus Advertiser, so an
-      # Advertiser crash never restarts (and takes off air) Mgmt's adverts.
+      # Mgmt before the D-Bus Advertiser (an Advertiser crash must not
+      # restart — and take off air — Mgmt's adverts); the receiver, which
+      # runs host code, last so its crashes restart neither transmitter.
       assert children |> Enum.map(&id_of/1) |> Enum.take(-5) == [
                Bluez.BlueAlsa,
-               Bluez.AdvertReceiver,
                Bluez.Mgmt,
                Bluez.Advertiser,
+               Bluez.AdvertReceiver,
                __MODULE__.ExtraChild
              ]
 
       assert {Bluez.Advertiser, []} in children
       assert {Bluez.Mgmt, [adapter_index: 1]} in children
-      assert {Bluez.AdvertReceiver, [on_report: ^on_report]} = Enum.at(children, -4)
+      assert {Bluez.AdvertReceiver, [on_report: ^on_report]} = Enum.at(children, -2)
 
       ids = Bluez.children(advertiser: false, mgmt: nil) |> Enum.map(&id_of/1)
       refute Bluez.Advertiser in ids

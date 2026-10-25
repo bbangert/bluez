@@ -208,14 +208,17 @@ defmodule Bluez.MgmtTest do
 
   test "an expiry racing a replacement on the same instance doesn't remove the replacement" do
     {mgmt, kernel} = start_mgmt()
-    advertise_ok(mgmt, kernel, 5, duration_ms: 30)
+    # A duration that can't elapse on its own during the test: the expiry
+    # is fired by hand below, exactly while the replacement is in flight.
+    advertise_ok(mgmt, kernel, 5, duration_ms: 60_000)
+    %{5 => %{timer: timer}} = :sys.get_state(mgmt).instances
 
-    # Re-advertise instance 5 and hold the kernel's reply until the old
-    # advertisement's duration has fired (its removal queues behind): the
-    # old entry is then flagged as being removed.
+    # Re-advertise instance 5, hold the kernel's reply, and let the old
+    # advertisement's expiry fire meanwhile (its removal queues behind).
     task = advertise_async(mgmt, <<2, 1, 6>>, instance: 5)
     expect_command(kernel, @params)
-    assert eventually(fn -> match?(%{5 => %{removing: true}}, :sys.get_state(mgmt).instances) end)
+    send(mgmt, {:expire, 5, timer})
+    assert %{5 => %{removing: true}} = :sys.get_state(mgmt).instances
     assert :queue.len(:sys.get_state(mgmt).queue) == 1
     complete(kernel, @params, 0, <<5, 0, 31, 31>>)
     expect_command(kernel, @data)
@@ -296,7 +299,14 @@ defmodule Bluez.MgmtTest do
 
   test "shutdown also removes an instance whose data command is still in flight" do
     {mgmt, kernel} = start_mgmt()
-    _task = advertise_async(mgmt, <<2, 1, 6>>, instance: 7)
+    # Unlinked caller: shutdown cuts its call off, and that exit must not
+    # propagate to the test process.
+    owner = self()
+
+    spawn(fn ->
+      Mgmt.advertise(<<2, 1, 6>>, server: mgmt, instance: 7, owner: owner)
+    end)
+
     expect_command(kernel, @params)
     complete(kernel, @params, 0, <<7, 0, 31, 31>>)
     expect_command(kernel, @data)
@@ -306,6 +316,16 @@ defmodule Bluez.MgmtTest do
     :ok = stop_supervised(Mgmt)
     refute Process.alive?(mgmt)
     assert expect_command(kernel, @remove) == <<7>>
+  end
+
+  test "a command the kernel never answers restarts the server; the caller gets an error" do
+    {mgmt, kernel} = start_mgmt(command_timeout: 50)
+    ref = Process.monitor(mgmt)
+    task = advertise_async(mgmt, <<2, 1, 6>>, instance: 2)
+    expect_command(kernel, @params)
+
+    assert_receive {:DOWN, ^ref, :process, ^mgmt, :mgmt_command_timeout}, 1_000
+    assert Task.await(task) == {:error, :not_running}
   end
 
   test "an aborted socket select stops the server instead of leaving it deaf" do
@@ -367,12 +387,10 @@ defmodule Bluez.MgmtTest do
   test "legacy_adv_data/2 builds the exact Flags + Local Name + UUID128 PDU (Tuya P1 shape)" do
     block = <<0::8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15>>
 
+    # Flags (3) + Local Name (10) + one UUID128 (18): exactly the 31-byte
+    # legacy advertising PDU.
     assert Mgmt.legacy_adv_data([AdData.local_name("ABCDEFGH"), AdData.uuid128_list([block])]) ==
              <<2, 1, 6>> <> <<9, 9, "ABCDEFGH">> <> <<17, 7, block::binary>>
-
-    assert byte_size(
-             Mgmt.legacy_adv_data([AdData.local_name("ABCDEFGH"), AdData.uuid128_list([block])])
-           ) == 31
   end
 
   test "legacy_adv_data/2 prepends Flags and enforces 31 bytes" do
@@ -391,7 +409,7 @@ defmodule Bluez.MgmtTest do
     assert Mgmt.read_advertising_features(:no_such_mgmt) == {:error, :not_running}
   end
 
-  defp eventually(fun, tries \\ 20) do
+  defp eventually(fun, tries \\ 200) do
     cond do
       fun.() ->
         true

@@ -122,6 +122,10 @@ defmodule Bluez.Advertiser do
     * `:mgmt` — the `Bluez.Mgmt` whose instances to respect (default
       `Bluez.Mgmt`; no effect when it isn't running).
 
+  A spec without a valid `:type` (or with an invalid field) returns
+  `{:error, {:invalid_spec, message}}`; bad options return
+  `{:error, {:invalid, option}}`.
+
   Returns `{:error, :instance_conflict}` instead of registering when
   `bluetoothd` could hand this advertisement an instance `Bluez.Mgmt`
   holds on the same controller (see "Sharing the controller with

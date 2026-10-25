@@ -31,12 +31,14 @@ defmodule Bluez do
        restarts the scanning stack — the children that follow *do* restart
        with it under `:rest_for_one`, which is intended (same audio path).
     8. Opt-in raw radio access, each only when its option is given, in
-       this order: `Bluez.AdvertReceiver` (`advert_receiver:`),
-       `Bluez.Mgmt` (`mgmt:`), `Bluez.Advertiser` (`advertiser:`). After
-       audio so their faults never touch it; the two kernel-socket
-       children come before the D-Bus Advertiser so an Advertiser crash
-       never restarts them (a Mgmt restart takes its raw adverts off air).
-       A bluetoothd restart rebuilds all three.
+       this order: `Bluez.Mgmt` (`mgmt:`), `Bluez.Advertiser`
+       (`advertiser:`), `Bluez.AdvertReceiver` (`advert_receiver:`).
+       After audio so their faults never touch it. Mgmt comes before the
+       D-Bus Advertiser so an Advertiser crash never restarts it (a Mgmt
+       restart takes its raw adverts off air); the receiver — stateless,
+       and running the host's `on_report:` code, which may raise — comes
+       last so its crashes never restart either transmitter. A bluetoothd
+       restart rebuilds all three.
     9. `extra_children:` — host-supplied child specs, appended last.
 
   ## Options
@@ -262,15 +264,15 @@ defmodule Bluez do
   end
 
   # Opt-in raw radio access (advertising TX, verbatim advert RX). After
-  # audio: a fault here only restarts these and extra_children. The
-  # kernel-socket children (no D-Bus dependency) go first, the D-Bus
-  # Advertiser last, so its faults never restart — and take off air —
-  # Mgmt's advertisements.
+  # audio: a fault here only restarts these and extra_children. Mgmt
+  # before the D-Bus Advertiser, so an Advertiser fault never restarts —
+  # and takes off air — Mgmt's advertisements; the stateless receiver,
+  # which runs host code (on_report:), last so its faults restart neither.
   defp radio_children(opts) do
     for {key, module} <- [
-          advert_receiver: __MODULE__.AdvertReceiver,
           mgmt: __MODULE__.Mgmt,
-          advertiser: __MODULE__.Advertiser
+          advertiser: __MODULE__.Advertiser,
+          advert_receiver: __MODULE__.AdvertReceiver
         ],
         child_opts = Keyword.get(opts, key, false),
         child_opts != false and child_opts != nil do

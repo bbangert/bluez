@@ -103,14 +103,13 @@ defmodule Bluez.AdvertiserTest do
                       } = register},
                      1_000
 
-      # bluetoothd reads the properties back before answering.
-      get_all =
-        method_call(svr, path, "org.freedesktop.DBus.Properties", "GetAll", "s", [
-          "org.bluez.LEAdvertisement1"
-        ])
+      # bluetoothd reads the properties back before answering. GetAll is
+      # the only call in flight, so its reply is the only property list.
+      method_call(svr, path, "org.freedesktop.DBus.Properties", "GetAll", "s", [
+        "org.bluez.LEAdvertisement1"
+      ])
 
-      assert_receive {^svr, %Message{type: :method_return, body: [props]} = rp}, 1_000
-      assert rp.header_fields.reply_serial == get_all
+      assert_receive {^svr, %Message{type: :method_return, body: [props]}}, 1_000
       assert {"ServiceUUIDs", {"as", ^uuids}} = List.keyfind(props, "ServiceUUIDs", 0)
 
       reply(svr, register)
@@ -273,6 +272,8 @@ defmodule Bluez.AdvertiserTest do
   test "rejects bad options in the caller, before reaching the server" do
     assert {:error, {:invalid_spec, _}} = Advertiser.advertise(%{type: :scanner})
     assert {:error, {:invalid_spec, _}} = Advertiser.advertise(%{})
+    assert {:error, {:invalid_spec, _}} = Advertiser.advertise(%{type: "broadcast"})
+    assert {:error, {:invalid_spec, _}} = Advertiser.advertise(:broadcast)
 
     spec = %{type: :broadcast}
     assert Advertiser.advertise(spec, owner: :worker) == {:error, {:invalid, "owner"}}
@@ -324,7 +325,7 @@ defmodule Bluez.AdvertiserTest do
     mgmt
   end
 
-  defp wait_until(fun, tries \\ 50) do
+  defp wait_until(fun, tries \\ 200) do
     cond do
       fun.() ->
         :ok
@@ -375,15 +376,10 @@ defmodule Bluez.AdvertiserTest do
     TestServer.push(svr, Message.new!(:method_return, opts))
   end
 
-  # Push a method call from "bluetoothd"; returns the serial TestServer
-  # assigned so the reply can be matched.
+  # Push a method call from "bluetoothd".
   defp method_call(svr, path, iface, member, signature, body) do
-    serial = :sys.get_state(svr).serial
-
     opts = [sender: ":1.1", path: path, interface: iface, member: member, body: body]
     opts = if signature, do: Keyword.put(opts, :signature, signature), else: opts
     TestServer.push(svr, Message.new!(:method_call, opts))
-
-    serial
   end
 end

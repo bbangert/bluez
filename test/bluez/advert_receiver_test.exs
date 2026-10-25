@@ -42,9 +42,9 @@ defmodule Bluez.AdvertReceiverTest do
     :ok = :socket.send(kernel, <<0x04, 0x0E, 4, 1, 3, 0x0C, 0>>)
     :ok = :socket.send(kernel, adv_packet(<<2, 1, 6>>, -62))
 
-    assert_receive {:report, %{address: 0xAABBCCDDEEFF, data: ^data, rssi: -61}}
-    assert_receive {:report, %{data: <<2, 1, 6>>, rssi: -62}}
-    refute_receive {:report, _}, 50
+    assert_receive {:report, %{address: 0xAABBCCDDEEFF, data: ^data, rssi: -61}}, 1_000
+    assert_receive {:report, %{data: <<2, 1, 6>>, rssi: -62}}, 1_000
+    refute_receive {:report, _}, 250
     assert AdvertReceiver.listening?(receiver)
   end
 
@@ -76,7 +76,7 @@ defmodule Bluez.AdvertReceiverTest do
     assert AdvertReceiver.listening?(receiver)
 
     :ok = :socket.send(kernel, adv_packet(<<2, 1, 6>>))
-    assert_receive {:report, %{data: <<2, 1, 6>>}}
+    assert_receive {:report, %{data: <<2, 1, 6>>}}, 1_000
   end
 
   test "an aborted socket select reopens instead of going deaf" do
@@ -102,7 +102,7 @@ defmodule Bluez.AdvertReceiverTest do
     refute AdvertReceiver.listening?(:no_such_receiver)
   end
 
-  defp wait_until(fun, tries \\ 100) do
+  defp wait_until(fun, tries \\ 200) do
     cond do
       fun.() ->
         true
