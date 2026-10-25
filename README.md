@@ -45,6 +45,7 @@ The core modules carry the reference detail:
 - `Bluez.Agent` — pairing authorization
 - `Bluez.BlueAlsa` — A2DP playback PCM discovery
 - `Bluez.Advertiser` / `Bluez.Mgmt` — LE advertising (D-Bus / raw AD bytes)
+- `Bluez.Radio` — per-controller transmit leases for the advertisers
 - `Bluez.AdvertReceiver` — verbatim advertising reports off the HCI socket
 
 ## Features
@@ -73,7 +74,9 @@ The core modules carry the reference detail:
   manufacturer/service data, intervals, millisecond-precise durations);
   `Bluez.Mgmt` puts verbatim AD bytes on air through the kernel MGMT
   socket for layouts BlueZ's D-Bus API refuses (Flags, names, 128-bit UUID
-  lists in the advertising PDU).
+  lists in the advertising PDU). Both send under a `Bluez.Radio` transmit
+  lease: one holder per controller, and everything it sent goes off air
+  when the lease ends.
 - **Verbatim advert receive** (opt-in) — `Bluez.AdvertReceiver` reads the
   controller's legacy and extended advertising reports off an HCI raw
   socket, AD bytes untouched, for protocols that BlueZ's per-device

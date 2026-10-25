@@ -31,14 +31,17 @@ defmodule Bluez do
        restarts the scanning stack — the children that follow *do* restart
        with it under `:rest_for_one`, which is intended (same audio path).
     8. Opt-in raw radio access, each only when its option is given, in
-       this order: `Bluez.Mgmt` (`mgmt:`), `Bluez.Advertiser`
-       (`advertiser:`), `Bluez.AdvertReceiver` (`advert_receiver:`).
-       After audio so their faults never touch it. Mgmt comes before the
-       D-Bus Advertiser so an Advertiser crash never restarts it (a Mgmt
-       restart takes its raw adverts off air); the receiver — stateless,
-       and running the host's `on_report:` code, which may raise — comes
-       last so its crashes never restart either transmitter. A bluetoothd
-       restart rebuilds all three.
+       this order: `Bluez.Radio` (transmit leases; started whenever
+       `mgmt:` or `advertiser:` is), `Bluez.Mgmt` (`mgmt:`),
+       `Bluez.Advertiser` (`advertiser:`), `Bluez.AdvertReceiver`
+       (`advert_receiver:`). After audio so their faults never touch it.
+       The Radio comes first: the transmitters subscribe to it, and if it
+       restarts its leases are gone, so they restart with it. Mgmt comes
+       before the D-Bus Advertiser so an Advertiser crash never restarts
+       it (a Mgmt restart takes its raw adverts off air); the receiver —
+       stateless, and running the host's `on_report:` code, which may
+       raise — comes last so its crashes never restart a transmitter. A
+       bluetoothd restart rebuilds all of them.
     9. `extra_children:` — host-supplied child specs, appended last.
 
   ## Options
@@ -61,6 +64,8 @@ defmodule Bluez do
       (LE advertising via `LEAdvertisingManager1`). Off by default.
     * `mgmt:` — `true` or keyword opts: start `Bluez.Mgmt` (raw-AD
       advertising via the kernel MGMT socket). Off by default.
+      Either one also starts `Bluez.Radio`, whose lease a process must
+      hold to send through them.
     * `advert_receiver:` — `true` or keyword opts (`on_report:`, …): start
       `Bluez.AdvertReceiver` (verbatim advertising reports off the HCI
       raw channel). Off by default.
@@ -264,20 +269,27 @@ defmodule Bluez do
   end
 
   # Opt-in raw radio access (advertising TX, verbatim advert RX). After
-  # audio: a fault here only restarts these and extra_children. Mgmt
+  # audio: a fault here only restarts these and extra_children. Radio (the
+  # transmit-lease authority) first: its restart ends every lease, so the
+  # transmitters after it restart and take their adverts off air too. Mgmt
   # before the D-Bus Advertiser, so an Advertiser fault never restarts —
   # and takes off air — Mgmt's advertisements; the stateless receiver,
   # which runs host code (on_report:), last so its faults restart neither.
   defp radio_children(opts) do
-    for {key, module} <- [
-          mgmt: __MODULE__.Mgmt,
-          advertiser: __MODULE__.Advertiser,
-          advert_receiver: __MODULE__.AdvertReceiver
-        ],
-        child_opts = Keyword.get(opts, key, false),
-        child_opts != false and child_opts != nil do
-      {module, if(child_opts == true, do: [], else: child_opts)}
-    end
+    enabled =
+      for {key, module} <- [
+            mgmt: __MODULE__.Mgmt,
+            advertiser: __MODULE__.Advertiser,
+            advert_receiver: __MODULE__.AdvertReceiver
+          ],
+          child_opts = Keyword.get(opts, key, false),
+          child_opts != false and child_opts != nil do
+        {module, if(child_opts == true, do: [], else: child_opts)}
+      end
+
+    # The lease authority both transmitters subscribe to — ahead of them.
+    transmits? = Enum.any?(enabled, fn {module, _} -> module != __MODULE__.AdvertReceiver end)
+    if transmits?, do: [{__MODULE__.Radio, []} | enabled], else: enabled
   end
 
   @doc """

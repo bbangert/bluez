@@ -60,11 +60,28 @@ or a keyword list):
  advert_receiver: [on_report: &MyApp.Beacons.on_report/1]}
 ```
 
+Either advertiser starts `Bluez.Radio`. Sending needs the controller's
+transmit lease: acquire it in the process that will send (typically the
+GenServer driving your protocol) and keep it for as long as that process
+transmits. Only the holder may send; releasing the lease, or the holder
+exiting, takes everything it sent off air. A send returning
+`{:error, :lease_expired}` means the lease is gone (e.g. `Bluez.Radio`
+restarted): acquire again.
+
+```elixir
+{:ok, lease} = Bluez.Radio.acquire()
+```
+
+`acquire/1` returns `{:error, :no_adapter_index}` until `Bluez.Client`
+has resolved the adapter, and `{:error, {:held_by, pid}}` while another
+process holds it.
+
 Send a payload as an ordered 16-bit UUID list for 300 ms:
 
 ```elixir
 uuids = Bluez.AdData.uuid16_strings(payload)
-{:ok, _id} = Bluez.Advertiser.advertise(%{type: :broadcast, service_uuids: uuids}, duration_ms: 300)
+spec = %{type: :broadcast, service_uuids: uuids}
+{:ok, _id} = Bluez.Advertiser.advertise(lease, spec, duration_ms: 300)
 ```
 
 Send an exact legacy advertising PDU (here Flags + Local Name + one
@@ -74,7 +91,7 @@ Send an exact legacy advertising PDU (here Flags + Local Name + one
 alias Bluez.AdData
 
 data = Bluez.Mgmt.legacy_adv_data([AdData.local_name(name), AdData.uuid128_list([block])])
-{:ok, _instance} = Bluez.Mgmt.advertise(data, duration_ms: 300)
+{:ok, _instance} = Bluez.Mgmt.advertise(lease, data, duration_ms: 300)
 ```
 
 Receive reports with the AD bytes as they were on air:

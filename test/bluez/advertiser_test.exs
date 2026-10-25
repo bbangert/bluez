@@ -1,7 +1,7 @@
 defmodule Bluez.AdvertiserTest do
   use ExUnit.Case, async: true
 
-  alias Bluez.{AdData, Advertiser}
+  alias Bluez.{AdData, Advertiser, Radio, TestLeaseHolder}
   alias Bluez.Rebus.{Message, TestServer}
 
   @adapter "/org/bluez/hci0"
@@ -68,11 +68,12 @@ defmodule Bluez.AdvertiserTest do
       {:ok, svr} = start_supervised({TestServer, tap: self()})
       {:ok, addr} = TestServer.get_listen_addr(svr)
       connect_fun = fn -> Bluez.Rebus.connect(addr) end
+      radio = start_supervised!({Radio, name: nil})
 
       # init/1 blocks on the bus Hello until this test answers it.
       starter =
         Task.async(fn ->
-          GenServer.start(Advertiser, connect_fun: connect_fun, adapter_path: @adapter)
+          GenServer.start(Advertiser, connect_fun: connect_fun, radio: radio)
         end)
 
       assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}, 1_000
@@ -80,21 +81,17 @@ defmodule Bluez.AdvertiserTest do
       {:ok, adv} = Task.await(starter)
       on_exit(fn -> Process.exit(adv, :kill) end)
 
-      %{svr: svr, adv: adv}
+      # Sends go through a process holding hci0's (@adapter's) lease.
+      {holder, lease} = TestLeaseHolder.start(radio)
+
+      %{svr: svr, adv: adv, radio: radio, holder: holder, lease: lease}
     end
 
     test "registers, serves GetAll while registering, and unregisters after duration_ms",
-         %{svr: svr, adv: adv} do
+         %{svr: svr} = ctx do
       uuids = AdData.uuid16_strings(<<1, 2, 1, 2>>)
       spec = %{type: :broadcast, service_uuids: uuids}
-      # Owned by the test process: with the default (the Task) owner-exit
-      # cleanup would unregister it and mask a broken duration_ms.
-      owner = self()
-
-      task =
-        Task.async(fn ->
-          Advertiser.advertise(spec, server: adv, duration_ms: 50, owner: owner)
-        end)
+      ref = advertise_async(ctx, spec, duration_ms: 50)
 
       assert_receive {^svr,
                       %Message{
@@ -113,7 +110,7 @@ defmodule Bluez.AdvertiserTest do
       assert {"ServiceUUIDs", {"as", ^uuids}} = List.keyfind(props, "ServiceUUIDs", 0)
 
       reply(svr, register)
-      assert Task.await(task) == {:ok, 1}
+      assert TestLeaseHolder.await(ref) == {:ok, 1}
 
       assert_receive {^svr,
                       %Message{
@@ -123,92 +120,74 @@ defmodule Bluez.AdvertiserTest do
                      1_000
     end
 
-    test "stop/2 returns only once BlueZ has answered the unregister", %{svr: svr, adv: adv} do
-      owner = self()
+    test "stop/3 returns only once BlueZ has answered the unregister", %{svr: svr} = ctx do
+      {id, path} = registered(ctx)
 
-      task =
-        Task.async(fn -> Advertiser.advertise(%{type: :broadcast}, server: adv, owner: owner) end)
-
-      assert_receive {^svr, %Message{header_fields: %{member: "RegisterAdvertisement"}} = reg},
-                     1_000
-
-      reply(svr, reg)
-      assert {:ok, id} = Task.await(task)
-
-      stopper = Task.async(fn -> Advertiser.stop(id, adv) end)
-
-      assert_receive {^svr,
-                      %Message{header_fields: %{member: "UnregisterAdvertisement"}} = unreg},
-                     1_000
-
-      refute Task.yield(stopper, 100)
+      ref = stop_async(ctx, id)
+      unreg = assert_unregister(svr, path)
+      refute_receive {^ref, _}, 100
       reply(svr, unreg)
-      assert Task.await(stopper) == :ok
+      assert TestLeaseHolder.await(ref) == :ok
     end
 
-    test "a refused unregister keeps the advertisement tracked and stop/2 retryable",
-         %{svr: svr, adv: adv} do
-      {id, path} = registered(svr, adv)
-
-      first = Task.async(fn -> Advertiser.stop(id, adv) end)
+    test "a stop during an expiry's unregistration waits for it", %{svr: svr, adv: adv} = ctx do
+      {id, path} = registered(ctx, duration_ms: 20)
       unreg = assert_unregister(svr, path)
-      # A concurrent stop waits on the same unregistration.
-      second = Task.async(fn -> Advertiser.stop(id, adv) end)
-      wait_until(fn -> match?(%{^id => %{waiters: [_, _]}}, :sys.get_state(adv).ads) end)
-      error(svr, unreg, "org.bluez.Error.Failed")
 
-      assert Task.await(first) == {:error, "org.bluez.Error.Failed"}
-      assert Task.await(second) == {:error, "org.bluez.Error.Failed"}
+      ref = stop_async(ctx, id)
+      wait_until(fn -> match?(%{^id => %{waiters: [_]}}, :sys.get_state(adv).ads) end)
+      reply(svr, unreg)
+      assert TestLeaseHolder.await(ref) == :ok
+    end
+
+    test "a refused unregister keeps the advertisement tracked and stop/3 retryable",
+         %{svr: svr, adv: adv} = ctx do
+      {id, path} = registered(ctx)
+
+      ref = stop_async(ctx, id)
+      error(svr, assert_unregister(svr, path), "org.bluez.Error.Failed")
+      assert TestLeaseHolder.await(ref) == {:error, "org.bluez.Error.Failed"}
       assert %{^id => %{status: :active}} = :sys.get_state(adv).ads
 
-      retry = Task.async(fn -> Advertiser.stop(id, adv) end)
+      ref = stop_async(ctx, id)
       reply(svr, assert_unregister(svr, path))
-      assert Task.await(retry) == :ok
+      assert TestLeaseHolder.await(ref) == :ok
       assert :sys.get_state(adv).ads == %{}
     end
 
-    test "DoesNotExist from BlueZ counts as unregistered", %{svr: svr, adv: adv} do
-      {id, path} = registered(svr, adv)
-      stopper = Task.async(fn -> Advertiser.stop(id, adv) end)
+    test "DoesNotExist from BlueZ counts as unregistered", %{svr: svr} = ctx do
+      {id, path} = registered(ctx)
+      ref = stop_async(ctx, id)
       error(svr, assert_unregister(svr, path), "org.bluez.Error.DoesNotExist")
-      assert Task.await(stopper) == :ok
+      assert TestLeaseHolder.await(ref) == :ok
     end
 
     test "refuses while Bluez.Mgmt holds an instance bluetoothd would hand out next",
-         %{svr: svr, adv: adv} do
+         %{svr: svr} = ctx do
       # Mgmt on hci0 (the adapter these tests advertise on) holds instance 1:
       # bluetoothd, unaware of it, would allocate 1 for our first advert.
-      mgmt = mgmt_holding(1)
+      mgmt = mgmt_holding(ctx, 1)
 
-      assert Advertiser.advertise(%{type: :broadcast}, server: adv, mgmt: mgmt) ==
+      assert ctx |> advertise_async(%{type: :broadcast}, mgmt: mgmt) |> TestLeaseHolder.await() ==
                {:error, :instance_conflict}
 
       refute_receive {^svr, %Message{header_fields: %{member: "RegisterAdvertisement"}}}, 50
     end
 
-    test "registers alongside a Bluez.Mgmt instance bluetoothd can't reach",
-         %{svr: svr, adv: adv} do
-      mgmt = mgmt_holding(5)
-      owner = self()
-
-      task =
-        Task.async(fn ->
-          Advertiser.advertise(%{type: :broadcast}, server: adv, mgmt: mgmt, owner: owner)
-        end)
+    test "registers alongside a Bluez.Mgmt instance bluetoothd can't reach", %{svr: svr} = ctx do
+      mgmt = mgmt_holding(ctx, 5)
+      ref = advertise_async(ctx, %{type: :broadcast}, mgmt: mgmt)
 
       assert_receive {^svr, %Message{header_fields: %{member: "RegisterAdvertisement"}} = reg},
                      1_000
 
       reply(svr, reg)
-      assert {:ok, _id} = Task.await(task)
+      assert {:ok, _id} = TestLeaseHolder.await(ref)
     end
 
     test "Release mid-registration still unregisters if BlueZ then accepts it",
-         %{svr: svr, adv: adv} do
-      owner = self()
-
-      task =
-        Task.async(fn -> Advertiser.advertise(%{type: :broadcast}, server: adv, owner: owner) end)
+         %{svr: svr, adv: adv} = ctx do
+      ref = advertise_async(ctx, %{type: :broadcast})
 
       assert_receive {^svr,
                       %Message{
@@ -221,77 +200,103 @@ defmodule Bluez.AdvertiserTest do
       assert_receive {^svr, %Message{type: :method_return}}, 1_000
 
       reply(svr, reg)
-      assert Task.await(task) == {:error, :stopped}
+      assert TestLeaseHolder.await(ref) == {:error, :stopped}
       reply(svr, assert_unregister(svr, path))
       assert wait_until(fn -> :sys.get_state(adv).ads == %{} end) == :ok
     end
 
-    test "a BlueZ error is returned and the object is dropped", %{svr: svr, adv: adv} do
-      task = Task.async(fn -> Advertiser.advertise(%{type: :broadcast}, server: adv) end)
+    test "a BlueZ error is returned and the object is dropped", %{svr: svr, adv: adv} = ctx do
+      ref = advertise_async(ctx, %{type: :broadcast})
 
       assert_receive {^svr, %Message{header_fields: %{member: "RegisterAdvertisement"}} = reg},
                      1_000
 
-      TestServer.push(
-        svr,
-        Message.new!(:error,
-          reply_serial: reg.serial,
-          error_name: "org.bluez.Error.NotPermitted",
-          flags: []
-        )
-      )
-
-      assert Task.await(task) == {:error, "org.bluez.Error.NotPermitted"}
+      error(svr, reg, "org.bluez.Error.NotPermitted")
+      assert TestLeaseHolder.await(ref) == {:error, "org.bluez.Error.NotPermitted"}
       assert :sys.get_state(adv).ads == %{}
     end
 
-    test "the owner's exit unregisters", %{svr: svr, adv: adv} do
-      owner = spawn(fn -> Process.sleep(:infinity) end)
+    test "the holder's exit unregisters everything sent under its lease",
+         %{svr: svr, holder: holder} = ctx do
+      {_id, path} = registered(ctx)
 
-      task =
-        Task.async(fn -> Advertiser.advertise(%{type: :broadcast}, server: adv, owner: owner) end)
+      TestLeaseHolder.stop(holder)
+      assert_unregister(svr, path)
+    end
 
-      assert_receive {^svr, %Message{header_fields: %{member: "RegisterAdvertisement"}} = reg},
-                     1_000
+    test "releasing the lease unregisters", %{svr: svr, holder: holder} = ctx do
+      {_id, path} = registered(ctx)
 
-      reply(svr, reg)
-      assert {:ok, id} = Task.await(task)
+      assert TestLeaseHolder.call(holder, &Radio.release/1) == :ok
+      assert_unregister(svr, path)
+    end
 
-      Process.exit(owner, :kill)
-      path = "/org/exbluez/advertiser/adv#{id}"
+    test "an advertisement registered after its lease ended is unregistered",
+         %{svr: svr, radio: radio, holder: holder} = ctx do
+      _ref = advertise_async(ctx, %{type: :broadcast})
 
       assert_receive {^svr,
                       %Message{
-                        header_fields: %{member: "UnregisterAdvertisement"},
-                        body: [^path]
-                      }},
+                        header_fields: %{member: "RegisterAdvertisement"},
+                        body: [path, []]
+                      } = reg},
                      1_000
+
+      TestLeaseHolder.stop(holder)
+      wait_until(fn -> Radio.holder(0, radio) == nil end)
+      reply(svr, reg)
+      assert_unregister(svr, path)
+    end
+
+    test "only the lease holder may send, and only while the lease lasts",
+         %{svr: svr, adv: adv, holder: holder, lease: lease} do
+      assert Advertiser.advertise(lease, %{type: :broadcast}, server: adv) ==
+               {:error, :not_lease_holder}
+
+      assert Advertiser.stop(lease, 1, adv) == {:error, :not_lease_holder}
+
+      assert TestLeaseHolder.call(holder, fn lease ->
+               :ok = Radio.release(lease)
+               Advertiser.advertise(lease, %{type: :broadcast}, server: adv)
+             end) == {:error, :lease_expired}
+
+      refute_receive {^svr, %Message{header_fields: %{member: "RegisterAdvertisement"}}}, 50
     end
   end
 
   test "rejects bad options in the caller, before reaching the server" do
-    assert {:error, {:invalid_spec, _}} = Advertiser.advertise(%{type: :scanner})
-    assert {:error, {:invalid_spec, _}} = Advertiser.advertise(%{})
-    assert {:error, {:invalid_spec, _}} = Advertiser.advertise(%{type: "broadcast"})
-    assert {:error, {:invalid_spec, _}} = Advertiser.advertise(:broadcast)
+    {:ok, lease} = Radio.acquire(server: start_supervised!({Radio, name: nil}), adapter_index: 0)
 
-    spec = %{type: :broadcast}
-    assert Advertiser.advertise(spec, owner: :worker) == {:error, {:invalid, "owner"}}
-    assert Advertiser.advertise(spec, duration_ms: 0) == {:error, {:invalid, "duration_ms"}}
+    assert {:error, {:invalid_spec, _}} = Advertiser.advertise(lease, %{type: :scanner})
+    assert {:error, {:invalid_spec, _}} = Advertiser.advertise(lease, %{})
+    assert {:error, {:invalid_spec, _}} = Advertiser.advertise(lease, %{type: "broadcast"})
+    assert {:error, {:invalid_spec, _}} = Advertiser.advertise(lease, :broadcast)
+
+    assert Advertiser.advertise(lease, %{type: :broadcast}, duration_ms: 0) ==
+             {:error, {:invalid, "duration_ms"}}
 
     assert {:error, {:invalid_spec, _}} =
              Advertiser.properties(%{type: :broadcast, min_interval_ms: 4_294_967_316})
   end
 
   test "public API degrades when not running" do
-    assert Advertiser.advertise(%{type: :broadcast}, server: :no_such_adv) ==
+    {:ok, lease} = Radio.acquire(server: start_supervised!({Radio, name: nil}), adapter_index: 0)
+
+    assert Advertiser.advertise(lease, %{type: :broadcast}, server: :no_such_adv) ==
              {:error, :not_running}
 
-    assert Advertiser.stop(1, :no_such_adv) == :ok
+    assert Advertiser.stop(lease, 1, :no_such_adv) == :ok
   end
 
-  # A Bluez.Mgmt (against a scripted kernel) holding `instance` on hci0.
-  defp mgmt_holding(instance) do
+  defp advertise_async(%{adv: adv, holder: holder}, spec, opts \\ []),
+    do: TestLeaseHolder.run(holder, &Advertiser.advertise(&1, spec, [server: adv] ++ opts))
+
+  defp stop_async(%{adv: adv, holder: holder}, id),
+    do: TestLeaseHolder.run(holder, &Advertiser.stop(&1, id, adv))
+
+  # A Bluez.Mgmt (against a scripted kernel) holding `instance` on hci0,
+  # sent by the same lease holder.
+  defp mgmt_holding(%{radio: radio, holder: holder}, instance) do
     test_pid = self()
 
     open = fn ->
@@ -301,13 +306,14 @@ defmodule Bluez.AdvertiserTest do
       {:ok, proc}
     end
 
-    mgmt = start_supervised!({Bluez.Mgmt, name: nil, adapter_index: 0, open: open})
+    mgmt = start_supervised!({Bluez.Mgmt, name: nil, radio: radio, open: open})
     assert_receive {:kernel, kernel}, 1_000
 
-    task =
-      Task.async(fn ->
-        Bluez.Mgmt.advertise(<<2, 1, 6>>, server: mgmt, instance: instance, owner: test_pid)
-      end)
+    ref =
+      TestLeaseHolder.run(
+        holder,
+        &Bluez.Mgmt.advertise(&1, <<2, 1, 6>>, server: mgmt, instance: instance)
+      )
 
     # Read Advertising Features (hardware offload, nothing else registered),
     # then the parameters and data commands.
@@ -328,7 +334,7 @@ defmodule Bluez.AdvertiserTest do
         )
     end
 
-    assert Task.await(task) == {:ok, instance}
+    assert TestLeaseHolder.await(ref) == {:ok, instance}
     assert Bluez.Mgmt.held_instances(mgmt) == [{0, instance}]
     mgmt
   end
@@ -347,18 +353,15 @@ defmodule Bluez.AdvertiserTest do
     end
   end
 
-  # Register an advertisement owned by the test process; {id, path}.
-  defp registered(svr, adv) do
-    owner = self()
-
-    task =
-      Task.async(fn -> Advertiser.advertise(%{type: :broadcast}, server: adv, owner: owner) end)
+  # Register an advertisement through the lease holder; {id, path}.
+  defp registered(%{svr: svr} = ctx, opts \\ []) do
+    ref = advertise_async(ctx, %{type: :broadcast}, opts)
 
     assert_receive {^svr, %Message{header_fields: %{member: "RegisterAdvertisement"}} = reg},
                    1_000
 
     reply(svr, reg)
-    assert {:ok, id} = Task.await(task)
+    assert {:ok, id} = TestLeaseHolder.await(ref)
     {id, "/org/exbluez/advertiser/adv#{id}"}
   end
 

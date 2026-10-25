@@ -16,29 +16,28 @@ defmodule Bluez.Mgmt do
   secondary-PHY flag is set) so the advertising interval can be set — the
   kernel default of 1.28 s is useless for short bursts.
 
+  Sending requires the controller's transmit lease (`Bluez.Radio`): call
+  `advertise/3` and `stop_advertising/3` from the process holding it. The
+  lease also names the controller, and ending it — `Bluez.Radio.release/1`
+  or the holder exiting — removes every instance sent under it.
+
   Advertising instances are a per-controller namespace shared with
   `bluetoothd`, which allocates its own from 1 upward. Without
   `instance:`, an advertisement goes to the highest instance number that
-  is free or already ours (`read_advertising_features/0` lists the
-  occupied ones), so it never takes over `bluetoothd`'s; repeated default
-  sends reuse that one instance, each replacing the last. An explicit
+  is free or already ours (Read Advertising Features lists the occupied
+  ones), so it never takes over `bluetoothd`'s; repeated default sends
+  reuse that one instance, each replacing the last. An explicit
   `instance:` is used as given — replacing whatever occupies it. Every
   instance added here is removed again when its `duration_ms:` elapses,
-  when its owner process exits, on `stop_advertising/1`, and when this
-  process stops.
+  on `stop_advertising/3`, when its lease ends, and when this process
+  stops.
 
   `bluetoothd` doesn't know about instances added here, so a D-Bus
   advertisement could later be given the same number and silently
-  overwrite one. `Bluez.Advertiser` guards against that by consulting
-  `held_instances/1` and refusing with `{:error, :instance_conflict}`
-  while bluetoothd's next pick could collide; on a one-instance
-  controller the two paths take turns. That check is a snapshot, not a
-  reservation, so don't advertise through both on the same controller
-  concurrently — drive them from one process.
-
-  Without the `adapter_index:` start option, requests are refused with
-  `{:error, :no_adapter_index}` until `Bluez.Client` has resolved the
-  adapter, so nothing is ever left on the `hci0` fallback.
+  overwrite one; `Bluez.Advertiser` checks `held_instances/1` before
+  registering and refuses with `{:error, :instance_conflict}` when it
+  could (see its moduledoc). Because only the lease holder sends, one
+  call at a time, that check is exact.
 
   ## Software rotation
 
@@ -47,7 +46,7 @@ defmodule Bluez.Mgmt do
   between instances in software, roughly 2 s per instance. Accepting an
   instance there doesn't mean it is on air yet, so with another instance
   active (bluetoothd's, say) a short `duration_ms:` advertisement could be
-  removed before it ever transmits. `advertise/2` therefore refuses a
+  removed before it ever transmits. `advertise/3` therefore refuses a
   finite `duration_ms:` with `{:error, :rotation_busy}` when the
   controller lacks hardware offload (`Bluez.Hci.adv_hw_offload?/1`) and any
   other instance is registered. Every request reads the controller's
@@ -69,7 +68,8 @@ defmodule Bluez.Mgmt do
   use GenServer
   require Logger
 
-  alias Bluez.{AdData, DevicePath, Hci}
+  alias Bluez.{AdData, Hci, Radio}
+  alias Bluez.Radio.Lease
 
   # Per-send patience in terminate/2 (see there).
   @terminate_send_timeout 100
@@ -84,7 +84,8 @@ defmodule Bluez.Mgmt do
   end
 
   @doc """
-  Add (or replace) an advertising instance carrying `adv_data` verbatim.
+  Add (or replace) an advertising instance carrying `adv_data` verbatim,
+  on the controller `lease` covers. Call it from the lease holder.
 
   Options:
 
@@ -92,8 +93,6 @@ defmodule Bluez.Mgmt do
     * `:duration_ms` — remove the instance after this many ms (default:
       advertise until stopped).
     * `:instance` — instance number (default: the controller's highest).
-    * `:owner` — pid whose exit removes the instance (default: the
-      caller). Pass `nil` to tie it to this process only.
     * `:server` — the `Bluez.Mgmt` to use (default `Bluez.Mgmt`).
     * `:flags`, `:min_interval_ms`, `:max_interval_ms`, `:tx_power` — see
       `Bluez.Hci.add_ext_adv_params/2`. `:min_interval_ms`/
@@ -102,17 +101,16 @@ defmodule Bluez.Mgmt do
   Returns `{:ok, instance}` once the kernel has accepted the data, or
   `{:error, reason}` — a MGMT status atom (`:busy`, `:invalid_params`,
   `:rejected`, `:not_supported`, …), `:no_free_instance`, `:rotation_busy`
-  (see "Software rotation"), `:too_long`, `{:invalid, message}` for bad
-  options, or `:not_running`.
+  (see "Software rotation"), `:not_lease_holder`, `:lease_expired`,
+  `:too_long`, `{:invalid, message}` for bad options, or `:not_running`.
   """
-  @spec advertise(binary(), keyword()) :: {:ok, byte()} | {:error, term()}
-  def advertise(adv_data, opts \\ []) when is_binary(adv_data) do
-    opts = Keyword.put_new(opts, :owner, self())
-
-    # Validate here, in the caller, so a bad option can never crash the
-    # server mid-job.
-    with :ok <- validate(adv_data, opts) do
-      server_call(Keyword.get(opts, :server, __MODULE__), {:advertise, adv_data, opts})
+  @spec advertise(Lease.t(), binary(), keyword()) :: {:ok, byte()} | {:error, term()}
+  def advertise(lease, adv_data, opts \\ []) when is_binary(adv_data) do
+    # Checked here, in the caller: only the holder sends, and a bad option
+    # can never crash the server mid-job.
+    with :ok <- Radio.check_holder(lease),
+         :ok <- validate(adv_data, opts) do
+      server_call(Keyword.get(opts, :server, __MODULE__), {:advertise, lease, adv_data, opts})
     end
   end
 
@@ -124,7 +122,6 @@ defmodule Bluez.Mgmt do
       byte_size(adv_data) > 255 or byte_size(scan_rsp) > 255 -> {:error, :too_long}
       not valid_opt?(opts, :instance, &(&1 in 1..254)) -> invalid("instance")
       not valid_opt?(opts, :duration_ms, &(is_integer(&1) and &1 > 0)) -> invalid("duration_ms")
-      not valid_opt?(opts, :owner, &is_pid/1) -> invalid("owner")
       true -> validate_params(opts)
     end
   end
@@ -154,19 +151,27 @@ defmodule Bluez.Mgmt do
     |> Keyword.put(:scan_response, Keyword.get(opts, :scan_response, <<>>) != <<>>)
   end
 
-  @doc "Remove an instance added by `advertise/2`."
-  @spec stop_advertising(byte(), GenServer.server()) :: :ok | {:error, term()}
-  def stop_advertising(instance, server \\ __MODULE__) when instance in 1..254,
-    do: server_call(server, {:stop_advertising, instance})
+  @doc """
+  Remove an instance `advertise/3` added under `lease` (call it from the
+  holder). `{:error, :unknown_instance}` when the lease holds no such
+  instance.
+  """
+  @spec stop_advertising(Lease.t(), byte(), GenServer.server()) :: :ok | {:error, term()}
+  def stop_advertising(lease, instance, server \\ __MODULE__) when instance in 1..254 do
+    with :ok <- Radio.check_holder(lease),
+         do: server_call(server, {:stop_advertising, lease, instance})
+  end
 
   @doc """
-  The controller's advertising capabilities (*Read Advertising
+  Controller `index`'s advertising capabilities (*Read Advertising
   Features*): supported flags, maximum data lengths, instance count and
-  the instances currently registered (by anyone).
+  the instances currently registered (by anyone). Read-only, so no lease
+  is needed.
   """
-  @spec read_advertising_features(GenServer.server()) :: {:ok, map()} | {:error, term()}
-  def read_advertising_features(server \\ __MODULE__),
-    do: server_call(server, :read_advertising_features)
+  @spec read_advertising_features(non_neg_integer(), GenServer.server()) ::
+          {:ok, map()} | {:error, term()}
+  def read_advertising_features(index, server \\ __MODULE__) when is_integer(index),
+    do: server_call(server, {:read_advertising_features, index})
 
   @doc """
   The `{controller_index, instance}` pairs this process holds, including
@@ -219,14 +224,16 @@ defmodule Bluez.Mgmt do
 
     case open.() do
       {:ok, sock} ->
+        # Lease ends arrive as {:radio_lease_ended, ref}.
+        :ok = Radio.subscribe(Keyword.get(opts, :radio, Radio))
+
         state = %{
           sock: sock,
-          adapter_index: Keyword.get(opts, :adapter_index),
           command_timeout: Keyword.get(opts, :command_timeout, @command_timeout),
           # The in-flight job (one MGMT command at a time) and the queue.
           job: nil,
           queue: :queue.new(),
-          # instance => %{index, owner_ref, timer}
+          # instance => %{index, lease_ref, timer, gen, removing}
           instances: %{}
         }
 
@@ -240,31 +247,21 @@ defmodule Bluez.Mgmt do
   end
 
   @impl GenServer
-  def handle_call({:advertise, adv_data, opts}, from, state) do
-    case index(state) do
-      {:ok, index} ->
-        job = %{
-          from: from,
-          kind: {:advertise, index, adv_data, opts},
-          steps: []
-        }
-
-        {:noreply, enqueue(state, job)}
-
-      :error ->
-        {:reply, {:error, :no_adapter_index}, state}
+  def handle_call({:advertise, lease, adv_data, opts}, from, state) do
+    if Radio.valid?(lease) do
+      job = %{from: from, kind: {:advertise, lease, adv_data, opts}, steps: []}
+      {:noreply, enqueue(state, job)}
+    else
+      {:reply, {:error, :lease_expired}, state}
     end
   end
 
-  def handle_call({:stop_advertising, instance}, from, state) do
-    case Map.fetch(state.instances, instance) do
-      # :current — an explicit stop removes whatever occupies the instance
-      # when it runs, including a replacement that lands meanwhile.
-      {:ok, entry} ->
-        state = mark_removing(state, instance)
-        {:noreply, enqueue(state, remove_job(entry.index, instance, :current, from))}
+  def handle_call({:stop_advertising, %Lease{ref: ref}, instance}, from, state) do
+    case state.instances do
+      %{^instance => %{lease_ref: ^ref, removing: false}} ->
+        {:noreply, cleanup(state, instance, from)}
 
-      :error ->
+      _not_held_under_this_lease ->
         {:reply, {:error, :unknown_instance}, state}
     end
   end
@@ -272,29 +269,12 @@ defmodule Bluez.Mgmt do
   def handle_call(:held_instances, _from, state) do
     tracked = for {instance, entry} <- state.instances, do: {entry.index, instance}
 
-    in_flight =
-      case state.job do
-        %{kind: {:advertising, index, instance, _opts}} -> [{index, instance}]
-        _other -> []
-      end
-
-    {:reply, Enum.uniq(in_flight ++ tracked), state}
+    {:reply, Enum.uniq(in_flight(state) ++ tracked), state}
   end
 
-  def handle_call(:read_advertising_features, from, state) do
-    case index(state) do
-      {:ok, index} ->
-        job = %{
-          from: from,
-          kind: :features,
-          steps: [{Hci.op_read_adv_features(), index, <<>>}]
-        }
-
-        {:noreply, enqueue(state, job)}
-
-      :error ->
-        {:reply, {:error, :no_adapter_index}, state}
-    end
+  def handle_call({:read_advertising_features, index}, from, state) do
+    job = %{from: from, kind: :features, steps: [{Hci.op_read_adv_features(), index, <<>>}]}
+    {:noreply, enqueue(state, job)}
   end
 
   @impl GenServer
@@ -323,9 +303,11 @@ defmodule Bluez.Mgmt do
     end
   end
 
-  def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
-    owned = for {instance, %{owner_ref: ^ref}} <- state.instances, do: instance
-    {:noreply, Enum.reduce(owned, state, &cleanup(&2, &1, nil))}
+  # The lease ended (released, or its holder exited): take everything
+  # sent under it off air.
+  def handle_info({:radio_lease_ended, ref}, state) do
+    held = for {instance, %{lease_ref: ^ref, removing: false}} <- state.instances, do: instance
+    {:noreply, Enum.reduce(held, state, &cleanup(&2, &1, nil))}
   end
 
   def handle_info(_other, state), do: {:noreply, state}
@@ -337,18 +319,12 @@ defmodule Bluez.Mgmt do
     # while its data command is still in flight.
     tracked = for {instance, entry} <- state.instances, do: {entry.index, instance}
 
-    in_flight =
-      case state.job do
-        %{kind: {:advertising, index, instance, _opts}} -> [{index, instance}]
-        _other -> []
-      end
-
     # Bounded sends: we may be stopping *because* the socket is wedged
     # (:mgmt_command_timeout), and an unbounded send would then block until
     # the supervisor kills us. The first send that times out ends the
     # attempt, so the total stays bounded too.
     _ =
-      Enum.reduce_while(Enum.uniq(in_flight ++ tracked), :ok, fn {index, instance}, :ok ->
+      Enum.reduce_while(Enum.uniq(in_flight(state) ++ tracked), :ok, fn {index, instance}, :ok ->
         command = Hci.mgmt_command(Hci.op_remove_advertising(), index, <<instance>>)
 
         case :socket.send(state.sock, command, [], @terminate_send_timeout) do
@@ -362,10 +338,10 @@ defmodule Bluez.Mgmt do
 
   # ── job queue ─────────────────────────────────────────────────────────────
 
-  # `gen` ties an automatic removal (expiry, owner exit) to the
-  # advertisement it was queued for: if the instance has been re-advertised
-  # by the time it runs, the removal is stale and skipped (see start_job/2).
-  # An explicit stop passes `:current` instead.
+  # `gen` ties a removal to the advertisement it was queued for: if the
+  # instance has been re-advertised by the time it runs (an expiry racing
+  # the holder's replacement), the removal is stale and skipped (see
+  # start_job/2).
   defp remove_job(index, instance, gen, from) do
     %{
       from: from,
@@ -388,21 +364,9 @@ defmodule Bluez.Mgmt do
   # Every advertise starts with Read Advertising Features: it picks the
   # default instance and tells whether the controller rotates instances in
   # software (see prepared/4).
-  defp start_job(state, %{kind: {:advertise, index, adv_data, opts}} = job) do
-    steps = [{Hci.op_read_adv_features(), index, <<>>}]
-    send_step(state, %{job | steps: steps, kind: {:prepare, index, adv_data, opts}})
-  end
-
-  defp start_job(state, %{kind: {:remove, instance, :current}} = job) do
-    case state.instances[instance] do
-      %{index: index, gen: gen} ->
-        state = mark_removing(state, instance)
-        steps = [{Hci.op_remove_advertising(), index, <<instance>>}]
-        send_step(state, %{job | kind: {:remove, instance, gen}, steps: steps})
-
-      nil ->
-        finish(state, job, :ok)
-    end
+  defp start_job(state, %{kind: {:advertise, lease, adv_data, opts}} = job) do
+    steps = [{Hci.op_read_adv_features(), lease.index, <<>>}]
+    send_step(state, %{job | steps: steps, kind: {:prepare, lease, adv_data, opts}})
   end
 
   defp start_job(state, %{kind: {:remove, instance, gen}} = job) do
@@ -413,16 +377,18 @@ defmodule Bluez.Mgmt do
 
   defp start_job(state, job), do: send_step(state, job)
 
-  # Options were validated by advertise/2 in the caller, so building the
+  # Options were validated by advertise/3 in the caller, so building the
   # parameters here cannot raise.
-  defp start_advertise(state, job, index, instance, adv_data, opts) do
+  defp start_advertise(state, job, lease, instance, adv_data, opts) do
+    index = lease.index
+
     steps = [
       {Hci.op_add_ext_adv_params(), index, Hci.add_ext_adv_params(instance, params_opts(opts))},
       {Hci.op_add_ext_adv_data(), index,
        Hci.add_ext_adv_data(instance, adv_data, Keyword.get(opts, :scan_response, <<>>))}
     ]
 
-    send_step(state, %{job | steps: steps, kind: {:advertising, index, instance, opts}})
+    send_step(state, %{job | steps: steps, kind: {:advertising, lease, instance, opts}})
   end
 
   defp send_step(state, %{steps: [{opcode, index, params} | _rest]} = job) do
@@ -458,16 +424,25 @@ defmodule Bluez.Mgmt do
 
   defp step_done(state, _opcode, _result), do: state
 
-  defp complete(state, %{kind: {:prepare, index, adv_data, opts}} = job, params) do
+  defp complete(state, %{kind: {:prepare, lease, adv_data, opts}} = job, params) do
     case Hci.decode_adv_features(params) do
-      {:ok, features} -> prepared(state, job, {index, adv_data, opts}, features)
+      {:ok, features} -> prepared(state, job, {lease, adv_data, opts}, features)
       :error -> finish(state, job, {:error, :malformed_reply})
     end
   end
 
-  defp complete(state, %{kind: {:advertising, index, instance, opts}} = job, _params) do
-    state = track(state, index, instance, opts)
-    finish(state, job, {:ok, instance})
+  # On air. If the lease ended while the commands were in flight, its
+  # end-of-lease cleanup already ran without this instance: take it back
+  # off air now instead of reporting success.
+  defp complete(state, %{kind: {:advertising, lease, instance, opts}} = job, _params) do
+    state = track(state, lease, instance, opts)
+
+    if Radio.valid?(lease) do
+      finish(state, job, {:ok, instance})
+    else
+      if job.from, do: GenServer.reply(job.from, {:error, :lease_expired})
+      cleanup(%{state | job: nil}, instance, nil)
+    end
   end
 
   defp complete(state, %{kind: :features} = job, params) do
@@ -484,21 +459,19 @@ defmodule Bluez.Mgmt do
     do: finish(removed(state, instance, gen), job, :ok)
 
   # Parameters accepted but data refused leaves a half-made instance:
-  # report the failure, then remove it as the very next job — ahead of
-  # anything queued, which may be a new advertisement on the same instance.
-  defp failed(state, %{kind: {:advertising, index, instance, _opts}, steps: [_data]} = job, error) do
+  # report the failure and remove it. It is tracked under the lease (as
+  # being removed, replacing any older entry — the accepted parameters
+  # already overwrote that advertisement) so a failed rollback is still
+  # covered by stop_advertising/3, the lease ending and shutdown.
+  defp failed(state, %{kind: {:advertising, lease, instance, _opts}, steps: [_data]} = job, error) do
     if job.from, do: GenServer.reply(job.from, error)
 
-    # Track it (as being removed, replacing any older entry — the accepted
-    # parameters already overwrote that advertisement) so a failed rollback
-    # is still covered by stop_advertising/1 and shutdown.
     state = untrack(state, instance)
     gen = make_ref()
-    entry = %{index: index, owner_ref: nil, timer: nil, gen: gen, removing: true}
+    entry = %{index: lease.index, lease_ref: lease.ref, timer: nil, gen: gen, removing: true}
     state = put_in(state.instances[instance], entry)
 
-    rollback = remove_job(index, instance, gen, nil)
-    next(%{state | job: nil, queue: :queue.in_r(rollback, state.queue)})
+    enqueue(%{state | job: nil}, remove_job(lease.index, instance, gen, nil))
   end
 
   # Remove Advertising for an instance the kernel no longer has: it's gone,
@@ -506,8 +479,9 @@ defmodule Bluez.Mgmt do
   defp failed(state, %{kind: {:remove, instance, gen}} = job, {:error, :invalid_params}),
     do: finish(removed(state, instance, gen), job, :ok)
 
-  # Any other removal failure: keep tracking it (owner/duration cleanup is
-  # spent, but stop_advertising/1 and shutdown still cover it).
+  # Any other removal failure: keep tracking it as live (its duration
+  # trigger is spent, but stop_advertising/3, the lease ending and shutdown
+  # still cover it).
   defp failed(state, %{kind: {:remove, instance, gen}} = job, error) do
     state =
       if current?(state, instance, gen),
@@ -524,17 +498,20 @@ defmodule Bluez.Mgmt do
     next(%{state | job: nil})
   end
 
+  # The instance whose parameters the kernel may already have accepted
+  # while its data command is still in flight.
+  defp in_flight(state) do
+    case state.job do
+      %{kind: {:advertising, lease, instance, _opts}} -> [{lease.index, instance}]
+      _other -> []
+    end
+  end
+
   # ── instance tracking ─────────────────────────────────────────────────────
 
-  defp track(state, index, instance, opts) do
+  defp track(state, lease, instance, opts) do
     # Replacing an instance we already track: drop the old bookkeeping.
     state = untrack(state, instance)
-
-    owner_ref =
-      case opts[:owner] do
-        pid when is_pid(pid) -> Process.monitor(pid)
-        nil -> nil
-      end
 
     timer =
       case opts[:duration_ms] do
@@ -547,11 +524,18 @@ defmodule Bluez.Mgmt do
           nil
       end
 
-    entry = %{index: index, owner_ref: owner_ref, timer: timer, gen: make_ref(), removing: false}
+    entry = %{
+      index: lease.index,
+      lease_ref: lease.ref,
+      timer: timer,
+      gen: make_ref(),
+      removing: false
+    }
+
     %{state | instances: Map.put(state.instances, instance, entry)}
   end
 
-  # Automatic removal (expiry, owner exit) of exactly this advertisement.
+  # Removal of exactly this advertisement (stop, expiry, lease end).
   defp cleanup(state, instance, from) do
     state = mark_removing(state, instance)
     entry = state.instances[instance]
@@ -559,12 +543,11 @@ defmodule Bluez.Mgmt do
   end
 
   # Start taking `instance` off air. It stays tracked (flagged `removing`)
-  # until the kernel confirms, so a failed removal is still covered by
-  # stop_advertising/1 and shutdown; owner and duration triggers are spent.
+  # until the kernel confirms, so a failed removal is still covered by a
+  # retry and shutdown; its duration trigger is spent.
   defp mark_removing(state, instance) do
     entry = Map.fetch!(state.instances, instance)
-    if entry.owner_ref, do: Process.demonitor(entry.owner_ref, [:flush])
-    put_in(state.instances[instance], %{entry | owner_ref: nil, timer: nil, removing: true})
+    put_in(state.instances[instance], %{entry | timer: nil, removing: true})
   end
 
   # With the controller's features in hand: settle the instance, and refuse
@@ -572,8 +555,8 @@ defmodule Bluez.Mgmt do
   # offload, instances share the air in ~2 s software slots, so with another
   # instance active a short `duration_ms:` can be removed before it ever
   # transmits — while add/data report success.
-  defp prepared(state, job, {index, adv_data, opts}, features) do
-    instance = opts[:instance] || pick_instance(state, index, features)
+  defp prepared(state, job, {lease, adv_data, opts}, features) do
+    instance = opts[:instance] || pick_instance(state, lease.index, features)
 
     cond do
       instance == nil ->
@@ -584,7 +567,7 @@ defmodule Bluez.Mgmt do
         finish(state, job, {:error, :rotation_busy})
 
       true ->
-        start_advertise(state, job, index, instance, adv_data, opts)
+        start_advertise(state, job, lease, instance, adv_data, opts)
     end
   end
 
@@ -608,8 +591,7 @@ defmodule Bluez.Mgmt do
       {nil, _instances} ->
         state
 
-      {entry, instances} ->
-        if entry.owner_ref, do: Process.demonitor(entry.owner_ref, [:flush])
+      {_entry, instances} ->
         %{state | instances: instances}
     end
   end
@@ -649,11 +631,5 @@ defmodule Bluez.Mgmt do
       _other ->
         state
     end
-  end
-
-  defp index(%{adapter_index: index}) when is_integer(index), do: {:ok, index}
-
-  defp index(_state) do
-    with {:ok, path} <- DevicePath.resolved_adapter_path(), do: Hci.adapter_index(path)
   end
 end

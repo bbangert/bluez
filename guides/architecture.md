@@ -23,7 +23,7 @@ flowchart TB
     client --> agent["5 · Bluez.Agent<br/>(pairing)"]
     agent --> gatt["6 · Gatt Task.Supervisor + Bluez.Gatt"]
     gatt --> alsa["7 · bluealsad + Bluez.BlueAlsa<br/>(audio: true only)"]
-    alsa --> radio["8 · Mgmt / Advertiser / AdvertReceiver<br/>(opt-in only)"]
+    alsa --> radio["8 · Radio / Mgmt / Advertiser / AdvertReceiver<br/>(opt-in only)"]
     radio --> extra["9 · extra_children:<br/>(host consumers)"]
 
     style alsa stroke-dasharray: 5 5
@@ -147,7 +147,18 @@ hand out the advertising bytes it received (only per-device properties,
 deduped and merged), and transmit an advertising PDU with an arbitrary
 layout. Some protocols need both — e.g. lights that carry an encrypted
 payload as a 16-bit Service UUID list, where order and repeated values
-*are* the data. Three opt-in children cover that:
+*are* the data. Opt-in children cover that:
+
+- **`Bluez.Radio`** — transmit leases, one per controller, started
+  whenever either advertiser is. A process `acquire/1`s a controller,
+  sends through the advertisers with the lease, and `release/1`s it (or
+  exits); only the holder may send, and the lease ending takes
+  everything sent under it off air. The controller's advertising
+  instances are one namespace the two transmit paths share without
+  seeing each other's use of it, so a single holder issuing every send,
+  one call at a time, is what lets each path check the other's state
+  exactly. It defaults to the adapter `Bluez.Client` resolved, refusing
+  (`{:error, :no_adapter_index}`) to lease the `hci0` fallback.
 
 - **`Bluez.Advertiser`** (D-Bus, `LEAdvertisingManager1`). Each
   advertisement is an `LEAdvertisement1` object exported on its own rebus
@@ -156,7 +167,7 @@ payload as a 16-bit Service UUID list, where order and repeated values
   `ServiceUUIDs` in order with duplicates and writes 16-bit UUIDs
   little-endian, so `Bluez.AdData.uuid16_strings/1` puts a payload on air
   verbatim. Lifetime: `duration_ms:` (ms-precise, unlike BlueZ's
-  whole-second `Timeout`), `stop/1`, or the owner process exiting.
+  whole-second `Timeout`), `stop/3`, or the lease ending.
 - **`Bluez.Mgmt`** (kernel MGMT over an `HCI_CHANNEL_CONTROL` socket).
   For AD layouts BlueZ refuses: its `Data` property rejects Flags, UUID
   lists, names and service data, and it moves `LocalName` to the scan
@@ -166,21 +177,18 @@ payload as a 16-bit Service UUID list, where order and repeated values
   bursts. Instances default to the highest number that is free or
   already ours, so `bluetoothd`'s (allocated from 1) are never taken
   over; commands are serialized one at a time; every instance is removed
-  on duration, owner exit, `stop_advertising/1`, or shutdown. Both
-  advertisers wait for `Bluez.Client` to resolve the adapter rather than
-  act on the `hci0` fallback, and clean up on the adapter they used.
-  Because `bluetoothd` can't see `Bluez.Mgmt`'s instances, the
-  Advertiser refuses (`{:error, :instance_conflict}`) to register while
-  bluetoothd's next allocation could land on one of them. That check is
-  a snapshot, not a reservation: send through both on one controller
-  from a single process, never concurrently.
+  on duration, lease end, `stop_advertising/3`, or shutdown. Because
+  `bluetoothd` can't see `Bluez.Mgmt`'s instances, the Advertiser
+  refuses (`{:error, :instance_conflict}`) to register while bluetoothd's
+  next allocation could land on one of them — exact, since the lease
+  holder is the only sender on the controller.
 - **`Bluez.AdvertReceiver`** (`HCI_CHANNEL_RAW` socket with a kernel
   filter for LE Meta events). Listens to the controller's legacy and
   extended advertising reports while `Bluez.Client` scans, and hands each
   one — AD bytes untouched — to `on_report:`. Read-only, so it never
-  conflicts with `bluetoothd`. Like the advertisers it waits for
-  `Bluez.Client` to resolve the adapter (never listening on the `hci0`
-  fallback), moves its socket if the selection changes, and retries
+  conflicts with `bluetoothd`, and needs no lease. Like `Bluez.Radio` it
+  waits for `Bluez.Client` to resolve the adapter (never listening on the
+  `hci0` fallback); it moves its socket if the selection changes, and retries
   opening instead of crash-looping when no adapter is present.
 
 `Bluez.Hci` holds the socket setup and the pure codecs (HCI reports,

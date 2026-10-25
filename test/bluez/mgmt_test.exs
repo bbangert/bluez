@@ -1,15 +1,16 @@
 defmodule Bluez.MgmtTest do
   use ExUnit.Case, async: true
 
-  alias Bluez.{AdData, Mgmt, TestSocketPair}
+  alias Bluez.{AdData, Mgmt, Radio, TestLeaseHolder, TestSocketPair}
 
   @read_features 0x003D
   @remove 0x003F
   @params 0x0054
   @data 0x0055
 
-  # The test plays the kernel on the other end of the MGMT socket.
-  defp start_mgmt(opts \\ []) do
+  # The test plays the kernel on the other end of the MGMT socket, and
+  # sends through a process holding hci0's transmit lease.
+  setup ctx do
     test_pid = self()
 
     open = fn ->
@@ -20,15 +21,19 @@ defmodule Bluez.MgmtTest do
       {:ok, proc}
     end
 
-    mgmt = start_supervised!({Mgmt, [name: nil, adapter_index: 0, open: open] ++ opts})
+    radio = start_supervised!({Radio, name: nil})
+    opts = [name: nil, radio: radio, open: open] ++ Map.get(ctx, :mgmt_opts, [])
+    mgmt = start_supervised!({Mgmt, opts})
     assert_receive {:kernel, kernel}, 1_000
-    {mgmt, kernel}
+    {holder, lease} = TestLeaseHolder.start(radio)
+
+    %{mgmt: mgmt, kernel: kernel, radio: radio, holder: holder, lease: lease}
   end
 
   # Datagrams on the kernel socket are processed in order, so once a later
   # command round-trip has completed every earlier packet has been handled.
   defp sync(mgmt, kernel) do
-    task = Task.async(fn -> Mgmt.read_advertising_features(mgmt) end)
+    task = Task.async(fn -> Mgmt.read_advertising_features(0, mgmt) end)
     expect_command(kernel, @read_features)
     complete(kernel, @read_features, 0, features(5))
     assert {:ok, _} = Task.await(task)
@@ -61,20 +66,21 @@ defmodule Bluez.MgmtTest do
     complete(kernel, @read_features, 0, features(max, in_use, flags))
   end
 
-  # The owner defaults to the caller — here the short-lived Task — so pin
-  # it to the test process unless a test is about ownership.
-  defp advertise_async(mgmt, data, opts) do
-    opts = [server: mgmt, owner: self()] |> Keyword.merge(opts)
-    Task.async(fn -> Mgmt.advertise(data, opts) end)
-  end
+  # Sends go through the lease holder; returns a ref for await/1.
+  defp advertise_async(%{mgmt: mgmt, holder: holder}, data, opts),
+    do: TestLeaseHolder.run(holder, &Mgmt.advertise(&1, data, [server: mgmt] ++ opts))
 
-  test "advertise/2 sends ext params + data on the highest instance, then removes after duration" do
-    {mgmt, kernel} = start_mgmt()
+  defp stop_async(%{mgmt: mgmt, holder: holder}, instance),
+    do: TestLeaseHolder.run(holder, &Mgmt.stop_advertising(&1, instance, mgmt))
 
+  defp await(ref), do: TestLeaseHolder.await(ref)
+
+  test "advertise/3 sends ext params + data on the highest instance, then removes after duration",
+       %{kernel: kernel} = ctx do
     data =
       Mgmt.legacy_adv_data([AdData.local_name("ABCDEFGH"), AdData.uuid128_list([<<1::128>>])])
 
-    task = advertise_async(mgmt, data, duration_ms: 50)
+    ref = advertise_async(ctx, data, duration_ms: 50)
 
     # No instance given: ask the controller how many it has.
     assert expect_command(kernel, @read_features) == <<>>
@@ -88,7 +94,7 @@ defmodule Bluez.MgmtTest do
     assert expect_command(kernel, @data) == <<5, byte_size(data), 0, data::binary>>
     complete(kernel, @data, 0, <<5>>)
 
-    assert Task.await(task) == {:ok, 5}
+    assert await(ref) == {:ok, 5}
 
     # duration_ms elapses → Remove Advertising for exactly our instance.
     assert expect_command(kernel, @remove) == <<5>>
@@ -96,9 +102,9 @@ defmodule Bluez.MgmtTest do
     assert {:error, :timeout} = :socket.recv(kernel, 0, 100)
   end
 
-  test "a refused data step reports the status and removes the half-made instance" do
-    {mgmt, kernel} = start_mgmt()
-    task = advertise_async(mgmt, <<2, 1, 6>>, instance: 3)
+  test "a refused data step reports the status and removes the half-made instance",
+       %{kernel: kernel} = ctx do
+    ref = advertise_async(ctx, <<2, 1, 6>>, instance: 3)
 
     answer_features(kernel)
 
@@ -107,19 +113,19 @@ defmodule Bluez.MgmtTest do
     expect_command(kernel, @data)
     complete(kernel, @data, 0x0D)
 
-    assert Task.await(task) == {:error, :invalid_params}
+    assert await(ref) == {:error, :invalid_params}
     assert expect_command(kernel, @remove) == <<3>>
   end
 
-  test "a half-made instance whose rollback fails stays tracked and removable" do
-    {mgmt, kernel} = start_mgmt()
-    task = advertise_async(mgmt, <<2, 1, 6>>, instance: 3)
+  test "a half-made instance whose rollback fails stays tracked and removable",
+       %{mgmt: mgmt, kernel: kernel} = ctx do
+    ref = advertise_async(ctx, <<2, 1, 6>>, instance: 3)
     answer_features(kernel)
     expect_command(kernel, @params)
     complete(kernel, @params, 0, <<3, 0, 31, 31>>)
     expect_command(kernel, @data)
     complete(kernel, @data, 0x0D)
-    assert Task.await(task) == {:error, :invalid_params}
+    assert await(ref) == {:error, :invalid_params}
 
     assert expect_command(kernel, @remove) == <<3>>
     complete(kernel, @remove, 0x0A)
@@ -128,68 +134,94 @@ defmodule Bluez.MgmtTest do
              match?(%{3 => %{removing: false}}, :sys.get_state(mgmt).instances)
            end)
 
-    stopper = Task.async(fn -> Mgmt.stop_advertising(3, mgmt) end)
+    ref = stop_async(ctx, 3)
     assert expect_command(kernel, @remove) == <<3>>
     complete(kernel, @remove, 0, <<3>>)
-    assert Task.await(stopper) == :ok
+    assert await(ref) == :ok
     assert :sys.get_state(mgmt).instances == %{}
   end
 
-  test "a refused params step reports the status and sends nothing more" do
-    {mgmt, kernel} = start_mgmt()
-    task = advertise_async(mgmt, <<2, 1, 6>>, instance: 3)
+  test "a refused params step reports the status and sends nothing more",
+       %{kernel: kernel} = ctx do
+    ref = advertise_async(ctx, <<2, 1, 6>>, instance: 3)
 
     answer_features(kernel)
 
     expect_command(kernel, @params)
     complete(kernel, @params, 0x0B)
 
-    assert Task.await(task) == {:error, :rejected}
+    assert await(ref) == {:error, :rejected}
     assert {:error, :timeout} = :socket.recv(kernel, 0, 100)
   end
 
-  test "the owner's exit removes its instance" do
-    {mgmt, kernel} = start_mgmt()
-    owner = spawn(fn -> Process.sleep(:infinity) end)
-    task = advertise_async(mgmt, <<2, 1, 6>>, instance: 2, owner: owner)
+  test "the holder's exit ends its lease and removes its instances",
+       %{kernel: kernel, holder: holder} = ctx do
+    advertise_ok(ctx, 2)
+    advertise_ok(ctx, 4)
 
-    answer_features(kernel)
+    TestLeaseHolder.stop(holder)
+    first = expect_command(kernel, @remove)
+    complete(kernel, @remove, 0, first)
+    second = expect_command(kernel, @remove)
+    assert Enum.sort([first, second]) == [<<2>>, <<4>>]
+  end
 
-    expect_command(kernel, @params)
-    complete(kernel, @params, 0, <<2, 0, 31, 31>>)
-    expect_command(kernel, @data)
-    complete(kernel, @data, 0, <<2>>)
-    assert Task.await(task) == {:ok, 2}
+  test "releasing the lease removes its instances", %{kernel: kernel, holder: holder} = ctx do
+    advertise_ok(ctx, 2)
 
-    Process.exit(owner, :kill)
+    assert TestLeaseHolder.call(holder, &Radio.release/1) == :ok
     assert expect_command(kernel, @remove) == <<2>>
   end
 
-  test "stop_advertising/2 removes a tracked instance and refuses unknown ones" do
-    {mgmt, kernel} = start_mgmt()
-    task = advertise_async(mgmt, <<2, 1, 6>>, instance: 4)
-
+  test "an instance landing after its lease ended is taken back off air",
+       %{radio: radio, kernel: kernel, holder: holder} = ctx do
+    _ref = advertise_async(ctx, <<2, 1, 6>>, instance: 2)
     answer_features(kernel)
-
     expect_command(kernel, @params)
-    complete(kernel, @params, 0, <<4, 0, 31, 31>>)
+
+    # The holder dies with its send in flight; the lease end finds nothing
+    # tracked yet.
+    TestLeaseHolder.stop(holder)
+    assert eventually(fn -> Radio.holder(0, radio) == nil end)
+    complete(kernel, @params, 0, <<2, 0, 31, 31>>)
     expect_command(kernel, @data)
-    complete(kernel, @data, 0, <<4>>)
-    assert Task.await(task) == {:ok, 4}
+    complete(kernel, @data, 0, <<2>>)
 
-    stopper = Task.async(fn -> Mgmt.stop_advertising(4, mgmt) end)
-    assert expect_command(kernel, @remove) == <<4>>
-    complete(kernel, @remove, 0, <<4>>)
-    assert Task.await(stopper) == :ok
-
-    assert Mgmt.stop_advertising(4, mgmt) == {:error, :unknown_instance}
+    assert expect_command(kernel, @remove) == <<2>>
   end
 
-  test "commands queue behind the one in flight" do
-    {mgmt, kernel} = start_mgmt()
-    first = Task.async(fn -> Mgmt.read_advertising_features(mgmt) end)
+  test "only the lease holder may send, and only while the lease lasts",
+       %{mgmt: mgmt, kernel: kernel, holder: holder, lease: lease} do
+    # The lease struct alone is not enough: the caller must be its holder.
+    assert Mgmt.advertise(lease, <<2, 1, 6>>, server: mgmt) == {:error, :not_lease_holder}
+    assert Mgmt.stop_advertising(lease, 1, mgmt) == {:error, :not_lease_holder}
+
+    # A released lease is refused by the server.
+    assert TestLeaseHolder.call(holder, fn lease ->
+             :ok = Radio.release(lease)
+             Mgmt.advertise(lease, <<2, 1, 6>>, server: mgmt)
+           end) == {:error, :lease_expired}
+
+    assert {:error, :timeout} = :socket.recv(kernel, 0, 50)
+  end
+
+  test "stop_advertising/3 removes a tracked instance and refuses unknown ones",
+       %{mgmt: mgmt, kernel: kernel, holder: holder} = ctx do
+    advertise_ok(ctx, 4)
+
+    ref = stop_async(ctx, 4)
+    assert expect_command(kernel, @remove) == <<4>>
+    complete(kernel, @remove, 0, <<4>>)
+    assert await(ref) == :ok
+
+    assert TestLeaseHolder.call(holder, &Mgmt.stop_advertising(&1, 4, mgmt)) ==
+             {:error, :unknown_instance}
+  end
+
+  test "commands queue behind the one in flight", %{mgmt: mgmt, kernel: kernel} do
+    first = Task.async(fn -> Mgmt.read_advertising_features(0, mgmt) end)
     expect_command(kernel, @read_features)
-    second = Task.async(fn -> Mgmt.read_advertising_features(mgmt) end)
+    second = Task.async(fn -> Mgmt.read_advertising_features(0, mgmt) end)
 
     # Nothing else goes out until the first reply.
     assert {:error, :timeout} = :socket.recv(kernel, 0, 50)
@@ -201,15 +233,9 @@ defmodule Bluez.MgmtTest do
     assert {:ok, %{max_instances: 4}} = Task.await(second)
   end
 
-  test "an instance removed by someone else is no longer tracked" do
-    {mgmt, kernel} = start_mgmt()
-    task = advertise_async(mgmt, <<2, 1, 6>>, instance: 6)
-    answer_features(kernel)
-    expect_command(kernel, @params)
-    complete(kernel, @params, 0, <<6, 0, 31, 31>>)
-    expect_command(kernel, @data)
-    complete(kernel, @data, 0, <<6>>)
-    assert Task.await(task) == {:ok, 6}
+  test "an instance removed by someone else is no longer tracked",
+       %{mgmt: mgmt, kernel: kernel} = ctx do
+    advertise_ok(ctx, 6)
 
     # MGMT Advertising Removed event (bluetoothd restart cleared it).
     :ok = :socket.send(kernel, <<0x24, 0, 0, 0, 1, 0, 6>>)
@@ -217,26 +243,26 @@ defmodule Bluez.MgmtTest do
   end
 
   # Accept an advertisement on `instance` end to end.
-  defp advertise_ok(mgmt, kernel, instance, opts \\ []) do
-    task = advertise_async(mgmt, <<2, 1, 6>>, [instance: instance] ++ opts)
+  defp advertise_ok(%{kernel: kernel} = ctx, instance, opts \\ []) do
+    ref = advertise_async(ctx, <<2, 1, 6>>, [instance: instance] ++ opts)
     answer_features(kernel)
     expect_command(kernel, @params)
     complete(kernel, @params, 0, <<instance, 0, 31, 31>>)
     expect_command(kernel, @data)
     complete(kernel, @data, 0, <<instance>>)
-    assert Task.await(task) == {:ok, instance}
+    assert await(ref) == {:ok, instance}
   end
 
-  test "an expiry racing a replacement on the same instance doesn't remove the replacement" do
-    {mgmt, kernel} = start_mgmt()
+  test "an expiry racing a replacement on the same instance doesn't remove the replacement",
+       %{mgmt: mgmt, kernel: kernel} = ctx do
     # A duration that can't elapse on its own during the test: the expiry
     # is fired by hand below, exactly while the replacement is in flight.
-    advertise_ok(mgmt, kernel, 5, duration_ms: 60_000)
+    advertise_ok(ctx, 5, duration_ms: 60_000)
     %{5 => %{timer: timer}} = :sys.get_state(mgmt).instances
 
     # Re-advertise instance 5, hold the kernel's reply, and let the old
     # advertisement's expiry fire meanwhile (its removal queues behind).
-    task = advertise_async(mgmt, <<2, 1, 6>>, instance: 5)
+    ref = advertise_async(ctx, <<2, 1, 6>>, instance: 5)
     answer_features(kernel)
     expect_command(kernel, @params)
     send(mgmt, {:expire, 5, timer})
@@ -245,7 +271,7 @@ defmodule Bluez.MgmtTest do
     complete(kernel, @params, 0, <<5, 0, 31, 31>>)
     expect_command(kernel, @data)
     complete(kernel, @data, 0, <<5>>)
-    assert Task.await(task) == {:ok, 5}
+    assert await(ref) == {:ok, 5}
 
     # The stale removal is skipped: nothing else goes to the kernel, and the
     # replacement is still tracked.
@@ -253,61 +279,36 @@ defmodule Bluez.MgmtTest do
     assert %{5 => %{removing: false}} = :sys.get_state(mgmt).instances
   end
 
-  test "a failed data step's rollback runs before queued work for the same instance" do
-    {mgmt, kernel} = start_mgmt()
-    first = advertise_async(mgmt, <<2, 1, 6>>, instance: 3)
-    answer_features(kernel)
-    expect_command(kernel, @params)
-    complete(kernel, @params, 0, <<3, 0, 31, 31>>)
-    expect_command(kernel, @data)
+  test "a failed removal keeps the instance tracked so it can be retried",
+       %{mgmt: mgmt, kernel: kernel} = ctx do
+    advertise_ok(ctx, 4)
 
-    second = advertise_async(mgmt, <<2, 1, 6>>, instance: 3)
-    # The second request must be queued before the first fails.
-    assert eventually(fn -> :queue.len(:sys.get_state(mgmt).queue) == 1 end)
-    complete(kernel, @data, 0x0D)
-    assert Task.await(first) == {:error, :invalid_params}
-
-    assert expect_command(kernel, @remove) == <<3>>
-    complete(kernel, @remove, 0, <<3>>)
-    answer_features(kernel)
-    expect_command(kernel, @params)
-    complete(kernel, @params, 0, <<3, 0, 31, 31>>)
-    expect_command(kernel, @data)
-    complete(kernel, @data, 0, <<3>>)
-    assert Task.await(second) == {:ok, 3}
-    assert {:error, :timeout} = :socket.recv(kernel, 0, 100)
-  end
-
-  test "a failed removal keeps the instance tracked so it can be retried" do
-    {mgmt, kernel} = start_mgmt()
-    advertise_ok(mgmt, kernel, 4)
-
-    stopper = Task.async(fn -> Mgmt.stop_advertising(4, mgmt) end)
+    ref = stop_async(ctx, 4)
     expect_command(kernel, @remove)
     complete(kernel, @remove, 0x0A)
-    assert Task.await(stopper) == {:error, :busy}
+    assert await(ref) == {:error, :busy}
 
-    stopper = Task.async(fn -> Mgmt.stop_advertising(4, mgmt) end)
+    ref = stop_async(ctx, 4)
     assert expect_command(kernel, @remove) == <<4>>
     complete(kernel, @remove, 0, <<4>>)
-    assert Task.await(stopper) == :ok
+    assert await(ref) == :ok
     assert :sys.get_state(mgmt).instances == %{}
   end
 
-  test "removing an instance the kernel no longer has counts as removed" do
-    {mgmt, kernel} = start_mgmt()
-    advertise_ok(mgmt, kernel, 4)
+  test "removing an instance the kernel no longer has counts as removed",
+       %{mgmt: mgmt, kernel: kernel} = ctx do
+    advertise_ok(ctx, 4)
 
-    stopper = Task.async(fn -> Mgmt.stop_advertising(4, mgmt) end)
+    ref = stop_async(ctx, 4)
     expect_command(kernel, @remove)
     complete(kernel, @remove, 0x0D)
-    assert Task.await(stopper) == :ok
+    assert await(ref) == :ok
     assert :sys.get_state(mgmt).instances == %{}
   end
 
-  test "an Advertising Removed event for another controller is ignored" do
-    {mgmt, kernel} = start_mgmt()
-    advertise_ok(mgmt, kernel, 6)
+  test "an Advertising Removed event for another controller is ignored",
+       %{mgmt: mgmt, kernel: kernel} = ctx do
+    advertise_ok(ctx, 6)
 
     # Instance 6 removed on hci1; ours is on hci0. The sync round-trip
     # proves the event was processed (not merely still in flight).
@@ -321,15 +322,10 @@ defmodule Bluez.MgmtTest do
     assert :sys.get_state(mgmt).instances == %{}
   end
 
-  test "shutdown also removes an instance whose data command is still in flight" do
-    {mgmt, kernel} = start_mgmt()
-    # Unlinked caller: shutdown cuts its call off, and that exit must not
-    # propagate to the test process.
-    owner = self()
-
-    spawn(fn ->
-      Mgmt.advertise(<<2, 1, 6>>, server: mgmt, instance: 7, owner: owner)
-    end)
+  test "shutdown also removes an instance whose data command is still in flight",
+       %{mgmt: mgmt, kernel: kernel} = ctx do
+    # Shutdown cuts the holder's call off; the holder sees :not_running.
+    ref = advertise_async(ctx, <<2, 1, 6>>, instance: 7)
 
     answer_features(kernel)
 
@@ -342,21 +338,22 @@ defmodule Bluez.MgmtTest do
     :ok = stop_supervised(Mgmt)
     refute Process.alive?(mgmt)
     assert expect_command(kernel, @remove) == <<7>>
+    assert await(ref) == {:error, :not_running}
   end
 
-  test "a command the kernel never answers restarts the server; the caller gets an error" do
-    {mgmt, kernel} = start_mgmt(command_timeout: 50)
-    ref = Process.monitor(mgmt)
-    task = advertise_async(mgmt, <<2, 1, 6>>, instance: 2)
+  @tag mgmt_opts: [command_timeout: 50]
+  test "a command the kernel never answers restarts the server; the caller gets an error",
+       %{mgmt: mgmt, kernel: kernel} = ctx do
+    mon = Process.monitor(mgmt)
+    ref = advertise_async(ctx, <<2, 1, 6>>, instance: 2)
     answer_features(kernel)
     expect_command(kernel, @params)
 
-    assert_receive {:DOWN, ^ref, :process, ^mgmt, :mgmt_command_timeout}, 1_000
-    assert Task.await(task) == {:error, :not_running}
+    assert_receive {:DOWN, ^mon, :process, ^mgmt, :mgmt_command_timeout}, 1_000
+    assert await(ref) == {:error, :not_running}
   end
 
-  test "an aborted socket select stops the server instead of leaving it deaf" do
-    {mgmt, _kernel} = start_mgmt()
+  test "an aborted socket select stops the server instead of leaving it deaf", %{mgmt: mgmt} do
     ref = Process.monitor(mgmt)
     sock = :sys.get_state(mgmt).sock
 
@@ -364,9 +361,8 @@ defmodule Bluez.MgmtTest do
     assert_receive {:DOWN, ^ref, :process, ^mgmt, {:mgmt_socket_abort, :closed}}, 1_000
   end
 
-  test "the default instance skips one held by someone else" do
-    {mgmt, kernel} = start_mgmt()
-    task = advertise_async(mgmt, <<2, 1, 6>>, [])
+  test "the default instance skips one held by someone else", %{kernel: kernel} = ctx do
+    ref = advertise_async(ctx, <<2, 1, 6>>, [])
 
     expect_command(kernel, @read_features)
     # Max 5; instance 5 is occupied (e.g. bluetoothd on a small controller).
@@ -376,95 +372,84 @@ defmodule Bluez.MgmtTest do
     complete(kernel, @params, 0, <<4, 0, 31, 31>>)
     expect_command(kernel, @data)
     complete(kernel, @data, 0, <<4>>)
-    assert Task.await(task) == {:ok, 4}
+    assert await(ref) == {:ok, 4}
   end
 
-  test "the default instance reuses our own, even though the kernel lists it" do
-    {mgmt, kernel} = start_mgmt()
-    advertise_ok(mgmt, kernel, 5)
+  test "the default instance reuses our own, even though the kernel lists it",
+       %{kernel: kernel} = ctx do
+    advertise_ok(ctx, 5)
 
-    task = advertise_async(mgmt, <<2, 1, 6>>, [])
+    ref = advertise_async(ctx, <<2, 1, 6>>, [])
     expect_command(kernel, @read_features)
     complete(kernel, @read_features, 0, <<0::little-32, 31, 31, 5, 1, 5>>)
     assert <<5, _::binary>> = expect_command(kernel, @params)
     complete(kernel, @params, 0, <<5, 0, 31, 31>>)
     expect_command(kernel, @data)
     complete(kernel, @data, 0, <<5>>)
-    assert Task.await(task) == {:ok, 5}
+    assert await(ref) == {:ok, 5}
   end
 
-  test "no free instance is an error, not a takeover" do
-    {mgmt, kernel} = start_mgmt()
-    task = advertise_async(mgmt, <<2, 1, 6>>, [])
+  test "no free instance is an error, not a takeover", %{kernel: kernel} = ctx do
+    ref = advertise_async(ctx, <<2, 1, 6>>, [])
     expect_command(kernel, @read_features)
     complete(kernel, @read_features, 0, <<0::little-32, 31, 31, 1, 1, 1>>)
-    assert Task.await(task) == {:error, :no_free_instance}
+    assert await(ref) == {:error, :no_free_instance}
     assert {:error, :timeout} = :socket.recv(kernel, 0, 100)
   end
 
-  test "a finite advertisement is refused while a software-rotating controller has another instance" do
-    {mgmt, kernel} = start_mgmt()
-    task = advertise_async(mgmt, <<2, 1, 6>>, instance: 5, duration_ms: 300)
+  test "a finite advertisement is refused while a software-rotating controller has another instance",
+       %{kernel: kernel} = ctx do
+    ref = advertise_async(ctx, <<2, 1, 6>>, instance: 5, duration_ms: 300)
 
     # No hardware offload, and instance 1 (bluetoothd's) is registered: the
     # kernel would rotate ours in ~2 s slots, so 300 ms may never air.
     answer_features(kernel, 5, [1], 0)
-    assert Task.await(task) == {:error, :rotation_busy}
+    assert await(ref) == {:error, :rotation_busy}
     assert {:error, :timeout} = :socket.recv(kernel, 0, 100)
   end
 
-  test "software rotation doesn't block an unbounded advert, or one alone on the controller" do
-    {mgmt, kernel} = start_mgmt()
-
+  test "software rotation doesn't block an unbounded advert, or one alone on the controller",
+       %{kernel: kernel} = ctx do
     # No duration: it will get its rotation slot eventually.
-    task = advertise_async(mgmt, <<2, 1, 6>>, instance: 5)
+    ref = advertise_async(ctx, <<2, 1, 6>>, instance: 5)
     answer_features(kernel, 5, [1], 0)
     expect_command(kernel, @params)
     complete(kernel, @params, 0, <<5, 0, 31, 31>>)
     expect_command(kernel, @data)
     complete(kernel, @data, 0, <<5>>)
-    assert Task.await(task) == {:ok, 5}
+    assert await(ref) == {:ok, 5}
 
     # Replacing our own instance with nothing else registered: no rotation.
-    task = advertise_async(mgmt, <<2, 1, 6>>, instance: 5, duration_ms: 300)
+    ref = advertise_async(ctx, <<2, 1, 6>>, instance: 5, duration_ms: 300)
     answer_features(kernel, 5, [5], 0)
     expect_command(kernel, @params)
     complete(kernel, @params, 0, <<5, 0, 31, 31>>)
     expect_command(kernel, @data)
     complete(kernel, @data, 0, <<5>>)
-    assert Task.await(task) == {:ok, 5}
+    assert await(ref) == {:ok, 5}
   end
 
-  test "an explicit stop also removes a replacement that lands while it waits" do
-    {mgmt, kernel} = start_mgmt()
-    advertise_ok(mgmt, kernel, 5)
+  test "rejects bad input in the caller, before reaching the server", %{holder: holder} do
+    results =
+      TestLeaseHolder.call(holder, fn lease ->
+        [
+          Mgmt.advertise(lease, :binary.copy(<<0>>, 256)),
+          Mgmt.advertise(lease, <<>>, instance: 0),
+          Mgmt.advertise(lease, <<>>, duration_ms: -1),
+          Mgmt.advertise(lease, <<>>, flags: [:bogus]),
+          Mgmt.advertise(lease, <<>>, min_interval_ms: 5),
+          Mgmt.advertise(lease, <<>>, tx_power: :loud)
+        ]
+      end)
 
-    # A replacement for instance 5 is in flight when the stop arrives.
-    task = advertise_async(mgmt, <<2, 1, 6>>, instance: 5)
-    answer_features(kernel)
-    expect_command(kernel, @params)
-    stopper = Task.async(fn -> Mgmt.stop_advertising(5, mgmt) end)
-    assert eventually(fn -> :queue.len(:sys.get_state(mgmt).queue) == 1 end)
-
-    complete(kernel, @params, 0, <<5, 0, 31, 31>>)
-    expect_command(kernel, @data)
-    complete(kernel, @data, 0, <<5>>)
-    assert Task.await(task) == {:ok, 5}
-
-    # The stop then removes what is on instance 5 now: the replacement.
-    assert expect_command(kernel, @remove) == <<5>>
-    complete(kernel, @remove, 0, <<5>>)
-    assert Task.await(stopper) == :ok
-    assert :sys.get_state(mgmt).instances == %{}
-  end
-
-  test "rejects bad input in the caller, before reaching the server" do
-    assert Mgmt.advertise(:binary.copy(<<0>>, 256)) == {:error, :too_long}
-    assert Mgmt.advertise(<<>>, instance: 0) == {:error, {:invalid, "instance"}}
-    assert Mgmt.advertise(<<>>, duration_ms: -1) == {:error, {:invalid, "duration_ms"}}
-    assert {:error, {:invalid, _}} = Mgmt.advertise(<<>>, flags: [:bogus])
-    assert {:error, {:invalid, _}} = Mgmt.advertise(<<>>, min_interval_ms: 5)
-    assert {:error, {:invalid, _}} = Mgmt.advertise(<<>>, tx_power: :loud)
+    assert [
+             {:error, :too_long},
+             {:error, {:invalid, "instance"}},
+             {:error, {:invalid, "duration_ms"}},
+             {:error, {:invalid, _}},
+             {:error, {:invalid, _}},
+             {:error, {:invalid, _}}
+           ] = results
   end
 
   test "legacy_adv_data/2 builds the exact Flags + Local Name + UUID128 PDU (Tuya P1 shape)" do
@@ -488,8 +473,11 @@ defmodule Bluez.MgmtTest do
     assert Mgmt.start_link(name: nil, open: fn -> {:error, :eafnosupport} end) == :ignore
   end
 
-  test "public API degrades to :not_running" do
-    assert Mgmt.read_advertising_features(:no_such_mgmt) == {:error, :not_running}
+  test "public API degrades to :not_running", %{holder: holder} do
+    assert Mgmt.read_advertising_features(0, :no_such_mgmt) == {:error, :not_running}
+
+    assert TestLeaseHolder.call(holder, &Mgmt.advertise(&1, <<>>, server: :no_such_mgmt)) ==
+             {:error, :not_running}
   end
 
   defp eventually(fun, tries \\ 200) do

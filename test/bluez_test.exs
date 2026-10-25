@@ -85,16 +85,19 @@ defmodule BluezTest do
       children =
         Bluez.children(
           advertiser: true,
-          mgmt: [adapter_index: 1],
+          mgmt: [command_timeout: 1_000],
           advert_receiver: [on_report: on_report],
           extra_children: [__MODULE__.ExtraChild]
         )
 
-      # Mgmt before the D-Bus Advertiser (an Advertiser crash must not
-      # restart — and take off air — Mgmt's adverts); the receiver, which
-      # runs host code, last so its crashes restart neither transmitter.
-      assert children |> Enum.map(&id_of/1) |> Enum.take(-5) == [
+      # Radio first (its restart ends every lease, so the transmitters
+      # after it restart too); Mgmt before the D-Bus Advertiser (an
+      # Advertiser crash must not restart — and take off air — Mgmt's
+      # adverts); the receiver, which runs host code, last so its crashes
+      # restart neither transmitter.
+      assert children |> Enum.map(&id_of/1) |> Enum.take(-6) == [
                Bluez.BlueAlsa,
+               Bluez.Radio,
                Bluez.Mgmt,
                Bluez.Advertiser,
                Bluez.AdvertReceiver,
@@ -102,12 +105,18 @@ defmodule BluezTest do
              ]
 
       assert {Bluez.Advertiser, []} in children
-      assert {Bluez.Mgmt, [adapter_index: 1]} in children
+      assert {Bluez.Mgmt, [command_timeout: 1_000]} in children
       assert {Bluez.AdvertReceiver, [on_report: ^on_report]} = Enum.at(children, -2)
 
       ids = Bluez.children(advertiser: false, mgmt: nil) |> Enum.map(&id_of/1)
       refute Bluez.Advertiser in ids
       refute Bluez.Mgmt in ids
+      refute Bluez.Radio in ids
+
+      # The receiver alone transmits nothing, so needs no Radio.
+      ids = Bluez.children(advert_receiver: []) |> Enum.map(&id_of/1)
+      assert Bluez.AdvertReceiver in ids
+      refute Bluez.Radio in ids
     end
 
     test "no opts yields the default children with an empty extra slot" do

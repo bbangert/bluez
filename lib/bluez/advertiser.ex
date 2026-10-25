@@ -3,15 +3,23 @@ defmodule Bluez.Advertiser do
   LE advertising through BlueZ's `org.bluez.LEAdvertisingManager1`: each
   advertisement is an `org.bluez.LEAdvertisement1` object this process
   exports on the bus, registered with `bluetoothd`, and unregistered again
-  after `duration_ms:`, on `stop/1`, or when its owner process exits.
+  after `duration_ms:`, on `stop/3`, or when its transmit lease ends.
+
+  Sending requires the controller's transmit lease (`Bluez.Radio`): call
+  `advertise/3` and `stop/3` from the process holding it. The lease names
+  the controller (`/org/bluez/hciN`), and ending it — `Bluez.Radio.release/1`
+  or the holder exiting — unregisters everything sent under it.
 
   BlueZ builds the AD bytes from the object's properties. It keeps
   `ServiceUUIDs` in the given order *with duplicates*, so protocols that
   carry a payload in a 16-bit UUID list can be sent here — see
   `Bluez.AdData.uuid16_strings/1`:
 
+      {:ok, lease} = Bluez.Radio.acquire()
       payload = <<...26 bytes...>>
+
       Bluez.Advertiser.advertise(
+        lease,
         %{type: :broadcast, service_uuids: Bluez.AdData.uuid16_strings(payload)},
         duration_ms: 300
       )
@@ -33,7 +41,7 @@ defmodule Bluez.Advertiser do
   them from its own bookkeeping, which doesn't include instances
   `Bluez.Mgmt` adds directly through the kernel. It always takes the
   lowest number it considers free, so with *n* of our advertisements on a
-  controller its next pick is at most *n + 1*. `advertise/2` therefore
+  controller its next pick is at most *n + 1*. `advertise/3` therefore
   refuses with `{:error, :instance_conflict}` while `Bluez.Mgmt` holds an
   instance in that range — rather than let BlueZ silently overwrite the
   raw advertisement (and `Bluez.Mgmt`'s later cleanup then remove this
@@ -41,18 +49,14 @@ defmodule Bluez.Advertiser do
   so on controllers with several instances both can run side by side; on
   a one-instance controller they take turns.
 
-  The check is a snapshot, not a reservation: it can't see an
-  `Bluez.Mgmt.advertise/2` that starts after it, and `Bluez.Mgmt` can't
-  see a registration still in flight here. **Don't send through both on
-  the same controller concurrently** — issue them from one process (one
-  after the other), as a single protocol driver naturally does.
+  The check is exact because of the lease: only the holder sends on the
+  controller, and each send returns only once BlueZ (or the kernel) has
+  the instance — so no other send can slip in between check and use.
 
   ## Start options
 
-    * `adapter_path:` — the adapter object path to advertise on (default:
-      the one `Bluez.Client` resolves; until it has, `advertise/2` returns
-      `{:error, :no_adapter}`). Each advertisement is unregistered from
-      the adapter it was registered on.
+    * `radio:` — the `Bluez.Radio` to subscribe to for lease ends
+      (default `Bluez.Radio`).
     * `name:` — registered name (default `Bluez.Advertiser`).
 
   ## Advertisement spec
@@ -72,7 +76,8 @@ defmodule Bluez.Advertiser do
   use GenServer
   require Logger
 
-  alias Bluez.{DBus, DevicePath, Hci}
+  alias Bluez.{DBus, Radio}
+  alias Bluez.Radio.Lease
   alias Bluez.Rebus.Message
 
   @adv_mgr_iface "org.bluez.LEAdvertisingManager1"
@@ -105,19 +110,18 @@ defmodule Bluez.Advertiser do
   end
 
   @doc """
-  Register an advertisement. Returns `{:ok, id}` once `bluetoothd` has
+  Register an advertisement on the controller `lease` covers (call it
+  from the lease holder). Returns `{:ok, id}` once `bluetoothd` has
   accepted it (it is on air from then), or `{:error, reason}` — a BlueZ
   error name (`"org.bluez.Error.NotPermitted"` when out of instances or
-  the data is too long, `"org.bluez.Error.InvalidArguments"`, …) or
-  `:not_running`.
+  the data is too long, `"org.bluez.Error.InvalidArguments"`, …),
+  `:not_lease_holder`, `:lease_expired`, or `:not_running`.
 
   Options:
 
     * `:duration_ms` — unregister after this many ms (default: until
-      `stop/1`). Millisecond-precise, unlike BlueZ's whole-second
-      `Timeout`.
-    * `:owner` — pid whose exit unregisters it (default: the caller;
-      `nil` = none).
+      `stop/3` or the lease ends). Millisecond-precise, unlike BlueZ's
+      whole-second `Timeout`.
     * `:server` — the Advertiser to use (default `Bluez.Advertiser`).
     * `:mgmt` — the `Bluez.Mgmt` whose instances to respect (default
       `Bluez.Mgmt`; no effect when it isn't running).
@@ -130,53 +134,49 @@ defmodule Bluez.Advertiser do
   `bluetoothd` could hand this advertisement an instance `Bluez.Mgmt`
   holds on the same controller (see "Sharing the controller with
   `Bluez.Mgmt`" above).
-
-  Until `Bluez.Client` has resolved the adapter (and without the
-  `adapter_path:` start option) this returns `{:error, :no_adapter}`
-  rather than registering on the `hci0` fallback.
   """
-  @spec advertise(spec(), keyword()) :: {:ok, pos_integer()} | {:error, term()}
-  def advertise(spec, opts \\ [])
+  @spec advertise(Lease.t(), spec(), keyword()) :: {:ok, pos_integer()} | {:error, term()}
+  def advertise(lease, spec, opts \\ [])
 
-  def advertise(%{type: type} = spec, opts) when type in [:broadcast, :peripheral] do
-    opts = Keyword.put_new(opts, :owner, self())
+  def advertise(lease, %{type: type} = spec, opts) when type in [:broadcast, :peripheral] do
     server = Keyword.get(opts, :server, __MODULE__)
 
-    # Validated here, in the caller: a bad option must not crash the
-    # shared server and lose every other advertisement's state.
-    with :ok <- validate_opts(opts),
+    # Checked here, in the caller: only the holder sends, and a bad option
+    # must not crash the shared server and lose every other advertisement.
+    with :ok <- Radio.check_holder(lease),
+         :ok <- validate_opts(opts),
          {:ok, props} <- properties(spec) do
       held = Bluez.Mgmt.held_instances(Keyword.get(opts, :mgmt, Bluez.Mgmt))
-      server_call(server, {:advertise, props, opts, held})
+      server_call(server, {:advertise, lease, props, opts, held})
     end
   end
 
-  def advertise(spec, _opts),
+  def advertise(_lease, spec, _opts),
     do: {:error, {:invalid_spec, "type must be :broadcast or :peripheral, got: #{inspect(spec)}"}}
 
   defp validate_opts(opts) do
-    cond do
-      not (is_nil(opts[:owner]) or is_pid(opts[:owner])) -> {:error, {:invalid, "owner"}}
-      not valid_duration?(opts[:duration_ms]) -> {:error, {:invalid, "duration_ms"}}
-      true -> :ok
-    end
+    if valid_duration?(opts[:duration_ms]), do: :ok, else: {:error, {:invalid, "duration_ms"}}
   end
 
   defp valid_duration?(nil), do: true
   defp valid_duration?(ms), do: is_integer(ms) and ms > 0
 
   @doc """
-  Unregister an advertisement early. Returns `:ok` once BlueZ has
-  confirmed the unregistration, so a following `advertise/2` can reuse
-  the freed slot (`:ok` also when already gone). If BlueZ refuses or the
-  call times out, returns `{:error, reason}` and the advertisement stays
-  tracked, so `stop/2` can be retried.
+  Unregister an advertisement `advertise/3` registered under `lease`
+  (call it from the holder). Returns `:ok` once BlueZ has confirmed the
+  unregistration, so a following `advertise/3` can reuse the freed slot
+  (`:ok` also when already gone). If BlueZ refuses or the call times out,
+  returns `{:error, reason}` and the advertisement stays tracked, so
+  `stop/3` can be retried. `{:error, :unknown_advertisement}` for one
+  registered under another lease.
   """
-  @spec stop(pos_integer(), GenServer.server()) :: :ok | {:error, term()}
-  def stop(id, server \\ __MODULE__) do
-    case server_call(server, {:stop, id}) do
-      {:error, :not_running} -> :ok
-      other -> other
+  @spec stop(Lease.t(), pos_integer(), GenServer.server()) :: :ok | {:error, term()}
+  def stop(lease, id, server \\ __MODULE__) do
+    with :ok <- Radio.check_holder(lease) do
+      case server_call(server, {:stop, lease, id}) do
+        {:error, :not_running} -> :ok
+        other -> other
+      end
     end
   end
 
@@ -259,20 +259,19 @@ defmodule Bluez.Advertiser do
   @impl GenServer
   def init(opts) do
     connect = Keyword.get(opts, :connect_fun, fn -> Bluez.Rebus.connect(:system) end)
-    adapter_path = Keyword.get(opts, :adapter_path)
 
     case connect.() do
       {:ok, conn} ->
         Bluez.Rebus.set_method_handler(conn, self())
+        # Lease ends arrive as {:radio_lease_ended, ref}.
+        :ok = Radio.subscribe(Keyword.get(opts, :radio, Radio))
 
         state = %{
           conn: conn,
           conn_ref: Process.monitor(conn),
-          # Explicit adapter, else the one Bluez.Client resolves.
-          adapter_path: adapter_path,
           next_id: 1,
-          # id => %{props, adapter, owner_ref, timer, cancelled, waiters,
-          #         status: :registering | :active | :unregistering}
+          # id => %{props, adapter, index, lease_ref, timer, cancelled,
+          #         waiters, status: :registering | :active | :unregistering}
           ads: %{}
         }
 
@@ -284,20 +283,27 @@ defmodule Bluez.Advertiser do
   end
 
   @impl GenServer
-  def handle_call({:advertise, props, opts, mgmt_held}, from, state) do
-    with {:ok, adapter} <- adapter_path(state),
-         :ok <- check_mgmt_conflict(state, adapter, mgmt_held) do
-      start_registration(state, adapter, props, opts, from)
-    else
-      :error -> {:reply, {:error, :no_adapter}, state}
-      {:error, _reason} = error -> {:reply, error, state}
+  def handle_call({:advertise, lease, props, opts, mgmt_held}, from, state) do
+    cond do
+      not Radio.valid?(lease) ->
+        {:reply, {:error, :lease_expired}, state}
+
+      mgmt_conflict?(state, lease.index, mgmt_held) ->
+        {:reply, {:error, :instance_conflict}, state}
+
+      true ->
+        start_registration(state, lease, props, opts, from)
     end
   end
 
   # Replies once BlueZ has confirmed the unregistration (or refused it);
-  # a stop arriving mid-registration or mid-unregistration waits too.
-  def handle_call({:stop, id}, from, state) do
+  # a stop arriving mid-unregistration (or mid-registration, after the
+  # lease ended under it) waits too.
+  def handle_call({:stop, %Lease{ref: ref}, id}, from, state) do
     case Map.fetch(state.ads, id) do
+      {:ok, %{lease_ref: other}} when other != ref ->
+        {:reply, {:error, :unknown_advertisement}, state}
+
       {:ok, %{status: :active}} ->
         {:noreply, begin_unregister(state, id, [from])}
 
@@ -316,43 +322,31 @@ defmodule Bluez.Advertiser do
   # free — it doesn't know Bluez.Mgmt's — so with `count` of our
   # advertisements on this controller its next pick is at most count + 1.
   # Any Mgmt instance in that range could be silently taken over.
-  defp check_mgmt_conflict(state, adapter, mgmt_held) do
-    case Hci.adapter_index(adapter) do
-      {:ok, index} ->
-        count = Enum.count(state.ads, fn {_id, entry} -> entry.adapter == adapter end)
-        reachable = fn {held_index, instance} -> held_index == index and instance <= count + 1 end
+  defp mgmt_conflict?(state, index, mgmt_held) do
+    count = Enum.count(state.ads, fn {_id, entry} -> entry.index == index end)
 
-        if Enum.any?(mgmt_held, reachable), do: {:error, :instance_conflict}, else: :ok
-
-      # Not an hciN path (only from an explicit adapter_path:): no index
-      # to compare, nothing Mgmt could hold there.
-      :error ->
-        :ok
-    end
+    Enum.any?(mgmt_held, fn {held_index, instance} ->
+      held_index == index and instance <= count + 1
+    end)
   end
 
-  # Every later cleanup goes to the adapter captured here, never a re-read.
-  defp start_registration(state, adapter, props, opts, from) do
+  defp start_registration(state, lease, props, opts, from) do
     id = state.next_id
     path = path(id)
     conn = state.conn
     me = self()
-
-    owner_ref =
-      case opts[:owner] do
-        pid when is_pid(pid) -> Process.monitor(pid)
-        nil -> nil
-      end
+    adapter = "/org/bluez/hci" <> Integer.to_string(lease.index)
 
     entry = %{
       props: props,
       adapter: adapter,
-      owner_ref: owner_ref,
+      index: lease.index,
+      lease_ref: lease.ref,
       timer: nil,
       status: :registering,
       # Stopped while registering: unregister as soon as BlueZ answers.
       cancelled: false,
-      # stop/2 callers waiting for the unregistration to be confirmed.
+      # stop/3 callers waiting for the unregistration to be confirmed.
       waiters: []
     }
 
@@ -383,7 +377,7 @@ defmodule Bluez.Advertiser do
         entry = %{entry | status: :active, timer: timer}
         {:noreply, %{state | ads: Map.put(state.ads, id, entry)}}
 
-      # Stopped (stop/2, owner exit, expiry) while registering: take it
+      # Stopped (lease end, Release) while registering: take it
       # straight back off air, answering the waiting stop callers when done.
       {{:ok, _}, {:ok, entry}} ->
         GenServer.reply(from, {:error, :stopped})
@@ -420,7 +414,7 @@ defmodule Bluez.Advertiser do
         {:noreply, unregistered(state, id, entry)}
 
       # Refused or timed out: it may still be on air, so keep tracking it
-      # (stop/2 can retry; its owner and duration triggers are spent).
+      # (stop/3 can retry; its duration trigger is spent).
       {{:error, reason}, {:ok, entry}} ->
         Logger.warning("Bluez.Advertiser: unregistering #{path(id)} failed: #{inspect(reason)}")
         Enum.each(entry.waiters, &GenServer.reply(&1, {:error, reason}))
@@ -436,8 +430,10 @@ defmodule Bluez.Advertiser do
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{conn_ref: ref} = state),
     do: {:stop, {:dbus_connection_down, reason}, state}
 
-  def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
-    ids = for {id, %{owner_ref: ^ref}} <- state.ads, do: id
+  # The lease ended (released, or its holder exited): unregister
+  # everything sent under it.
+  def handle_info({:radio_lease_ended, ref}, state) do
+    ids = for {id, %{lease_ref: ^ref}} <- state.ads, do: id
     {:noreply, Enum.reduce(ids, state, &unregister(&2, &1))}
   end
 
@@ -448,7 +444,7 @@ defmodule Bluez.Advertiser do
     drop(state, id)
   end
 
-  # Owner exit / expiry: start taking it off air, whatever stage it's at.
+  # Lease end / expiry: start taking it off air, whatever stage it's at.
   defp unregister(state, id) do
     case Map.fetch(state.ads, id) do
       {:ok, %{status: :active}} -> begin_unregister(state, id, [])
@@ -482,11 +478,10 @@ defmodule Bluez.Advertiser do
     put_in(state.ads[id], entry)
   end
 
-  # Owner and duration triggers fire at most once per advertisement.
+  # The duration trigger fires at most once per advertisement.
   defp spend_triggers(entry) do
-    if entry.owner_ref, do: Process.demonitor(entry.owner_ref, [:flush])
     if entry.timer, do: Process.cancel_timer(entry.timer)
-    %{entry | owner_ref: nil, timer: nil}
+    %{entry | timer: nil}
   end
 
   defp drop(state, id) do
@@ -495,7 +490,6 @@ defmodule Bluez.Advertiser do
         state
 
       {entry, ads} ->
-        if entry.owner_ref, do: Process.demonitor(entry.owner_ref, [:flush])
         if entry.timer, do: Process.cancel_timer(entry.timer)
         %{state | ads: ads}
     end
@@ -589,7 +583,4 @@ defmodule Bluez.Advertiser do
   end
 
   defp id_from_path(_path), do: :error
-
-  defp adapter_path(%{adapter_path: path}) when is_binary(path), do: {:ok, path}
-  defp adapter_path(_state), do: DevicePath.resolved_adapter_path()
 end
