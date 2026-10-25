@@ -281,6 +281,8 @@ defmodule Bluez.Advertiser do
           radio: Keyword.get(opts, :radio, Radio),
           radio_pid: nil,
           radio_mon: nil,
+          # Ended leases not yet reported drained to the Radio (settle/1).
+          draining: MapSet.new(),
           next_id: 1,
           # id => %{props, adapter, index, lease_ref, lease_ended, retries,
           #         timer, cancelled, waiters,
@@ -455,13 +457,15 @@ defmodule Bluez.Advertiser do
 
   # The lease ended (released, or its holder exited): unregister
   # everything sent under it.
-  def handle_info({:radio_lease_ended, ref}, state),
-    do: {:noreply, end_leases(state, &(&1 == ref))}
+  def handle_info({:radio_lease_ended, ref}, state) do
+    state = end_leases(state, &(&1 == ref))
+    {:noreply, settle(%{state | draining: MapSet.put(state.draining, ref)})}
+  end
 
   # The Radio went away, and every lease with it. The next send
   # re-subscribes (to its restarted incarnation, when registered by name).
   def handle_info({:DOWN, mon, :process, _pid, _reason}, %{radio_mon: mon} = state) do
-    state = %{state | radio_pid: nil, radio_mon: nil}
+    state = %{state | radio_pid: nil, radio_mon: nil, draining: MapSet.new()}
     {:noreply, end_leases(state, fn _ref -> true end)}
   end
 
@@ -491,6 +495,19 @@ defmodule Bluez.Advertiser do
 
   defp lease_valid?(_state, _lease), do: false
 
+  # Report each ended lease drained once none of its advertisements is
+  # tracked here any more (registering, unregistering, or awaiting a
+  # retry), so the Radio can hand the controller on.
+  defp settle(%{draining: draining} = state) do
+    done =
+      Enum.reject(draining, fn ref ->
+        Enum.any?(state.ads, fn {_id, entry} -> entry.lease_ref == ref end)
+      end)
+
+    Enum.each(done, &Radio.drained(state.radio_pid, &1))
+    %{state | draining: MapSet.difference(draining, MapSet.new(done))}
+  end
+
   # Unregister everything sent under the leases `ended?` matches.
   defp end_leases(state, ended?) do
     ids = for {id, %{lease_ref: ref}} <- state.ads, ended?.(ref), do: id
@@ -510,9 +527,10 @@ defmodule Bluez.Advertiser do
         Process.send_after(self(), {:retry_unregister, id}, state.retry_ms)
         put_in(state.ads[id].retries, n + 1)
 
+      # Detached from its lease, so the lease counts as drained.
       %{lease_ended: true} ->
         Logger.warning("Bluez.Advertiser: giving up unregistering #{path(id)}")
-        state
+        settle(put_in(state.ads[id].lease_ref, nil))
 
       _live_lease ->
         state
@@ -571,7 +589,7 @@ defmodule Bluez.Advertiser do
 
       {entry, ads} ->
         if entry.timer, do: Process.cancel_timer(entry.timer)
-        %{state | ads: ads}
+        settle(%{state | ads: ads})
     end
   end
 

@@ -153,7 +153,9 @@ payload as a 16-bit Service UUID list, where order and repeated values
   whenever either advertiser is. A process `acquire/1`s a controller,
   sends through the advertisers with the lease, and `release/1`s it (or
   exits); only the holder may send, and the lease ending takes
-  everything sent under it off air. The controller's advertising
+  everything sent under it off air — the controller is handed on only
+  once that has finished, so a successor's sends can't collide with the
+  old lease's leftovers. The controller's advertising
   instances are one namespace the two transmit paths share without
   seeing each other's use of it, so a single holder issuing every send,
   one call at a time, is what lets each path check the other's state

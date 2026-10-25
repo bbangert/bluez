@@ -247,11 +247,14 @@ defmodule Bluez.Mgmt do
           radio: Keyword.get(opts, :radio, Radio),
           radio_pid: nil,
           radio_mon: nil,
+          # Ended leases not yet reported drained to the Radio (settle/1).
+          draining: MapSet.new(),
           # The in-flight job (one MGMT command at a time) and the queue.
           job: nil,
           queue: :queue.new(),
-          # instance => %{index, lease_ref, lease_ended, retries, timer,
-          #               gen, removing}
+          # {controller_index, instance} => %{lease_ref, lease_ended,
+          #   retries, timer, gen, removing} — instance numbers are
+          #   per controller, and one lease may name any controller.
           instances: %{}
         }
 
@@ -276,21 +279,20 @@ defmodule Bluez.Mgmt do
     end
   end
 
-  def handle_call({:stop_advertising, %Lease{ref: ref}, instance}, from, state) do
+  def handle_call({:stop_advertising, %Lease{index: index, ref: ref}, instance}, from, state) do
+    key = {index, instance}
+
     case state.instances do
-      %{^instance => %{lease_ref: ^ref, removing: false}} ->
-        {:noreply, cleanup(state, instance, from)}
+      %{^key => %{lease_ref: ^ref, removing: false}} ->
+        {:noreply, cleanup(state, key, from)}
 
       _not_held_under_this_lease ->
         {:reply, {:error, :unknown_instance}, state}
     end
   end
 
-  def handle_call(:held_instances, _from, state) do
-    tracked = for {instance, entry} <- state.instances, do: {entry.index, instance}
-
-    {:reply, Enum.uniq(in_flight(state) ++ tracked), state}
-  end
+  def handle_call(:held_instances, _from, state),
+    do: {:reply, Enum.uniq(in_flight(state) ++ Map.keys(state.instances)), state}
 
   def handle_call({:read_advertising_features, index}, from, state) do
     job = %{from: from, kind: :features, steps: [{Hci.op_read_adv_features(), index, <<>>}]}
@@ -313,10 +315,10 @@ defmodule Bluez.Mgmt do
     {:stop, :mgmt_command_timeout, state}
   end
 
-  def handle_info({:expire, instance, timer}, state) do
+  def handle_info({:expire, key, timer}, state) do
     case state.instances do
-      %{^instance => %{timer: ^timer}} ->
-        {:noreply, cleanup(state, instance, nil)}
+      %{^key => %{timer: ^timer}} ->
+        {:noreply, cleanup(state, key, nil)}
 
       _other ->
         {:noreply, state}
@@ -325,19 +327,21 @@ defmodule Bluez.Mgmt do
 
   # The lease ended (released, or its holder exited): take everything
   # sent under it off air.
-  def handle_info({:radio_lease_ended, ref}, state),
-    do: {:noreply, end_leases(state, &(&1 == ref))}
+  def handle_info({:radio_lease_ended, ref}, state) do
+    state = end_leases(state, &(&1 == ref))
+    {:noreply, settle(%{state | draining: MapSet.put(state.draining, ref)})}
+  end
 
   # The Radio went away, and every lease with it. The next send
   # re-subscribes (to its restarted incarnation, when registered by name).
   def handle_info({:DOWN, mon, :process, _pid, _reason}, %{radio_mon: mon} = state) do
-    state = %{state | radio_pid: nil, radio_mon: nil}
+    state = %{state | radio_pid: nil, radio_mon: nil, draining: MapSet.new()}
     {:noreply, end_leases(state, fn _ref -> true end)}
   end
 
-  def handle_info({:retry_remove, instance, gen}, state) do
+  def handle_info({:retry_remove, key, gen}, state) do
     case state.instances do
-      %{^instance => %{gen: ^gen, removing: false}} -> {:noreply, cleanup(state, instance, nil)}
+      %{^key => %{gen: ^gen, removing: false}} -> {:noreply, cleanup(state, key, nil)}
       _other -> {:noreply, state}
     end
   end
@@ -349,7 +353,7 @@ defmodule Bluez.Mgmt do
     # Best effort: don't leave our instances on air after we're gone —
     # including one whose parameters the kernel may already have accepted
     # while its data command is still in flight.
-    tracked = for {instance, entry} <- state.instances, do: {entry.index, instance}
+    tracked = Map.keys(state.instances)
 
     # Bounded sends: we may be stopping *because* the socket is wedged
     # (:mgmt_command_timeout), and an unbounded send would then block until
@@ -385,16 +389,33 @@ defmodule Bluez.Mgmt do
 
   defp lease_valid?(_state, _lease), do: false
 
+  # Report each ended lease drained once nothing sent under it is in
+  # flight here — no job of its queued or running, no instance of its
+  # still tracked — so the Radio can hand the controller on.
+  defp settle(%{draining: draining} = state) do
+    done = Enum.reject(draining, &pending?(state, &1))
+    Enum.each(done, &Radio.drained(state.radio_pid, &1))
+    %{state | draining: MapSet.difference(draining, MapSet.new(done))}
+  end
+
+  defp pending?(state, ref) do
+    Enum.any?([state.job | :queue.to_list(state.queue)], &lease_job?(&1, ref)) or
+      Enum.any?(state.instances, fn {_key, entry} -> entry.lease_ref == ref end)
+  end
+
+  defp lease_job?(%{kind: {_step, %Lease{ref: ref}, _arg, _opts}}, ref), do: true
+  defp lease_job?(_job, _ref), do: false
+
   # ── job queue ─────────────────────────────────────────────────────────────
 
   # `gen` ties a removal to the advertisement it was queued for: if the
   # instance has been re-advertised by the time it runs (an expiry racing
   # the holder's replacement), the removal is stale and skipped (see
   # start_job/2).
-  defp remove_job(index, instance, gen, from) do
+  defp remove_job({index, instance} = key, gen, from) do
     %{
       from: from,
-      kind: {:remove, instance, gen},
+      kind: {:remove, key, gen},
       steps: [{Hci.op_remove_advertising(), index, <<instance>>}]
     }
   end
@@ -414,12 +435,16 @@ defmodule Bluez.Mgmt do
   # default instance and tells whether the controller rotates instances in
   # software (see prepared/4).
   defp start_job(state, %{kind: {:advertise, lease, adv_data, opts}} = job) do
-    steps = [{Hci.op_read_adv_features(), lease.index, <<>>}]
-    send_step(state, %{job | steps: steps, kind: {:prepare, lease, adv_data, opts}})
+    if Radio.valid?(lease) do
+      steps = [{Hci.op_read_adv_features(), lease.index, <<>>}]
+      send_step(state, %{job | steps: steps, kind: {:prepare, lease, adv_data, opts}})
+    else
+      finish(state, job, {:error, :lease_expired})
+    end
   end
 
-  defp start_job(state, %{kind: {:remove, instance, gen}} = job) do
-    if current?(state, instance, gen),
+  defp start_job(state, %{kind: {:remove, key, gen}} = job) do
+    if current?(state, key, gen),
       do: send_step(state, job),
       else: finish(state, job, :ok)
   end
@@ -484,14 +509,15 @@ defmodule Bluez.Mgmt do
   # end-of-lease cleanup already ran without this instance: take it back
   # off air now instead of reporting success.
   defp complete(state, %{kind: {:advertising, lease, instance, opts}} = job, _params) do
-    state = track(state, lease, instance, opts)
+    key = {lease.index, instance}
+    state = track(state, lease, key, opts)
 
     if Radio.valid?(lease) do
       finish(state, job, {:ok, instance})
     else
       if job.from, do: GenServer.reply(job.from, {:error, :lease_expired})
-      state = put_in(state.instances[instance].lease_ended, true)
-      cleanup(%{state | job: nil}, instance, nil)
+      state = put_in(state.instances[key].lease_ended, true)
+      cleanup(%{state | job: nil}, key, nil)
     end
   end
 
@@ -505,8 +531,8 @@ defmodule Bluez.Mgmt do
     finish(state, job, result)
   end
 
-  defp complete(state, %{kind: {:remove, instance, gen}} = job, _params),
-    do: finish(removed(state, instance, gen), job, :ok)
+  defp complete(state, %{kind: {:remove, key, gen}} = job, _params),
+    do: finish(removed(state, key, gen), job, :ok)
 
   # Parameters accepted but data refused leaves a half-made instance:
   # report the failure and remove it. It is tracked under the lease (as
@@ -516,28 +542,28 @@ defmodule Bluez.Mgmt do
   defp failed(state, %{kind: {:advertising, lease, instance, _opts}, steps: [_data]} = job, error) do
     if job.from, do: GenServer.reply(job.from, error)
 
-    state = untrack(state, instance)
+    key = {lease.index, instance}
     gen = make_ref()
     entry = %{new_entry(lease, gen) | removing: true}
-    state = put_in(state.instances[instance], entry)
+    state = %{state | instances: Map.put(state.instances, key, entry)}
 
-    enqueue(%{state | job: nil}, remove_job(lease.index, instance, gen, nil))
+    enqueue(%{state | job: nil}, remove_job(key, gen, nil))
   end
 
   # Remove Advertising for an instance the kernel no longer has: it's gone,
   # which is what was asked.
-  defp failed(state, %{kind: {:remove, instance, gen}} = job, {:error, :invalid_params}),
-    do: finish(removed(state, instance, gen), job, :ok)
+  defp failed(state, %{kind: {:remove, key, gen}} = job, {:error, :invalid_params}),
+    do: finish(removed(state, key, gen), job, :ok)
 
   # Any other removal failure: keep tracking it as live (its duration
   # trigger is spent, but stop_advertising/3, the lease ending and shutdown
   # still cover it; after the lease ended, retry_orphan/2 does).
-  defp failed(state, %{kind: {:remove, instance, gen}} = job, error) do
+  defp failed(state, %{kind: {:remove, key, gen}} = job, error) do
     state =
-      if current?(state, instance, gen) do
+      if current?(state, key, gen) do
         state
-        |> update_in([:instances, instance], &%{&1 | removing: false})
-        |> retry_orphan(instance)
+        |> update_in([:instances, key], &%{&1 | removing: false})
+        |> retry_orphan(key)
       else
         state
       end
@@ -549,7 +575,7 @@ defmodule Bluez.Mgmt do
 
   defp finish(state, job, reply) do
     if job.from, do: GenServer.reply(job.from, reply)
-    next(%{state | job: nil})
+    %{state | job: nil} |> next() |> settle()
   end
 
   # The instance whose parameters the kernel may already have accepted
@@ -563,15 +589,13 @@ defmodule Bluez.Mgmt do
 
   # ── instance tracking ─────────────────────────────────────────────────────
 
-  defp track(state, lease, instance, opts) do
-    # Replacing an instance we already track: drop the old bookkeeping.
-    state = untrack(state, instance)
-
+  # Replacing an instance we already track drops the old bookkeeping.
+  defp track(state, lease, key, opts) do
     timer =
       case opts[:duration_ms] do
         ms when is_integer(ms) and ms > 0 ->
           timer = make_ref()
-          Process.send_after(self(), {:expire, instance, timer}, ms)
+          Process.send_after(self(), {:expire, key, timer}, ms)
           timer
 
         nil ->
@@ -579,12 +603,11 @@ defmodule Bluez.Mgmt do
       end
 
     entry = %{new_entry(lease, make_ref()) | timer: timer}
-    %{state | instances: Map.put(state.instances, instance, entry)}
+    %{state | instances: Map.put(state.instances, key, entry)}
   end
 
   defp new_entry(lease, gen) do
     %{
-      index: lease.index,
       lease_ref: lease.ref,
       # Its lease is over: nobody is left to retry a failed removal.
       lease_ended: false,
@@ -597,29 +620,33 @@ defmodule Bluez.Mgmt do
 
   # Take everything sent under the leases `ended?` matches off air.
   defp end_leases(state, ended?) do
-    ended = for {instance, %{lease_ref: ref}} <- state.instances, ended?.(ref), do: instance
+    ended = for {key, %{lease_ref: ref}} <- state.instances, ended?.(ref), do: key
 
-    Enum.reduce(ended, state, fn instance, state ->
-      state = put_in(state.instances[instance].lease_ended, true)
+    Enum.reduce(ended, state, fn key, state ->
+      state = put_in(state.instances[key].lease_ended, true)
 
       # One already being removed is retried if that removal fails.
-      if state.instances[instance].removing,
+      if state.instances[key].removing,
         do: state,
-        else: cleanup(state, instance, nil)
+        else: cleanup(state, key, nil)
     end)
   end
 
   # A removal refused after its lease ended has no holder left to retry
   # it: retry it here, a few times, before leaving it to shutdown.
-  defp retry_orphan(state, instance) do
-    case state.instances[instance] do
+  defp retry_orphan(state, {index, instance} = key) do
+    case state.instances[key] do
       %{lease_ended: true, retries: n, gen: gen} when n < @orphan_retries ->
-        Process.send_after(self(), {:retry_remove, instance, gen}, state.retry_ms)
-        put_in(state.instances[instance].retries, n + 1)
+        Process.send_after(self(), {:retry_remove, key, gen}, state.retry_ms)
+        put_in(state.instances[key].retries, n + 1)
 
+      # Detached from its lease, so the lease counts as drained.
       %{lease_ended: true} ->
-        Logger.warning("Bluez.Mgmt: giving up removing instance #{instance} until shutdown")
-        state
+        Logger.warning(
+          "Bluez.Mgmt: giving up removing hci#{index} instance #{instance} until shutdown"
+        )
+
+        put_in(state.instances[key].lease_ref, nil)
 
       _live_lease ->
         state
@@ -627,18 +654,17 @@ defmodule Bluez.Mgmt do
   end
 
   # Removal of exactly this advertisement (stop, expiry, lease end).
-  defp cleanup(state, instance, from) do
-    state = mark_removing(state, instance)
-    entry = state.instances[instance]
-    enqueue(state, remove_job(entry.index, instance, entry.gen, from))
+  defp cleanup(state, key, from) do
+    state = mark_removing(state, key)
+    enqueue(state, remove_job(key, state.instances[key].gen, from))
   end
 
   # Start taking `instance` off air. It stays tracked (flagged `removing`)
   # until the kernel confirms, so a failed removal is still covered by a
   # retry and shutdown; its duration trigger is spent.
-  defp mark_removing(state, instance) do
-    entry = Map.fetch!(state.instances, instance)
-    put_in(state.instances[instance], %{entry | timer: nil, removing: true})
+  defp mark_removing(state, key) do
+    entry = Map.fetch!(state.instances, key)
+    put_in(state.instances[key], %{entry | timer: nil, removing: true})
   end
 
   # With the controller's features in hand: settle the instance, and refuse
@@ -666,26 +692,18 @@ defmodule Bluez.Mgmt do
   # (re-advertising replaces our own); never one someone else holds.
   defp pick_instance(state, index, %{max_instances: max, instances: in_use}) when max > 0 do
     Enum.find(max..1//-1, fn instance ->
-      match?(%{index: ^index}, state.instances[instance]) or instance not in in_use
+      Map.has_key?(state.instances, {index, instance}) or instance not in in_use
     end)
   end
 
   defp pick_instance(_state, _index, _features), do: nil
 
-  defp current?(state, instance, gen), do: match?(%{gen: ^gen}, state.instances[instance])
+  defp current?(state, key, gen), do: match?(%{gen: ^gen}, state.instances[key])
 
-  defp removed(state, instance, gen),
-    do: if(current?(state, instance, gen), do: untrack(state, instance), else: state)
+  defp removed(state, key, gen),
+    do: if(current?(state, key, gen), do: untrack(state, key), else: state)
 
-  defp untrack(state, instance) do
-    case Map.pop(state.instances, instance) do
-      {nil, _instances} ->
-        state
-
-      {_entry, instances} ->
-        %{state | instances: instances}
-    end
-  end
+  defp untrack(state, key), do: %{state | instances: Map.delete(state.instances, key)}
 
   # ── socket ────────────────────────────────────────────────────────────────
 
@@ -712,12 +730,9 @@ defmodule Bluez.Mgmt do
 
       # Someone else (bluetoothd restarting, an expiring kernel timeout)
       # removed one of our instances: stop tracking it. The socket sees
-      # every controller's events, so match the index too.
+      # every controller's events; the key holds the index.
       {:ok, {:advertising_removed, index, instance}} ->
-        case state.instances[instance] do
-          %{index: ^index} -> untrack(state, instance)
-          _other -> state
-        end
+        state |> untrack({index, instance}) |> settle()
 
       _other ->
         state

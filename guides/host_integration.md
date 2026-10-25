@@ -74,7 +74,10 @@ restarted): acquire again.
 
 `acquire/1` returns `{:error, :no_adapter_index}` until `Bluez.Client`
 has resolved the adapter, and `{:error, {:held_by, pid}}` while another
-process holds it.
+process holds it. After a lease ends, the controller stays reserved until
+the transmitters have finished taking its advertisements off air;
+`acquire/1` waits for that (up to `wait:` ms, default 5000) and returns
+`{:error, :draining}` if it takes longer.
 
 Send a payload as an ordered 16-bit UUID list for 300 ms:
 

@@ -24,6 +24,13 @@ defmodule Bluez.Radio do
     * The lease ends on `release/1` or when the holder exits. Every
       advertisement sent under it is then taken off air (subscribers —
       the transmitters — get `{:radio_lease_ended, ref}`).
+    * The controller stays reserved until that is done: each subscriber
+      reports `drained/2` once nothing sent under the old lease is still
+      in flight (a registration BlueZ hasn't answered, a removal the
+      kernel hasn't confirmed), so a successor's sends can't be
+      overwritten or removed by the old lease's leftovers. `acquire/1`
+      waits for it (`:wait`); a subscriber that never reports is given up
+      on after 30 s.
     * If the Radio itself stops, every lease ends with it: the
       transmitters (which monitor it) take everything off air, and sends
       return `{:error, :lease_expired}` until a new lease is acquired.
@@ -35,8 +42,18 @@ defmodule Bluez.Radio do
   """
 
   use GenServer
+  require Logger
 
   alias Bluez.{DevicePath, Hci}
+
+  # How long acquire/1 waits by default for the previous lease to drain,
+  # and how often it checks.
+  @acquire_wait 5_000
+  @acquire_poll_ms 20
+
+  # Cap on a drain: a subscriber that never reports drained/2 can't hold
+  # the controller forever.
+  @drain_timeout 30_000
 
   defmodule Lease do
     @moduledoc """
@@ -48,7 +65,7 @@ defmodule Bluez.Radio do
 
     @type t :: %__MODULE__{
             radio: pid(),
-            index: non_neg_integer(),
+            index: 0..0xFFFE,
             ref: reference(),
             holder: pid()
           }
@@ -63,18 +80,35 @@ defmodule Bluez.Radio do
   Acquire the transmit lease on a controller for the calling process.
 
   Options: `:adapter_index` (default: the adapter `Bluez.Client`
-  resolved), `:server` (default `Bluez.Radio`).
+  resolved), `:wait` — ms to wait for the previous lease's work to drain
+  (default 5000), `:server` (default `Bluez.Radio`).
 
-  Returns `{:ok, lease}`, `{:error, {:held_by, pid}}`,
-  `{:error, :no_adapter_index}`, `{:error, {:invalid, "adapter_index"}}`
-  or `{:error, :not_running}`.
+  Returns `{:ok, lease}`, `{:error, {:held_by, pid}}`, `{:error, :draining}`
+  (still draining after `:wait`), `{:error, :no_adapter_index}`,
+  `{:error, {:invalid, "adapter_index"}}` or `{:error, :not_running}`.
   """
   @spec acquire(keyword()) :: {:ok, Lease.t()} | {:error, term()}
   def acquire(opts \\ []) do
     server = Keyword.get(opts, :server, __MODULE__)
+    deadline = System.monotonic_time(:millisecond) + Keyword.get(opts, :wait, @acquire_wait)
 
-    with {:ok, index} <- index(opts) do
-      call(server, {:acquire, index, self()}, {:error, :not_running})
+    with {:ok, index} <- index(opts), do: acquire_until(server, index, deadline)
+  end
+
+  # Polled rather than queued in the server: a waiter that gives up must
+  # never be handed a lease it no longer expects.
+  defp acquire_until(server, index, deadline) do
+    case call(server, {:acquire, index, self()}, {:error, :not_running}) do
+      {:error, :draining} = draining ->
+        if System.monotonic_time(:millisecond) < deadline do
+          Process.sleep(@acquire_poll_ms)
+          acquire_until(server, index, deadline)
+        else
+          draining
+        end
+
+      other ->
+        other
     end
   end
 
@@ -108,13 +142,25 @@ defmodule Bluez.Radio do
   @spec subscribe(GenServer.server()) :: {:ok, pid()} | {:error, :not_running}
   def subscribe(server \\ __MODULE__), do: call(server, :subscribe, {:error, :not_running})
 
+  @doc """
+  Report (from a subscriber) that nothing sent under the ended lease
+  `ref` is in flight any more. The controller is free once every
+  subscriber has.
+  """
+  @spec drained(GenServer.server(), reference()) :: :ok
+  def drained(server, ref), do: GenServer.cast(server, {:drained, ref, self()})
+
   @doc "The process holding the lease on controller `index`, or `nil`."
   @spec holder(non_neg_integer(), GenServer.server()) :: pid() | nil
   def holder(index, server \\ __MODULE__), do: call(server, {:holder, index}, nil)
 
+  # MGMT's controller index is 16 bits, and 0xFFFF means "no controller":
+  # anything outside would wrap onto another controller's lease.
+  defguardp valid_index?(index) when is_integer(index) and index in 0..0xFFFE
+
   defp index(opts) do
     case Keyword.fetch(opts, :adapter_index) do
-      {:ok, index} when is_integer(index) and index >= 0 ->
+      {:ok, index} when valid_index?(index) ->
         {:ok, index}
 
       {:ok, _bad} ->
@@ -122,10 +168,10 @@ defmodule Bluez.Radio do
 
       :error ->
         with {:ok, path} <- DevicePath.resolved_adapter_path(),
-             {:ok, index} <- Hci.adapter_index(path) do
+             {:ok, index} when valid_index?(index) <- Hci.adapter_index(path) do
           {:ok, index}
         else
-          :error -> {:error, :no_adapter_index}
+          _unresolved -> {:error, :no_adapter_index}
         end
     end
   end
@@ -140,10 +186,22 @@ defmodule Bluez.Radio do
   # ── GenServer ─────────────────────────────────────────────────────────────
 
   @impl GenServer
-  def init(_opts) do
-    # leases: index => %Lease{}; monitors: holder monitor ref => index;
-    # subscribers: pid => monitor ref.
-    {:ok, %{leases: %{}, monitors: %{}, subscribers: %{}}}
+  def init(opts) do
+    state = %{
+      # Test seam.
+      drain_timeout: Keyword.get(opts, :drain_timeout, @drain_timeout),
+      # index => %Lease{}
+      leases: %{},
+      # holder monitor ref => index
+      monitors: %{},
+      # pid => monitor ref
+      subscribers: %{},
+      # index => %{ref, pending}: the subscribers yet to report the ended
+      # lease drained.
+      draining: %{}
+    }
+
+    {:ok, state}
   end
 
   @impl GenServer
@@ -154,6 +212,9 @@ defmodule Bluez.Radio do
 
       %{^index => %Lease{holder: other}} ->
         {:reply, {:error, {:held_by, other}}, state}
+
+      _free when is_map_key(state.draining, index) ->
+        {:reply, {:error, :draining}, state}
 
       _free ->
         lease = %Lease{radio: self(), index: index, ref: make_ref(), holder: holder}
@@ -205,12 +266,46 @@ defmodule Bluez.Radio do
       {index, monitors} when is_integer(index) ->
         {:noreply, end_lease(%{state | monitors: monitors}, index)}
 
+      # A subscriber exited: it has nothing left in flight.
       {nil, _monitors} ->
-        {:noreply, %{state | subscribers: Map.delete(state.subscribers, pid)}}
+        state = %{state | subscribers: Map.delete(state.subscribers, pid)}
+        {:noreply, Enum.reduce(Map.keys(state.draining), state, &drained(&2, &1, pid))}
+    end
+  end
+
+  def handle_info({:drain_timeout, index, ref}, state) do
+    case state.draining do
+      %{^index => %{ref: ^ref, pending: pending}} ->
+        Logger.warning(
+          "Bluez.Radio: hci#{index} still draining after #{state.drain_timeout} ms " <>
+            "(#{inspect(MapSet.to_list(pending))}); freeing it"
+        )
+
+        {:noreply, %{state | draining: Map.delete(state.draining, index)}}
+
+      _other ->
+        {:noreply, state}
     end
   end
 
   def handle_info(_other, state), do: {:noreply, state}
+
+  @impl GenServer
+  def handle_cast({:drained, ref, pid}, state) do
+    case Enum.find(state.draining, fn {_index, drain} -> drain.ref == ref end) do
+      {index, _drain} -> {:noreply, drained(state, index, pid)}
+      nil -> {:noreply, state}
+    end
+  end
+
+  defp drained(state, index, pid) do
+    %{pending: pending} = drain = state.draining[index]
+    pending = MapSet.delete(pending, pid)
+
+    if MapSet.size(pending) == 0,
+      do: %{state | draining: Map.delete(state.draining, index)},
+      else: put_in(state.draining[index], %{drain | pending: pending})
+  end
 
   defp end_lease(state, index) do
     {%Lease{ref: ref}, leases} = Map.pop(state.leases, index)
@@ -225,8 +320,19 @@ defmodule Bluez.Radio do
           state.monitors
       end
 
-    # The transmitters take everything sent under the lease off air.
-    Enum.each(Map.keys(state.subscribers), &send(&1, {:radio_lease_ended, ref}))
-    %{state | leases: leases, monitors: monitors}
+    # The transmitters take everything sent under the lease off air; the
+    # controller stays reserved until each reports drained/2.
+    subscribers = Map.keys(state.subscribers)
+    Enum.each(subscribers, &send(&1, {:radio_lease_ended, ref}))
+
+    draining =
+      if subscribers == [] do
+        state.draining
+      else
+        Process.send_after(self(), {:drain_timeout, index, ref}, state.drain_timeout)
+        Map.put(state.draining, index, %{ref: ref, pending: MapSet.new(subscribers)})
+      end
+
+    %{state | leases: leases, monitors: monitors, draining: draining}
   end
 end

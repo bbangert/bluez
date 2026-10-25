@@ -59,7 +59,58 @@ defmodule Bluez.RadioTest do
 
     assert_receive {:radio_lease_ended, ^ref}, 1_000
     refute Radio.valid?(lease)
+
+    # Free once this subscriber has drained the old lease.
+    :ok = Radio.drained(radio, ref)
     assert {:ok, %Lease{holder: ^test_pid}} = Radio.acquire(server: radio, adapter_index: 0)
+  end
+
+  test "the controller stays reserved until every subscriber has drained the old lease",
+       %{radio: radio} do
+    {:ok, ^radio} = Radio.subscribe(radio)
+    {:ok, %Lease{ref: ref} = lease} = Radio.acquire(server: radio, adapter_index: 0)
+    :ok = Radio.release(lease)
+    assert_receive {:radio_lease_ended, ^ref}
+
+    assert Radio.acquire(server: radio, adapter_index: 0, wait: 0) == {:error, :draining}
+    # Other controllers aren't affected.
+    assert {:ok, _} = Radio.acquire(server: radio, adapter_index: 1, wait: 0)
+
+    # acquire/1 waits (polling) for the drain to finish.
+    waiter = Task.async(fn -> Radio.acquire(server: radio, adapter_index: 0, wait: 1_000) end)
+    Process.sleep(50)
+    :ok = Radio.drained(radio, ref)
+    assert {:ok, %Lease{index: 0}} = Task.await(waiter)
+  end
+
+  test "a subscriber exiting counts as drained", %{radio: radio} do
+    test_pid = self()
+
+    subscriber =
+      spawn(fn ->
+        {:ok, ^radio} = Radio.subscribe(radio)
+        send(test_pid, :subscribed)
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive :subscribed
+    {:ok, lease} = Radio.acquire(server: radio, adapter_index: 0)
+    :ok = Radio.release(lease)
+    assert Radio.acquire(server: radio, adapter_index: 0, wait: 0) == {:error, :draining}
+
+    Process.exit(subscriber, :kill)
+    assert {:ok, _} = Radio.acquire(server: radio, adapter_index: 0, wait: 1_000)
+  end
+
+  @tag capture_log: true
+  test "a drain that never finishes is given up on" do
+    radio = start_supervised!({Radio, name: nil, drain_timeout: 50}, id: :short_drain)
+    {:ok, ^radio} = Radio.subscribe(radio)
+    {:ok, lease} = Radio.acquire(server: radio, adapter_index: 0)
+    :ok = Radio.release(lease)
+
+    assert Radio.acquire(server: radio, adapter_index: 0, wait: 0) == {:error, :draining}
+    assert {:ok, _} = Radio.acquire(server: radio, adapter_index: 0, wait: 1_000)
   end
 
   test "a stale lease can't end its successor", %{radio: radio} do
@@ -67,6 +118,7 @@ defmodule Bluez.RadioTest do
     {holder, %Lease{ref: old_ref} = old} = Bluez.TestLeaseHolder.start(radio)
     assert Bluez.TestLeaseHolder.call(holder, &Radio.release/1) == :ok
     assert_receive {:radio_lease_ended, ^old_ref}
+    :ok = Radio.drained(radio, old_ref)
 
     # The controller is re-acquired; the old lease is now stale.
     {:ok, %Lease{ref: new_ref} = new} = Radio.acquire(server: radio, adapter_index: 0)
@@ -121,6 +173,12 @@ defmodule Bluez.RadioTest do
   test "rejects a bad adapter_index and degrades when not running" do
     assert Radio.acquire(server: :no_such_radio, adapter_index: -1) ==
              {:error, {:invalid, "adapter_index"}}
+
+    # MGMT indices are 16 bits, 0xFFFF reserved: beyond would alias hci0.
+    for bad <- [0xFFFF, 0x10000, 1.0] do
+      assert Radio.acquire(server: :no_such_radio, adapter_index: bad) ==
+               {:error, {:invalid, "adapter_index"}}
+    end
 
     assert Radio.acquire(server: :no_such_radio, adapter_index: 0) == {:error, :not_running}
     assert Radio.subscribe(:no_such_radio) == {:error, :not_running}

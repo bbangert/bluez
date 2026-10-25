@@ -131,7 +131,7 @@ defmodule Bluez.MgmtTest do
     complete(kernel, @remove, 0x0A)
 
     assert eventually(fn ->
-             match?(%{3 => %{removing: false}}, :sys.get_state(mgmt).instances)
+             match?(%{{0, 3} => %{removing: false}}, :sys.get_state(mgmt).instances)
            end)
 
     ref = stop_async(ctx, 3)
@@ -205,11 +205,50 @@ defmodule Bluez.MgmtTest do
     assert eventually(fn -> :sys.get_state(ctx.mgmt).instances == %{} end)
   end
 
+  test "the controller isn't handed on until the old lease's removals are done",
+       %{radio: radio, kernel: kernel, lease: lease} = ctx do
+    advertise_ok(ctx, 2)
+
+    :ok = Radio.release(lease)
+    assert expect_command(kernel, @remove) == <<2>>
+    # A successor could otherwise add an instance the pending removal of
+    # the old one then interferes with.
+    assert Radio.acquire(server: radio, adapter_index: 0, wait: 0) == {:error, :draining}
+
+    complete(kernel, @remove, 0, <<2>>)
+    assert {:ok, _lease} = Radio.acquire(server: radio, adapter_index: 0, wait: 1_000)
+  end
+
   test "the Radio stopping ends every lease", %{kernel: kernel} = ctx do
     advertise_ok(ctx, 2)
 
     :ok = stop_supervised(Radio)
     assert expect_command(kernel, @remove) == <<2>>
+  end
+
+  test "the same instance number on two controllers is tracked separately",
+       %{mgmt: mgmt, kernel: kernel, radio: radio} = ctx do
+    advertise_ok(ctx, 5)
+
+    # Instance 5 on hci1, under hci1's lease.
+    {other, _lease} = TestLeaseHolder.start(radio, 1)
+    ref = TestLeaseHolder.run(other, &Mgmt.advertise(&1, <<2, 1, 6>>, server: mgmt, instance: 5))
+    assert {:ok, <<0x3D, 0, 1, 0, _::binary>>} = :socket.recv(kernel, 0, 1_000)
+    complete(kernel, @read_features, 0, features(5))
+    assert {:ok, <<0x54, 0, 1, 0, _::binary>>} = :socket.recv(kernel, 0, 1_000)
+    complete(kernel, @params, 0, <<5, 0, 31, 31>>)
+    assert {:ok, <<0x55, 0, 1, 0, _::binary>>} = :socket.recv(kernel, 0, 1_000)
+    complete(kernel, @data, 0, <<5>>)
+    assert await(ref) == {:ok, 5}
+
+    assert Enum.sort(Mgmt.held_instances(mgmt)) == [{0, 5}, {1, 5}]
+
+    # Ending hci1's lease removes only hci1's instance 5.
+    TestLeaseHolder.stop(other)
+
+    assert {:ok, <<0x3F, 0, 1, 0, 1, 0, 5>>} = :socket.recv(kernel, 0, 1_000)
+    complete(kernel, @remove, 0, <<5>>)
+    assert eventually(fn -> Mgmt.held_instances(mgmt) == [{0, 5}] end)
   end
 
   test "a lease from another Radio is refused", %{mgmt: mgmt, kernel: kernel} do
@@ -229,7 +268,7 @@ defmodule Bluez.MgmtTest do
     assert TestLeaseHolder.call(other, &Mgmt.stop_advertising(&1, 4, mgmt)) ==
              {:error, :unknown_instance}
 
-    assert %{4 => %{removing: false}} = :sys.get_state(mgmt).instances
+    assert %{{0, 4} => %{removing: false}} = :sys.get_state(mgmt).instances
   end
 
   test "held_instances/2 reports a wedged server as :unknown, not as holding nothing",
@@ -309,15 +348,15 @@ defmodule Bluez.MgmtTest do
     # A duration that can't elapse on its own during the test: the expiry
     # is fired by hand below, exactly while the replacement is in flight.
     advertise_ok(ctx, 5, duration_ms: 60_000)
-    %{5 => %{timer: timer}} = :sys.get_state(mgmt).instances
+    %{{0, 5} => %{timer: timer}} = :sys.get_state(mgmt).instances
 
     # Re-advertise instance 5, hold the kernel's reply, and let the old
     # advertisement's expiry fire meanwhile (its removal queues behind).
     ref = advertise_async(ctx, <<2, 1, 6>>, instance: 5)
     answer_features(kernel)
     expect_command(kernel, @params)
-    send(mgmt, {:expire, 5, timer})
-    assert %{5 => %{removing: true}} = :sys.get_state(mgmt).instances
+    send(mgmt, {:expire, {0, 5}, timer})
+    assert %{{0, 5} => %{removing: true}} = :sys.get_state(mgmt).instances
     assert :queue.len(:sys.get_state(mgmt).queue) == 1
     complete(kernel, @params, 0, <<5, 0, 31, 31>>)
     expect_command(kernel, @data)
@@ -327,7 +366,7 @@ defmodule Bluez.MgmtTest do
     # The stale removal is skipped: nothing else goes to the kernel, and the
     # replacement is still tracked.
     assert {:error, :timeout} = :socket.recv(kernel, 0, 100)
-    assert %{5 => %{removing: false}} = :sys.get_state(mgmt).instances
+    assert %{{0, 5} => %{removing: false}} = :sys.get_state(mgmt).instances
   end
 
   test "a failed removal keeps the instance tracked so it can be retried",
@@ -365,7 +404,7 @@ defmodule Bluez.MgmtTest do
     # proves the event was processed (not merely still in flight).
     :ok = :socket.send(kernel, <<0x24, 0, 1, 0, 1, 0, 6>>)
     sync(mgmt, kernel)
-    assert %{6 => _} = :sys.get_state(mgmt).instances
+    assert %{{0, 6} => _} = :sys.get_state(mgmt).instances
 
     # ...whereas the same event for hci0 does drop it.
     :ok = :socket.send(kernel, <<0x24, 0, 0, 0, 1, 0, 6>>)

@@ -249,6 +249,32 @@ defmodule Bluez.AdvertiserTest do
       assert_unregister(svr, path)
     end
 
+    test "the controller isn't handed on while the old lease's registration is pending",
+         %{svr: svr, radio: radio, lease: lease} = ctx do
+      _ref = advertise_async(ctx, %{type: :broadcast})
+
+      assert_receive {^svr,
+                      %Message{
+                        header_fields: %{member: "RegisterAdvertisement"},
+                        body: [path, []]
+                      } = reg},
+                     1_000
+
+      # The lease ends mid-registration. Were the controller handed on
+      # now, a successor's Bluez.Mgmt instance 1 could be overwritten by
+      # this registration (bluetoothd doesn't see it) and then removed by
+      # its cancellation.
+      :ok = Radio.release(lease)
+      assert Radio.acquire(server: radio, adapter_index: 0, wait: 0) == {:error, :draining}
+
+      reply(svr, reg)
+      unreg = assert_unregister(svr, path)
+      assert Radio.acquire(server: radio, adapter_index: 0, wait: 0) == {:error, :draining}
+
+      reply(svr, unreg)
+      assert {:ok, _lease} = Radio.acquire(server: radio, adapter_index: 0, wait: 1_000)
+    end
+
     test "an unregister refused after its lease ended is retried",
          %{svr: svr, adv: adv, lease: lease} = ctx do
       {_id, path} = registered(ctx)
