@@ -383,6 +383,26 @@ defmodule Bluez.MgmtTest do
     assert :sys.get_state(mgmt).instances == %{}
   end
 
+  test "an unplugged controller's instances are forgotten, so a reused index starts clean",
+       %{mgmt: mgmt, kernel: kernel} = ctx do
+    advertise_ok(ctx, 5)
+
+    # MGMT Index Removed for hci0 (a USB dongle unplugged).
+    :ok = :socket.send(kernel, <<0x05, 0, 0, 0, 0, 0>>)
+    assert eventually(fn -> :sys.get_state(mgmt).instances == %{} end)
+
+    # Replugged as hci0, where someone else now holds instance 5: the
+    # default pick no longer treats 5 as ours.
+    ref = advertise_async(ctx, <<2, 1, 6>>, [])
+    expect_command(kernel, @read_features)
+    complete(kernel, @read_features, 0, <<0::little-32, 31, 31, 5, 1, 5>>)
+    assert <<4, _::binary>> = expect_command(kernel, @params)
+    complete(kernel, @params, 0, <<4, 0, 31, 31>>)
+    expect_command(kernel, @data)
+    complete(kernel, @data, 0, <<4>>)
+    assert await(ref) == {:ok, 4}
+  end
+
   test "an Advertising Removed event for another controller is ignored",
        %{mgmt: mgmt, kernel: kernel} = ctx do
     advertise_ok(ctx, 6)

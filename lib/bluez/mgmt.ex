@@ -498,10 +498,11 @@ defmodule Bluez.Mgmt do
     enqueue(%{state | job: nil}, remove_job(key, gen, nil))
   end
 
-  # Remove Advertising for an instance the kernel no longer has: it's gone,
-  # which is what was asked.
-  defp failed(state, %{kind: {:remove, key, gen}} = job, {:error, :invalid_params}),
-    do: finish(removed(state, key, gen), job, :ok)
+  # Remove Advertising for an instance (or controller) the kernel no
+  # longer has: it's gone, which is what was asked.
+  defp failed(state, %{kind: {:remove, key, gen}} = job, {:error, status})
+       when status in [:invalid_params, :invalid_index],
+       do: finish(removed(state, key, gen), job, :ok)
 
   # Any other removal failure: keep tracking it as live (its duration
   # trigger is spent, but stop_advertising/3 and shutdown still cover it).
@@ -638,6 +639,12 @@ defmodule Bluez.Mgmt do
       # every controller's events; the key holds the index.
       {:ok, {:advertising_removed, index, instance}} ->
         untrack(state, {index, instance})
+
+      # The controller went away (a USB dongle unplugged), its instances
+      # with it. Forget them, so a controller later given the same index
+      # isn't mistaken for holding ours.
+      {:ok, {:index_removed, index}} ->
+        %{state | instances: Map.reject(state.instances, &match?({{^index, _}, _}, &1))}
 
       _other ->
         state
