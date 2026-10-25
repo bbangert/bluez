@@ -48,8 +48,18 @@ defmodule Bluez.MgmtTest do
       :socket.send(kernel, <<1::little-16, 0::little-16, byte_size(rp)::little-16, rp::binary>>)
   end
 
-  defp features(max_instances),
-    do: <<0::little-32, 31, 31, max_instances, 1, 1>>
+  # MGMT_ADV_FLAG_HW_OFFLOAD: concurrent hardware sets, no software
+  # rotation (so finite durations are never refused as :rotation_busy).
+  @hw_offload Bitwise.bsl(1, 11)
+
+  defp features(max_instances, in_use \\ [1], flags \\ @hw_offload),
+    do: <<flags::little-32, 31, 31, max_instances, length(in_use)>> <> :binary.list_to_bin(in_use)
+
+  # Every advertise starts with Read Advertising Features.
+  defp answer_features(kernel, max \\ 5, in_use \\ [1], flags \\ @hw_offload) do
+    assert expect_command(kernel, @read_features) == <<>>
+    complete(kernel, @read_features, 0, features(max, in_use, flags))
+  end
 
   # The owner defaults to the caller — here the short-lived Task — so pin
   # it to the test process unless a test is about ownership.
@@ -90,6 +100,8 @@ defmodule Bluez.MgmtTest do
     {mgmt, kernel} = start_mgmt()
     task = advertise_async(mgmt, <<2, 1, 6>>, instance: 3)
 
+    answer_features(kernel)
+
     expect_command(kernel, @params)
     complete(kernel, @params, 0, <<3, 0, 31, 31>>)
     expect_command(kernel, @data)
@@ -102,6 +114,7 @@ defmodule Bluez.MgmtTest do
   test "a half-made instance whose rollback fails stays tracked and removable" do
     {mgmt, kernel} = start_mgmt()
     task = advertise_async(mgmt, <<2, 1, 6>>, instance: 3)
+    answer_features(kernel)
     expect_command(kernel, @params)
     complete(kernel, @params, 0, <<3, 0, 31, 31>>)
     expect_command(kernel, @data)
@@ -126,6 +139,8 @@ defmodule Bluez.MgmtTest do
     {mgmt, kernel} = start_mgmt()
     task = advertise_async(mgmt, <<2, 1, 6>>, instance: 3)
 
+    answer_features(kernel)
+
     expect_command(kernel, @params)
     complete(kernel, @params, 0x0B)
 
@@ -137,6 +152,8 @@ defmodule Bluez.MgmtTest do
     {mgmt, kernel} = start_mgmt()
     owner = spawn(fn -> Process.sleep(:infinity) end)
     task = advertise_async(mgmt, <<2, 1, 6>>, instance: 2, owner: owner)
+
+    answer_features(kernel)
 
     expect_command(kernel, @params)
     complete(kernel, @params, 0, <<2, 0, 31, 31>>)
@@ -151,6 +168,8 @@ defmodule Bluez.MgmtTest do
   test "stop_advertising/2 removes a tracked instance and refuses unknown ones" do
     {mgmt, kernel} = start_mgmt()
     task = advertise_async(mgmt, <<2, 1, 6>>, instance: 4)
+
+    answer_features(kernel)
 
     expect_command(kernel, @params)
     complete(kernel, @params, 0, <<4, 0, 31, 31>>)
@@ -185,6 +204,7 @@ defmodule Bluez.MgmtTest do
   test "an instance removed by someone else is no longer tracked" do
     {mgmt, kernel} = start_mgmt()
     task = advertise_async(mgmt, <<2, 1, 6>>, instance: 6)
+    answer_features(kernel)
     expect_command(kernel, @params)
     complete(kernel, @params, 0, <<6, 0, 31, 31>>)
     expect_command(kernel, @data)
@@ -199,6 +219,7 @@ defmodule Bluez.MgmtTest do
   # Accept an advertisement on `instance` end to end.
   defp advertise_ok(mgmt, kernel, instance, opts \\ []) do
     task = advertise_async(mgmt, <<2, 1, 6>>, [instance: instance] ++ opts)
+    answer_features(kernel)
     expect_command(kernel, @params)
     complete(kernel, @params, 0, <<instance, 0, 31, 31>>)
     expect_command(kernel, @data)
@@ -216,6 +237,7 @@ defmodule Bluez.MgmtTest do
     # Re-advertise instance 5, hold the kernel's reply, and let the old
     # advertisement's expiry fire meanwhile (its removal queues behind).
     task = advertise_async(mgmt, <<2, 1, 6>>, instance: 5)
+    answer_features(kernel)
     expect_command(kernel, @params)
     send(mgmt, {:expire, 5, timer})
     assert %{5 => %{removing: true}} = :sys.get_state(mgmt).instances
@@ -234,6 +256,7 @@ defmodule Bluez.MgmtTest do
   test "a failed data step's rollback runs before queued work for the same instance" do
     {mgmt, kernel} = start_mgmt()
     first = advertise_async(mgmt, <<2, 1, 6>>, instance: 3)
+    answer_features(kernel)
     expect_command(kernel, @params)
     complete(kernel, @params, 0, <<3, 0, 31, 31>>)
     expect_command(kernel, @data)
@@ -246,6 +269,7 @@ defmodule Bluez.MgmtTest do
 
     assert expect_command(kernel, @remove) == <<3>>
     complete(kernel, @remove, 0, <<3>>)
+    answer_features(kernel)
     expect_command(kernel, @params)
     complete(kernel, @params, 0, <<3, 0, 31, 31>>)
     expect_command(kernel, @data)
@@ -307,6 +331,8 @@ defmodule Bluez.MgmtTest do
       Mgmt.advertise(<<2, 1, 6>>, server: mgmt, instance: 7, owner: owner)
     end)
 
+    answer_features(kernel)
+
     expect_command(kernel, @params)
     complete(kernel, @params, 0, <<7, 0, 31, 31>>)
     expect_command(kernel, @data)
@@ -322,6 +348,7 @@ defmodule Bluez.MgmtTest do
     {mgmt, kernel} = start_mgmt(command_timeout: 50)
     ref = Process.monitor(mgmt)
     task = advertise_async(mgmt, <<2, 1, 6>>, instance: 2)
+    answer_features(kernel)
     expect_command(kernel, @params)
 
     assert_receive {:DOWN, ^ref, :process, ^mgmt, :mgmt_command_timeout}, 1_000
@@ -373,6 +400,62 @@ defmodule Bluez.MgmtTest do
     complete(kernel, @read_features, 0, <<0::little-32, 31, 31, 1, 1, 1>>)
     assert Task.await(task) == {:error, :no_free_instance}
     assert {:error, :timeout} = :socket.recv(kernel, 0, 100)
+  end
+
+  test "a finite advertisement is refused while a software-rotating controller has another instance" do
+    {mgmt, kernel} = start_mgmt()
+    task = advertise_async(mgmt, <<2, 1, 6>>, instance: 5, duration_ms: 300)
+
+    # No hardware offload, and instance 1 (bluetoothd's) is registered: the
+    # kernel would rotate ours in ~2 s slots, so 300 ms may never air.
+    answer_features(kernel, 5, [1], 0)
+    assert Task.await(task) == {:error, :rotation_busy}
+    assert {:error, :timeout} = :socket.recv(kernel, 0, 100)
+  end
+
+  test "software rotation doesn't block an unbounded advert, or one alone on the controller" do
+    {mgmt, kernel} = start_mgmt()
+
+    # No duration: it will get its rotation slot eventually.
+    task = advertise_async(mgmt, <<2, 1, 6>>, instance: 5)
+    answer_features(kernel, 5, [1], 0)
+    expect_command(kernel, @params)
+    complete(kernel, @params, 0, <<5, 0, 31, 31>>)
+    expect_command(kernel, @data)
+    complete(kernel, @data, 0, <<5>>)
+    assert Task.await(task) == {:ok, 5}
+
+    # Replacing our own instance with nothing else registered: no rotation.
+    task = advertise_async(mgmt, <<2, 1, 6>>, instance: 5, duration_ms: 300)
+    answer_features(kernel, 5, [5], 0)
+    expect_command(kernel, @params)
+    complete(kernel, @params, 0, <<5, 0, 31, 31>>)
+    expect_command(kernel, @data)
+    complete(kernel, @data, 0, <<5>>)
+    assert Task.await(task) == {:ok, 5}
+  end
+
+  test "an explicit stop also removes a replacement that lands while it waits" do
+    {mgmt, kernel} = start_mgmt()
+    advertise_ok(mgmt, kernel, 5)
+
+    # A replacement for instance 5 is in flight when the stop arrives.
+    task = advertise_async(mgmt, <<2, 1, 6>>, instance: 5)
+    answer_features(kernel)
+    expect_command(kernel, @params)
+    stopper = Task.async(fn -> Mgmt.stop_advertising(5, mgmt) end)
+    assert eventually(fn -> :queue.len(:sys.get_state(mgmt).queue) == 1 end)
+
+    complete(kernel, @params, 0, <<5, 0, 31, 31>>)
+    expect_command(kernel, @data)
+    complete(kernel, @data, 0, <<5>>)
+    assert Task.await(task) == {:ok, 5}
+
+    # The stop then removes what is on instance 5 now: the replacement.
+    assert expect_command(kernel, @remove) == <<5>>
+    complete(kernel, @remove, 0, <<5>>)
+    assert Task.await(stopper) == :ok
+    assert :sys.get_state(mgmt).instances == %{}
   end
 
   test "rejects bad input in the caller, before reaching the server" do

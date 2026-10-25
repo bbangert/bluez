@@ -108,8 +108,16 @@ defmodule Bluez.HciTest do
     assert hi == 1 <<< 30
   end
 
-  test "sockaddr/2 packs dev and channel little-endian" do
-    assert Hci.sockaddr(1, 3) == %{family: 31, addr: <<1, 0, 3, 0>>}
+  test "sockaddr/2 packs dev and channel as host-endian unsigned shorts" do
+    # struct sockaddr_hci's fields are native `unsigned short`, unlike the
+    # little-endian fields inside HCI/MGMT packets.
+    assert Hci.sockaddr(1, 3) == %{family: 31, addr: <<1::native-16, 3::native-16>>}
+  end
+
+  test "adv_hw_offload?/1 reads MGMT_ADV_FLAG_HW_OFFLOAD (bit 11)" do
+    assert Hci.adv_hw_offload?(0x0800)
+    assert Hci.adv_hw_offload?(0xFFFF)
+    refute Hci.adv_hw_offload?(0x07FF)
   end
 
   test "adapter_index/1 rejects non-adapter paths" do

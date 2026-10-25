@@ -309,7 +309,15 @@ defmodule Bluez.AdvertiserTest do
         Bluez.Mgmt.advertise(<<2, 1, 6>>, server: mgmt, instance: instance, owner: test_pid)
       end)
 
-    for {opcode, rp} <- [{0x0054, <<instance, 0, 31, 31>>}, {0x0055, <<instance>>}] do
+    # Read Advertising Features (hardware offload, nothing else registered),
+    # then the parameters and data commands.
+    features = <<Bitwise.bsl(1, 11)::little-32, 31, 31, 5, 0>>
+
+    for {opcode, rp} <- [
+          {0x003D, features},
+          {0x0054, <<instance, 0, 31, 31>>},
+          {0x0055, <<instance>>}
+        ] do
       {:ok, <<^opcode::little-16, _::binary>>} = :socket.recv(kernel, 0, 1_000)
       reply = <<opcode::little-16, 0, rp::binary>>
 

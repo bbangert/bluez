@@ -40,6 +40,19 @@ defmodule Bluez.Mgmt do
   `{:error, :no_adapter_index}` until `Bluez.Client` has resolved the
   adapter, so nothing is ever left on the `hci0` fallback.
 
+  ## Software rotation
+
+  Controllers without extended advertising (e.g. the Raspberry Pi's
+  onboard BCM43438) have one advertising set; the kernel shares it
+  between instances in software, roughly 2 s per instance. Accepting an
+  instance there doesn't mean it is on air yet, so with another instance
+  active (bluetoothd's, say) a short `duration_ms:` advertisement could be
+  removed before it ever transmits. `advertise/2` therefore refuses a
+  finite `duration_ms:` with `{:error, :rotation_busy}` when the
+  controller lacks hardware offload (`Bluez.Hci.adv_hw_offload?/1`) and any
+  other instance is registered. Every request reads the controller's
+  advertising features first to decide this.
+
   ## Address
 
   The kernel picks the advertising address: a **connectable** instance
@@ -88,8 +101,9 @@ defmodule Bluez.Mgmt do
 
   Returns `{:ok, instance}` once the kernel has accepted the data, or
   `{:error, reason}` — a MGMT status atom (`:busy`, `:invalid_params`,
-  `:rejected`, `:not_supported`, …), `:too_long`, `{:invalid, message}`
-  for bad options, or `:not_running`.
+  `:rejected`, `:not_supported`, …), `:no_free_instance`, `:rotation_busy`
+  (see "Software rotation"), `:too_long`, `{:invalid, message}` for bad
+  options, or `:not_running`.
   """
   @spec advertise(binary(), keyword()) :: {:ok, byte()} | {:error, term()}
   def advertise(adv_data, opts \\ []) when is_binary(adv_data) do
@@ -244,8 +258,11 @@ defmodule Bluez.Mgmt do
 
   def handle_call({:stop_advertising, instance}, from, state) do
     case Map.fetch(state.instances, instance) do
-      {:ok, _entry} ->
-        {:noreply, cleanup(state, instance, from)}
+      # :current — an explicit stop removes whatever occupies the instance
+      # when it runs, including a replacement that lands meanwhile.
+      {:ok, entry} ->
+        state = mark_removing(state, instance)
+        {:noreply, enqueue(state, remove_job(entry.index, instance, :current, from))}
 
       :error ->
         {:reply, {:error, :unknown_instance}, state}
@@ -345,9 +362,10 @@ defmodule Bluez.Mgmt do
 
   # ── job queue ─────────────────────────────────────────────────────────────
 
-  # `gen` ties a removal to the advertisement it was queued for: if the
-  # instance has been re-advertised by the time it runs, the removal is
-  # stale and skipped (see start_job/2).
+  # `gen` ties an automatic removal (expiry, owner exit) to the
+  # advertisement it was queued for: if the instance has been re-advertised
+  # by the time it runs, the removal is stale and skipped (see start_job/2).
+  # An explicit stop passes `:current` instead.
   defp remove_job(index, instance, gen, from) do
     %{
       from: from,
@@ -367,16 +385,23 @@ defmodule Bluez.Mgmt do
 
   defp next(state), do: state
 
-  # Advertise needs the default instance first, which may need a Read
-  # Advertising Features round-trip; resolve the steps lazily.
+  # Every advertise starts with Read Advertising Features: it picks the
+  # default instance and tells whether the controller rotates instances in
+  # software (see prepared/4).
   defp start_job(state, %{kind: {:advertise, index, adv_data, opts}} = job) do
-    case opts[:instance] do
-      nil ->
-        steps = [{Hci.op_read_adv_features(), index, <<>>}]
-        send_step(state, %{job | steps: steps, kind: {:pick_instance, index, adv_data, opts}})
+    steps = [{Hci.op_read_adv_features(), index, <<>>}]
+    send_step(state, %{job | steps: steps, kind: {:prepare, index, adv_data, opts}})
+  end
 
-      instance ->
-        start_advertise(state, job, index, instance, adv_data, opts)
+  defp start_job(state, %{kind: {:remove, instance, :current}} = job) do
+    case state.instances[instance] do
+      %{index: index, gen: gen} ->
+        state = mark_removing(state, instance)
+        steps = [{Hci.op_remove_advertising(), index, <<instance>>}]
+        send_step(state, %{job | kind: {:remove, instance, gen}, steps: steps})
+
+      nil ->
+        finish(state, job, :ok)
     end
   end
 
@@ -433,12 +458,10 @@ defmodule Bluez.Mgmt do
 
   defp step_done(state, _opcode, _result), do: state
 
-  defp complete(state, %{kind: {:pick_instance, index, adv_data, opts}} = job, params) do
-    with {:ok, features} <- Hci.decode_adv_features(params),
-         instance when is_integer(instance) <- pick_instance(state, index, features) do
-      start_advertise(state, job, index, instance, adv_data, opts)
-    else
-      _other -> finish(state, job, {:error, :no_free_instance})
+  defp complete(state, %{kind: {:prepare, index, adv_data, opts}} = job, params) do
+    case Hci.decode_adv_features(params) do
+      {:ok, features} -> prepared(state, job, {index, adv_data, opts}, features)
+      :error -> finish(state, job, {:error, :malformed_reply})
     end
   end
 
@@ -528,15 +551,41 @@ defmodule Bluez.Mgmt do
     %{state | instances: Map.put(state.instances, instance, entry)}
   end
 
+  # Automatic removal (expiry, owner exit) of exactly this advertisement.
+  defp cleanup(state, instance, from) do
+    state = mark_removing(state, instance)
+    entry = state.instances[instance]
+    enqueue(state, remove_job(entry.index, instance, entry.gen, from))
+  end
+
   # Start taking `instance` off air. It stays tracked (flagged `removing`)
   # until the kernel confirms, so a failed removal is still covered by
   # stop_advertising/1 and shutdown; owner and duration triggers are spent.
-  defp cleanup(state, instance, from) do
+  defp mark_removing(state, instance) do
     entry = Map.fetch!(state.instances, instance)
     if entry.owner_ref, do: Process.demonitor(entry.owner_ref, [:flush])
-    entry = %{entry | owner_ref: nil, timer: nil, removing: true}
-    state = put_in(state.instances[instance], entry)
-    enqueue(state, remove_job(entry.index, instance, entry.gen, from))
+    put_in(state.instances[instance], %{entry | owner_ref: nil, timer: nil, removing: true})
+  end
+
+  # With the controller's features in hand: settle the instance, and refuse
+  # a finite advertisement the kernel would only rotate in. Without hardware
+  # offload, instances share the air in ~2 s software slots, so with another
+  # instance active a short `duration_ms:` can be removed before it ever
+  # transmits — while add/data report success.
+  defp prepared(state, job, {index, adv_data, opts}, features) do
+    instance = opts[:instance] || pick_instance(state, index, features)
+
+    cond do
+      instance == nil ->
+        finish(state, job, {:error, :no_free_instance})
+
+      opts[:duration_ms] != nil and not Hci.adv_hw_offload?(features.supported_flags) and
+          Enum.any?(features.instances, &(&1 != instance)) ->
+        finish(state, job, {:error, :rotation_busy})
+
+      true ->
+        start_advertise(state, job, index, instance, adv_data, opts)
+    end
   end
 
   # Highest instance that is free on the controller or already ours there

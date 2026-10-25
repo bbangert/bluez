@@ -64,6 +64,7 @@ defmodule Bluez.Hci do
     secondary_2m: 1 <<< 8,
     secondary_coded: 1 <<< 9
   }
+  @adv_flag_hw_offload 1 <<< 11
   @adv_param_duration 1 <<< 12
   @adv_param_timeout 1 <<< 13
   @adv_param_intervals 1 <<< 14
@@ -178,11 +179,12 @@ defmodule Bluez.Hci do
 
   @doc """
   Native `struct sockaddr_hci` for `:socket.bind/2`: family, then device
-  index and channel, both little-endian `u16`.
+  index and channel, both host-endian `unsigned short` (unlike the
+  little-endian fields inside HCI/MGMT packets).
   """
   @spec sockaddr(non_neg_integer(), non_neg_integer()) :: :socket.sockaddr_native()
   def sockaddr(index, channel),
-    do: %{family: @af_bluetooth, addr: <<index::little-16, channel::little-16>>}
+    do: %{family: @af_bluetooth, addr: <<index::native-16, channel::native-16>>}
 
   @doc """
   Native `struct hci_ufilter` (16 bytes incl. tail padding) passing only
@@ -348,6 +350,15 @@ defmodule Bluez.Hci do
   @doc "Opcode of MGMT Add Extended Advertising Data."
   @spec op_add_ext_adv_data() :: non_neg_integer()
   def op_add_ext_adv_data, do: @mgmt_op_add_ext_adv_data
+
+  @doc """
+  Whether the controller runs advertising instances as concurrent
+  hardware sets (`MGMT_ADV_FLAG_HW_OFFLOAD` in Read Advertising Features'
+  supported flags — set exactly when it is extended-advertising capable).
+  Without it the kernel rotates instances in software, one at a time.
+  """
+  @spec adv_hw_offload?(non_neg_integer()) :: boolean()
+  def adv_hw_offload?(supported_flags), do: (supported_flags &&& @adv_flag_hw_offload) != 0
 
   @doc "The advertising flag names `adv_flags/1` accepts."
   @spec adv_flag_names() :: [atom()]
