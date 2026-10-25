@@ -31,6 +31,7 @@ defmodule Bluez.DevicePath do
   """
 
   @adapter_path_key {Bluez, :adapter_path}
+  @resolved_adapter_key {Bluez, :resolved_adapter_path}
   @desired_adapter_key {Bluez, :desired_adapter}
   @default_adapter_path "/org/bluez/hci0"
   @max_address 0xFFFFFFFFFFFF
@@ -41,6 +42,31 @@ defmodule Bluez.DevicePath do
   """
   @spec adapter_path() :: String.t()
   def adapter_path, do: :persistent_term.get(@adapter_path_key, @default_adapter_path)
+
+  @doc """
+  The adapter path `Bluez.Client` resolved, or `:error` while it hasn't
+  yet (when `adapter_path/0` still answers the `/org/bluez/hci0`
+  default). For callers that must not act on the fallback — e.g. anything
+  that leaves state on a controller and has to clean it up on the same one.
+  """
+  @spec resolved_adapter_path() :: {:ok, String.t()} | :error
+  def resolved_adapter_path do
+    case :persistent_term.get(@resolved_adapter_key, nil) do
+      nil -> :error
+      path -> {:ok, path}
+    end
+  end
+
+  @doc """
+  The `:persistent_term` key behind `resolved_adapter_path/0`. Unlike
+  `adapter_path_key/0` (which keeps the last selection so device-path
+  conversions stay stable), this one is cleared each time `Bluez.Client`
+  starts and written once it has resolved the adapter — a value here
+  always belongs to the running Client incarnation, never a previous one
+  (e.g. across a radio switch).
+  """
+  @spec resolved_adapter_key() :: tuple()
+  def resolved_adapter_key, do: @resolved_adapter_key
 
   @doc """
   The `:persistent_term` key the resolved adapter path is published

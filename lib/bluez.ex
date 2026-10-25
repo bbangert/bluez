@@ -30,7 +30,15 @@ defmodule Bluez do
        after the scanning/GATT clients so an audio-daemon fault never
        restarts the scanning stack — the children that follow *do* restart
        with it under `:rest_for_one`, which is intended (same audio path).
-    8. `extra_children:` — host-supplied child specs, appended last.
+    8. Opt-in raw radio access, each only when its option is given, in
+       this order: `Bluez.Radio` and `Bluez.Mgmt` (`mgmt:`), then
+       `Bluez.AdvertReceiver` (`advert_receiver:`). After audio so their
+       faults never touch it. The Radio comes first: Mgmt subscribes to
+       it, and if it restarts its leases are gone, so Mgmt restarts with
+       it. The receiver — stateless, and running the host's `on_report:`
+       code, which may raise — comes last so its crashes never restart the
+       transmitter. A bluetoothd restart rebuilds all of them.
+    9. `extra_children:` — host-supplied child specs, appended last.
 
   ## Options
 
@@ -48,6 +56,12 @@ defmodule Bluez do
       `Bluez.BlueAlsa` client. Requires bluez-alsa (v4 recommended) on the
       device.
     * `blue_alsa:` — keyword opts for `Bluez.BlueAlsa` (`pubsub:`).
+    * `mgmt:` — `true` or keyword opts: start `Bluez.Mgmt` (raw-AD
+      advertising via the kernel MGMT socket) and `Bluez.Radio`, whose
+      lease a process must hold to send through it. Off by default.
+    * `advert_receiver:` — `true` or keyword opts (`on_report:`, …): start
+      `Bluez.AdvertReceiver` (verbatim advertising reports off the HCI
+      raw channel). Off by default.
     * `extra_children:` — host child specs appended at the end of the tree.
       Under `:rest_for_one` they restart with the audio path, and a fault
       there never disturbs the scanning/GATT stack above them. Ordering
@@ -208,6 +222,7 @@ defmodule Bluez do
       {__MODULE__.Gatt, Keyword.get(opts, :gatt, [])}
     ] ++
       audio_children(opts) ++
+      radio_children(opts) ++
       Keyword.get(opts, :extra_children, [])
   end
 
@@ -243,6 +258,36 @@ defmodule Bluez do
       ]
     else
       []
+    end
+  end
+
+  # Opt-in raw radio access (advertising TX, verbatim advert RX). After
+  # audio: a fault here only restarts these and extra_children. Radio (the
+  # lease authority) ahead of Mgmt: its restart ends every lease, so Mgmt
+  # restarts after it and takes its adverts off air too. The stateless
+  # receiver, which runs host code (on_report:), last so its faults never
+  # restart the transmitter.
+  defp radio_children(opts) do
+    transmit =
+      case child_opts(opts, :mgmt) do
+        nil -> []
+        mgmt_opts -> [{__MODULE__.Radio, []}, {__MODULE__.Mgmt, mgmt_opts}]
+      end
+
+    receiver =
+      case child_opts(opts, :advert_receiver) do
+        nil -> []
+        receiver_opts -> [{__MODULE__.AdvertReceiver, receiver_opts}]
+      end
+
+    transmit ++ receiver
+  end
+
+  defp child_opts(opts, key) do
+    case Keyword.get(opts, key) do
+      true -> []
+      child_opts when is_list(child_opts) -> child_opts
+      _off -> nil
     end
   end
 
