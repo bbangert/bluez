@@ -166,6 +166,9 @@ payload as a 16-bit Service UUID list, where order and repeated values
   on duration, owner exit, `stop_advertising/1`, or shutdown. Both
   advertisers wait for `Bluez.Client` to resolve the adapter rather than
   act on the `hci0` fallback, and clean up on the adapter they used.
+  Because `bluetoothd` can't see `Bluez.Mgmt`'s instances, the
+  Advertiser refuses (`{:error, :instance_conflict}`) to register while
+  bluetoothd's next allocation could land on one of them.
 - **`Bluez.AdvertReceiver`** (`HCI_CHANNEL_RAW` socket with a kernel
   filter for LE Meta events). Listens to the controller's legacy and
   extended advertising reports while `Bluez.Client` scans, and hands each

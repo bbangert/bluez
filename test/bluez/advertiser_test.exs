@@ -175,6 +175,35 @@ defmodule Bluez.AdvertiserTest do
       assert Task.await(stopper) == :ok
     end
 
+    test "refuses while Bluez.Mgmt holds an instance bluetoothd would hand out next",
+         %{svr: svr, adv: adv} do
+      # Mgmt on hci0 (the adapter these tests advertise on) holds instance 1:
+      # bluetoothd, unaware of it, would allocate 1 for our first advert.
+      mgmt = mgmt_holding(1)
+
+      assert Advertiser.advertise(%{type: :broadcast}, server: adv, mgmt: mgmt) ==
+               {:error, :instance_conflict}
+
+      refute_receive {^svr, %Message{header_fields: %{member: "RegisterAdvertisement"}}}, 50
+    end
+
+    test "registers alongside a Bluez.Mgmt instance bluetoothd can't reach",
+         %{svr: svr, adv: adv} do
+      mgmt = mgmt_holding(5)
+      owner = self()
+
+      task =
+        Task.async(fn ->
+          Advertiser.advertise(%{type: :broadcast}, server: adv, mgmt: mgmt, owner: owner)
+        end)
+
+      assert_receive {^svr, %Message{header_fields: %{member: "RegisterAdvertisement"}} = reg},
+                     1_000
+
+      reply(svr, reg)
+      assert {:ok, _id} = Task.await(task)
+    end
+
     test "a BlueZ error is returned and the object is dropped", %{svr: svr, adv: adv} do
       task = Task.async(fn -> Advertiser.advertise(%{type: :broadcast}, server: adv) end)
 
@@ -232,6 +261,41 @@ defmodule Bluez.AdvertiserTest do
              {:error, :not_running}
 
     assert Advertiser.stop(1, :no_such_adv) == :ok
+  end
+
+  # A Bluez.Mgmt (against a scripted kernel) holding `instance` on hci0.
+  defp mgmt_holding(instance) do
+    test_pid = self()
+
+    open = fn ->
+      {proc, kernel} = Bluez.TestSocketPair.open()
+      :ok = :socket.setopt(kernel, :otp, :controlling_process, test_pid)
+      send(test_pid, {:kernel, kernel})
+      {:ok, proc}
+    end
+
+    mgmt = start_supervised!({Bluez.Mgmt, name: nil, adapter_index: 0, open: open})
+    assert_receive {:kernel, kernel}
+
+    task =
+      Task.async(fn ->
+        Bluez.Mgmt.advertise(<<2, 1, 6>>, server: mgmt, instance: instance, owner: test_pid)
+      end)
+
+    for {opcode, rp} <- [{0x0054, <<instance, 0, 31, 31>>}, {0x0055, <<instance>>}] do
+      {:ok, <<^opcode::little-16, _::binary>>} = :socket.recv(kernel, 0, 1_000)
+      reply = <<opcode::little-16, 0, rp::binary>>
+
+      :ok =
+        :socket.send(
+          kernel,
+          <<1::little-16, 0::little-16, byte_size(reply)::little-16, reply::binary>>
+        )
+    end
+
+    assert Task.await(task) == {:ok, instance}
+    assert Bluez.Mgmt.held_instances(mgmt) == [{0, instance}]
+    mgmt
   end
 
   defp wait_until(fun, tries \\ 50) do

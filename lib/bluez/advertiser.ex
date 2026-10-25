@@ -27,6 +27,20 @@ defmodule Bluez.Advertiser do
   because `bluetoothd` calls `Properties.GetAll` back on us before
   `RegisterAdvertisement` returns.
 
+  ## Sharing the controller with `Bluez.Mgmt`
+
+  Advertising instances are per controller, and `bluetoothd` allocates
+  them from its own bookkeeping, which doesn't include instances
+  `Bluez.Mgmt` adds directly through the kernel. It always takes the
+  lowest number it considers free, so with *n* of our advertisements on a
+  controller its next pick is at most *n + 1*. `advertise/2` therefore
+  refuses with `{:error, :instance_conflict}` while `Bluez.Mgmt` holds an
+  instance in that range — rather than let BlueZ silently overwrite the
+  raw advertisement (and `Bluez.Mgmt`'s later cleanup then remove this
+  one). `Bluez.Mgmt` defaults to the controller's highest free instance,
+  so on controllers with several instances both can run side by side; on
+  a one-instance controller they take turns.
+
   ## Start options
 
     * `adapter_path:` — the adapter object path to advertise on (default:
@@ -52,7 +66,7 @@ defmodule Bluez.Advertiser do
   use GenServer
   require Logger
 
-  alias Bluez.{DBus, DevicePath}
+  alias Bluez.{DBus, DevicePath, Hci}
   alias Bluez.Rebus.Message
 
   @adv_mgr_iface "org.bluez.LEAdvertisingManager1"
@@ -99,6 +113,13 @@ defmodule Bluez.Advertiser do
     * `:owner` — pid whose exit unregisters it (default: the caller;
       `nil` = none).
     * `:server` — the Advertiser to use (default `Bluez.Advertiser`).
+    * `:mgmt` — the `Bluez.Mgmt` whose instances to respect (default
+      `Bluez.Mgmt`; no effect when it isn't running).
+
+  Returns `{:error, :instance_conflict}` instead of registering when
+  `bluetoothd` could hand this advertisement an instance `Bluez.Mgmt`
+  holds on the same controller (see "Sharing the controller with
+  `Bluez.Mgmt`" above).
 
   Until `Bluez.Client` has resolved the adapter (and without the
   `adapter_path:` start option) this returns `{:error, :no_adapter}`
@@ -113,7 +134,8 @@ defmodule Bluez.Advertiser do
     # shared server and lose every other advertisement's state.
     with :ok <- validate_opts(opts),
          {:ok, props} <- properties(spec) do
-      server_call(server, {:advertise, props, opts})
+      held = Bluez.Mgmt.held_instances(Keyword.get(opts, :mgmt, Bluez.Mgmt))
+      server_call(server, {:advertise, props, opts, held})
     end
   end
 
@@ -247,10 +269,13 @@ defmodule Bluez.Advertiser do
   end
 
   @impl GenServer
-  def handle_call({:advertise, props, opts}, from, state) do
-    case adapter_path(state) do
-      {:ok, adapter} -> start_registration(state, adapter, props, opts, from)
+  def handle_call({:advertise, props, opts, mgmt_held}, from, state) do
+    with {:ok, adapter} <- adapter_path(state),
+         :ok <- check_mgmt_conflict(state, adapter, mgmt_held) do
+      start_registration(state, adapter, props, opts, from)
+    else
       :error -> {:reply, {:error, :no_adapter}, state}
+      {:error, _reason} = error -> {:reply, error, state}
     end
   end
 
@@ -269,6 +294,25 @@ defmodule Bluez.Advertiser do
 
       :error ->
         {:reply, :ok, state}
+    end
+  end
+
+  # bluetoothd allocates the lowest instance its own bookkeeping shows as
+  # free — it doesn't know Bluez.Mgmt's — so with `count` of our
+  # advertisements on this controller its next pick is at most count + 1.
+  # Any Mgmt instance in that range could be silently taken over.
+  defp check_mgmt_conflict(state, adapter, mgmt_held) do
+    case Hci.adapter_index(adapter) do
+      {:ok, index} ->
+        count = Enum.count(state.ads, fn {_id, entry} -> entry.adapter == adapter end)
+        reachable = fn {held_index, instance} -> held_index == index and instance <= count + 1 end
+
+        if Enum.any?(mgmt_held, reachable), do: {:error, :instance_conflict}, else: :ok
+
+      # Not an hciN path (only from an explicit adapter_path:): no index
+      # to compare, nothing Mgmt could hold there.
+      :error ->
+        :ok
     end
   end
 

@@ -27,6 +27,13 @@ defmodule Bluez.Mgmt do
   when its owner process exits, on `stop_advertising/1`, and when this
   process stops.
 
+  `bluetoothd` doesn't know about instances added here, so a D-Bus
+  advertisement could later be given the same number and silently
+  overwrite one. `Bluez.Advertiser` guards against that by consulting
+  `held_instances/1` and refusing with `{:error, :instance_conflict}`
+  while bluetoothd's next pick could collide; on a one-instance
+  controller the two paths take turns.
+
   Without the `adapter_index:` start option, requests are refused with
   `{:error, :no_adapter_index}` until `Bluez.Client` has resolved the
   adapter, so nothing is ever left on the `hci0` fallback.
@@ -143,6 +150,19 @@ defmodule Bluez.Mgmt do
     do: server_call(server, :read_advertising_features)
 
   @doc """
+  The `{controller_index, instance}` pairs this process holds, including
+  one being set up right now. `bluetoothd` doesn't know about them, so
+  `Bluez.Advertiser` checks these before registering (see its moduledoc).
+  `[]` when not running.
+  """
+  @spec held_instances(GenServer.server()) :: [{non_neg_integer(), byte()}]
+  def held_instances(server \\ __MODULE__) do
+    GenServer.call(server, :held_instances)
+  catch
+    :exit, _reason -> []
+  end
+
+  @doc """
   Convenience for the common legacy layout: a Flags element (default
   `0x06`) followed by `elements`, encoded with `Bluez.AdData.encode/1`.
   Raises `ArgumentError` when the result exceeds 31 bytes.
@@ -225,6 +245,18 @@ defmodule Bluez.Mgmt do
       :error ->
         {:reply, {:error, :unknown_instance}, state}
     end
+  end
+
+  def handle_call(:held_instances, _from, state) do
+    tracked = for {instance, entry} <- state.instances, do: {entry.index, instance}
+
+    in_flight =
+      case state.job do
+        %{kind: {:advertising, index, instance, _opts}} -> [{index, instance}]
+        _other -> []
+      end
+
+    {:reply, Enum.uniq(in_flight ++ tracked), state}
   end
 
   def handle_call(:read_advertising_features, from, state) do
