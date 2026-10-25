@@ -30,7 +30,7 @@ defmodule Bluez.RadioTest do
   end
 
   test "release ends the lease and notifies subscribers", %{radio: radio} do
-    :ok = Radio.subscribe(radio)
+    {:ok, ^radio} = Radio.subscribe(radio)
     {:ok, %Lease{ref: ref} = lease} = Radio.acquire(server: radio, adapter_index: 0)
 
     assert Radio.release(lease) == :ok
@@ -44,7 +44,7 @@ defmodule Bluez.RadioTest do
   end
 
   test "the holder exiting ends its lease, freeing the controller", %{radio: radio} do
-    :ok = Radio.subscribe(radio)
+    {:ok, ^radio} = Radio.subscribe(radio)
     test_pid = self()
 
     holder =
@@ -62,6 +62,52 @@ defmodule Bluez.RadioTest do
     assert {:ok, %Lease{holder: ^test_pid}} = Radio.acquire(server: radio, adapter_index: 0)
   end
 
+  test "a stale lease can't end its successor", %{radio: radio} do
+    {:ok, ^radio} = Radio.subscribe(radio)
+    {holder, %Lease{ref: old_ref} = old} = Bluez.TestLeaseHolder.start(radio)
+    assert Bluez.TestLeaseHolder.call(holder, &Radio.release/1) == :ok
+    assert_receive {:radio_lease_ended, ^old_ref}
+
+    # The controller is re-acquired; the old lease is now stale.
+    {:ok, %Lease{ref: new_ref} = new} = Radio.acquire(server: radio, adapter_index: 0)
+    assert Radio.release(old) == :ok
+    refute Radio.valid?(old)
+    assert Radio.valid?(new)
+
+    # Nor does the old holder's exit, after it released.
+    Bluez.TestLeaseHolder.stop(holder)
+    assert Radio.valid?(new)
+    refute_received {:radio_lease_ended, ^new_ref}
+  end
+
+  test "every subscriber is notified, once each; dead ones are dropped", %{radio: radio} do
+    test_pid = self()
+
+    _forwarder =
+      spawn_link(fn ->
+        {:ok, ^radio} = Radio.subscribe(radio)
+        send(test_pid, :subscribed)
+        receive do: (msg -> send(test_pid, {:forwarded, msg}))
+      end)
+
+    assert_receive :subscribed
+    {:ok, ^radio} = Radio.subscribe(radio)
+    # Subscribing twice doesn't double the notifications.
+    {:ok, ^radio} = Radio.subscribe(radio)
+    gone = spawn(fn -> {:ok, ^radio} = Radio.subscribe(radio) end)
+    ref = Process.monitor(gone)
+    assert_receive {:DOWN, ^ref, :process, ^gone, _}
+
+    {:ok, %Lease{ref: lease_ref} = lease} = Radio.acquire(server: radio, adapter_index: 0)
+    :ok = Radio.release(lease)
+
+    assert_receive {:radio_lease_ended, ^lease_ref}
+    refute_received {:radio_lease_ended, _}
+    assert_receive {:forwarded, {:radio_lease_ended, ^lease_ref}}
+    # The Radio's own DOWN for it may still be on its way: poll.
+    assert eventually(fn -> not Map.has_key?(:sys.get_state(radio).subscribers, gone) end)
+  end
+
   test "check_holder/1 accepts only a lease held by the caller", %{radio: radio} do
     {:ok, lease} = Radio.acquire(server: radio, adapter_index: 0)
     assert Radio.check_holder(lease) == :ok
@@ -77,7 +123,21 @@ defmodule Bluez.RadioTest do
              {:error, {:invalid, "adapter_index"}}
 
     assert Radio.acquire(server: :no_such_radio, adapter_index: 0) == {:error, :not_running}
-    assert Radio.subscribe(:no_such_radio) == :ok
+    assert Radio.subscribe(:no_such_radio) == {:error, :not_running}
     assert Radio.holder(0, :no_such_radio) == nil
+  end
+
+  defp eventually(fun, tries \\ 100) do
+    cond do
+      fun.() ->
+        true
+
+      tries == 0 ->
+        false
+
+      true ->
+        Process.sleep(10)
+        eventually(fun, tries - 1)
+    end
   end
 end

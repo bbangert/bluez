@@ -51,12 +51,16 @@ defmodule Bluez.Advertiser do
 
   The check is exact because of the lease: only the holder sends on the
   controller, and each send returns only once BlueZ (or the kernel) has
-  the instance — so no other send can slip in between check and use.
+  the instance — so no other send can slip in between check and use. A
+  `Bluez.Mgmt` that doesn't answer counts as a conflict.
+
+  An unregistration BlueZ refuses after its lease ended — so no holder is
+  left to retry it — is retried here a few times.
 
   ## Start options
 
-    * `radio:` — the `Bluez.Radio` to subscribe to for lease ends
-      (default `Bluez.Radio`).
+    * `radio:` — the `Bluez.Radio` whose leases to accept (default
+      `Bluez.Radio`); leases from any other are refused.
     * `name:` — registered name (default `Bluez.Advertiser`).
 
   ## Advertisement spec
@@ -87,6 +91,10 @@ defmodule Bluez.Advertiser do
 
   @path_prefix "/org/exbluez/advertiser/adv"
   @call_timeout 10_000
+
+  # Retries of an unregistration BlueZ refused after its lease ended.
+  @orphan_retries 3
+  @orphan_retry_ms 2_000
 
   @type spec :: %{
           required(:type) => :broadcast | :peripheral,
@@ -263,19 +271,24 @@ defmodule Bluez.Advertiser do
     case connect.() do
       {:ok, conn} ->
         Bluez.Rebus.set_method_handler(conn, self())
-        # Lease ends arrive as {:radio_lease_ended, ref}.
-        :ok = Radio.subscribe(Keyword.get(opts, :radio, Radio))
 
         state = %{
           conn: conn,
           conn_ref: Process.monitor(conn),
+          # Test seam: the delay between orphan-unregistration retries.
+          retry_ms: Keyword.get(opts, :retry_ms, @orphan_retry_ms),
+          # The Radio whose lease ends we receive (see subscribe/1).
+          radio: Keyword.get(opts, :radio, Radio),
+          radio_pid: nil,
+          radio_mon: nil,
           next_id: 1,
-          # id => %{props, adapter, index, lease_ref, timer, cancelled,
-          #         waiters, status: :registering | :active | :unregistering}
+          # id => %{props, adapter, index, lease_ref, lease_ended, retries,
+          #         timer, cancelled, waiters,
+          #         status: :registering | :active | :unregistering}
           ads: %{}
         }
 
-        {:ok, state}
+        {:ok, subscribe(state)}
 
       {:error, reason} ->
         {:stop, {:dbus_connect_failed, reason}}
@@ -284,8 +297,10 @@ defmodule Bluez.Advertiser do
 
   @impl GenServer
   def handle_call({:advertise, lease, props, opts, mgmt_held}, from, state) do
+    state = subscribe(state)
+
     cond do
-      not Radio.valid?(lease) ->
+      not lease_valid?(state, lease) ->
         {:reply, {:error, :lease_expired}, state}
 
       mgmt_conflict?(state, lease.index, mgmt_held) ->
@@ -321,7 +336,10 @@ defmodule Bluez.Advertiser do
   # bluetoothd allocates the lowest instance its own bookkeeping shows as
   # free — it doesn't know Bluez.Mgmt's — so with `count` of our
   # advertisements on this controller its next pick is at most count + 1.
-  # Any Mgmt instance in that range could be silently taken over.
+  # Any Mgmt instance in that range could be silently taken over. A Mgmt
+  # that didn't answer may hold any of them.
+  defp mgmt_conflict?(_state, _index, :unknown), do: true
+
   defp mgmt_conflict?(state, index, mgmt_held) do
     count = Enum.count(state.ads, fn {_id, entry} -> entry.index == index end)
 
@@ -342,6 +360,9 @@ defmodule Bluez.Advertiser do
       adapter: adapter,
       index: lease.index,
       lease_ref: lease.ref,
+      # Its lease is over: nobody is left to retry a failed unregister.
+      lease_ended: false,
+      retries: 0,
       timer: nil,
       status: :registering,
       # Stopped while registering: unregister as soon as BlueZ answers.
@@ -380,7 +401,7 @@ defmodule Bluez.Advertiser do
       # Stopped (lease end, Release) while registering: take it
       # straight back off air, answering the waiting stop callers when done.
       {{:ok, _}, {:ok, entry}} ->
-        GenServer.reply(from, {:error, :stopped})
+        GenServer.reply(from, {:error, if(entry.lease_ended, do: :lease_expired, else: :stopped)})
         {:noreply, begin_unregister(state, id, entry.waiters)}
 
       # Our call timed out (or the connection hiccuped): BlueZ may still
@@ -414,11 +435,13 @@ defmodule Bluez.Advertiser do
         {:noreply, unregistered(state, id, entry)}
 
       # Refused or timed out: it may still be on air, so keep tracking it
-      # (stop/3 can retry; its duration trigger is spent).
+      # (stop/3 can retry — or, after its lease ended, retry_orphan/2; its
+      # duration trigger is spent).
       {{:error, reason}, {:ok, entry}} ->
         Logger.warning("Bluez.Advertiser: unregistering #{path(id)} failed: #{inspect(reason)}")
         Enum.each(entry.waiters, &GenServer.reply(&1, {:error, reason}))
-        {:noreply, put_in(state.ads[id], %{entry | status: :active, waiters: []})}
+        state = put_in(state.ads[id], %{entry | status: :active, waiters: []})
+        {:noreply, retry_orphan(state, id)}
     end
   end
 
@@ -432,12 +455,69 @@ defmodule Bluez.Advertiser do
 
   # The lease ended (released, or its holder exited): unregister
   # everything sent under it.
-  def handle_info({:radio_lease_ended, ref}, state) do
-    ids = for {id, %{lease_ref: ^ref}} <- state.ads, do: id
-    {:noreply, Enum.reduce(ids, state, &unregister(&2, &1))}
+  def handle_info({:radio_lease_ended, ref}, state),
+    do: {:noreply, end_leases(state, &(&1 == ref))}
+
+  # The Radio went away, and every lease with it. The next send
+  # re-subscribes (to its restarted incarnation, when registered by name).
+  def handle_info({:DOWN, mon, :process, _pid, _reason}, %{radio_mon: mon} = state) do
+    state = %{state | radio_pid: nil, radio_mon: nil}
+    {:noreply, end_leases(state, fn _ref -> true end)}
+  end
+
+  def handle_info({:retry_unregister, id}, state) do
+    case state.ads do
+      %{^id => %{status: :active}} -> {:noreply, begin_unregister(state, id, [])}
+      _other -> {:noreply, state}
+    end
   end
 
   def handle_info(_other, state), do: {:noreply, state}
+
+  # Lease ends come from the Radio we subscribed to (and monitor); a lease
+  # from any other would end without telling us, so it is refused. Retried
+  # on each send while no Radio was reachable.
+  defp subscribe(%{radio_pid: nil} = state) do
+    case Radio.subscribe(state.radio) do
+      {:ok, pid} -> %{state | radio_pid: pid, radio_mon: Process.monitor(pid)}
+      {:error, :not_running} -> state
+    end
+  end
+
+  defp subscribe(state), do: state
+
+  defp lease_valid?(%{radio_pid: pid}, %Lease{radio: pid} = lease) when is_pid(pid),
+    do: Radio.valid?(lease)
+
+  defp lease_valid?(_state, _lease), do: false
+
+  # Unregister everything sent under the leases `ended?` matches.
+  defp end_leases(state, ended?) do
+    ids = for {id, %{lease_ref: ref}} <- state.ads, ended?.(ref), do: id
+
+    Enum.reduce(ids, state, fn id, state ->
+      state = put_in(state.ads[id].lease_ended, true)
+      unregister(state, id)
+    end)
+  end
+
+  # An unregister refused after its lease ended has no holder left to
+  # retry it: retry it here, a few times, before leaving it to BlueZ
+  # (which drops it when this process's bus connection closes).
+  defp retry_orphan(state, id) do
+    case state.ads[id] do
+      %{lease_ended: true, retries: n} when n < @orphan_retries ->
+        Process.send_after(self(), {:retry_unregister, id}, state.retry_ms)
+        put_in(state.ads[id].retries, n + 1)
+
+      %{lease_ended: true} ->
+        Logger.warning("Bluez.Advertiser: giving up unregistering #{path(id)}")
+        state
+
+      _live_lease ->
+        state
+    end
+  end
 
   defp unregistered(state, id, entry) do
     Enum.each(entry.waiters, &GenServer.reply(&1, :ok))

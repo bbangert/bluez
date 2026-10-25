@@ -24,6 +24,9 @@ defmodule Bluez.Radio do
     * The lease ends on `release/1` or when the holder exits. Every
       advertisement sent under it is then taken off air (subscribers —
       the transmitters — get `{:radio_lease_ended, ref}`).
+    * If the Radio itself stops, every lease ends with it: the
+      transmitters (which monitor it) take everything off air, and sends
+      return `{:error, :lease_expired}` until a new lease is acquired.
 
   The controller defaults to the adapter `Bluez.Client` resolved
   (`Bluez.DevicePath.resolved_adapter_path/0`); until it has,
@@ -63,7 +66,8 @@ defmodule Bluez.Radio do
   resolved), `:server` (default `Bluez.Radio`).
 
   Returns `{:ok, lease}`, `{:error, {:held_by, pid}}`,
-  `{:error, :no_adapter_index}` or `{:error, :not_running}`.
+  `{:error, :no_adapter_index}`, `{:error, {:invalid, "adapter_index"}}`
+  or `{:error, :not_running}`.
   """
   @spec acquire(keyword()) :: {:ok, Lease.t()} | {:error, term()}
   def acquire(opts \\ []) do
@@ -74,7 +78,11 @@ defmodule Bluez.Radio do
     end
   end
 
-  @doc "End a lease, taking everything sent under it off air. `:ok` also when already ended."
+  @doc """
+  End a lease, taking everything sent under it off air. `:ok` also when
+  already ended. Any process holding the lease struct may end it (e.g. a
+  supervising process revoking it); only sending is holder-only.
+  """
   @spec release(Lease.t()) :: :ok
   def release(%Lease{radio: radio} = lease), do: call(radio, {:release, lease}, :ok)
 
@@ -93,10 +101,12 @@ defmodule Bluez.Radio do
 
   @doc """
   Subscribe the calling process to `{:radio_lease_ended, ref}` messages
-  (the transmitters do this in `init/1`). `:ok` even when not running.
+  (the transmitters do this). Returns `{:ok, radio_pid}` — leases from
+  any other Radio never notify the subscriber, so it should refuse them —
+  or `{:error, :not_running}`.
   """
-  @spec subscribe(GenServer.server()) :: :ok
-  def subscribe(server \\ __MODULE__), do: call(server, :subscribe, :ok)
+  @spec subscribe(GenServer.server()) :: {:ok, pid()} | {:error, :not_running}
+  def subscribe(server \\ __MODULE__), do: call(server, :subscribe, {:error, :not_running})
 
   @doc "The process holding the lease on controller `index`, or `nil`."
   @spec holder(non_neg_integer(), GenServer.server()) :: pid() | nil
@@ -171,10 +181,10 @@ defmodule Bluez.Radio do
 
   def handle_call(:subscribe, {pid, _tag}, state) do
     if Map.has_key?(state.subscribers, pid) do
-      {:reply, :ok, state}
+      {:reply, {:ok, self()}, state}
     else
       mon = Process.monitor(pid)
-      {:reply, :ok, %{state | subscribers: Map.put(state.subscribers, pid, mon)}}
+      {:reply, {:ok, self()}, %{state | subscribers: Map.put(state.subscribers, pid, mon)}}
     end
   end
 

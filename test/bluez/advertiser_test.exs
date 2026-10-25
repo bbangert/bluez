@@ -73,7 +73,7 @@ defmodule Bluez.AdvertiserTest do
       # init/1 blocks on the bus Hello until this test answers it.
       starter =
         Task.async(fn ->
-          GenServer.start(Advertiser, connect_fun: connect_fun, radio: radio)
+          GenServer.start(Advertiser, connect_fun: connect_fun, radio: radio, retry_ms: 20)
         end)
 
       assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}, 1_000
@@ -231,9 +231,9 @@ defmodule Bluez.AdvertiserTest do
       assert_unregister(svr, path)
     end
 
-    test "an advertisement registered after its lease ended is unregistered",
-         %{svr: svr, radio: radio, holder: holder} = ctx do
-      _ref = advertise_async(ctx, %{type: :broadcast})
+    test "an advertisement registered after its lease ended is reported expired and unregistered",
+         %{svr: svr, lease: lease} = ctx do
+      ref = advertise_async(ctx, %{type: :broadcast})
 
       assert_receive {^svr,
                       %Message{
@@ -242,10 +242,54 @@ defmodule Bluez.AdvertiserTest do
                       } = reg},
                      1_000
 
-      TestLeaseHolder.stop(holder)
-      wait_until(fn -> Radio.holder(0, radio) == nil end)
+      # The lease is revoked mid-registration.
+      :ok = Radio.release(lease)
       reply(svr, reg)
+      assert TestLeaseHolder.await(ref) == {:error, :lease_expired}
       assert_unregister(svr, path)
+    end
+
+    test "an unregister refused after its lease ended is retried",
+         %{svr: svr, adv: adv, lease: lease} = ctx do
+      {_id, path} = registered(ctx)
+
+      :ok = Radio.release(lease)
+      error(svr, assert_unregister(svr, path), "org.bluez.Error.Failed")
+
+      # No holder is left to retry it: the server does.
+      reply(svr, assert_unregister(svr, path))
+      assert wait_until(fn -> :sys.get_state(adv).ads == %{} end) == :ok
+    end
+
+    test "the Radio stopping ends every lease", %{svr: svr} = ctx do
+      {_id, path} = registered(ctx)
+
+      :ok = stop_supervised(Radio)
+      assert_unregister(svr, path)
+    end
+
+    test "a lease from another Radio is refused", %{svr: svr, adv: adv} do
+      other = start_supervised!({Radio, name: nil}, id: :other_radio)
+      {holder, _lease} = TestLeaseHolder.start(other, 1)
+
+      assert TestLeaseHolder.call(
+               holder,
+               &Advertiser.advertise(&1, %{type: :broadcast}, server: adv)
+             ) ==
+               {:error, :lease_expired}
+
+      refute_receive {^svr, %Message{header_fields: %{member: "RegisterAdvertisement"}}}, 50
+    end
+
+    test "a lease can't stop another lease's advertisement",
+         %{adv: adv, radio: radio} = ctx do
+      {id, _path} = registered(ctx)
+      {other, _lease} = TestLeaseHolder.start(radio, 1)
+
+      assert TestLeaseHolder.call(other, &Advertiser.stop(&1, id, adv)) ==
+               {:error, :unknown_advertisement}
+
+      assert %{^id => %{status: :active}} = :sys.get_state(adv).ads
     end
 
     test "only the lease holder may send, and only while the lease lasts",

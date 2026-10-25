@@ -173,21 +173,72 @@ defmodule Bluez.MgmtTest do
     assert expect_command(kernel, @remove) == <<2>>
   end
 
-  test "an instance landing after its lease ended is taken back off air",
-       %{radio: radio, kernel: kernel, holder: holder} = ctx do
-    _ref = advertise_async(ctx, <<2, 1, 6>>, instance: 2)
+  test "an instance landing after its lease ended is reported expired and taken back off air",
+       %{kernel: kernel, lease: lease} = ctx do
+    ref = advertise_async(ctx, <<2, 1, 6>>, instance: 2)
     answer_features(kernel)
     expect_command(kernel, @params)
 
-    # The holder dies with its send in flight; the lease end finds nothing
-    # tracked yet.
-    TestLeaseHolder.stop(holder)
-    assert eventually(fn -> Radio.holder(0, radio) == nil end)
+    # The lease is revoked with the send in flight; the lease end finds
+    # nothing tracked yet.
+    :ok = Radio.release(lease)
     complete(kernel, @params, 0, <<2, 0, 31, 31>>)
     expect_command(kernel, @data)
     complete(kernel, @data, 0, <<2>>)
 
+    assert await(ref) == {:error, :lease_expired}
     assert expect_command(kernel, @remove) == <<2>>
+  end
+
+  @tag mgmt_opts: [retry_ms: 20]
+  test "a removal refused after its lease ended is retried",
+       %{kernel: kernel, lease: lease} = ctx do
+    advertise_ok(ctx, 2)
+
+    :ok = Radio.release(lease)
+    assert expect_command(kernel, @remove) == <<2>>
+    complete(kernel, @remove, 0x0A)
+
+    # No holder is left to retry it: the server does.
+    assert expect_command(kernel, @remove) == <<2>>
+    complete(kernel, @remove, 0, <<2>>)
+    assert eventually(fn -> :sys.get_state(ctx.mgmt).instances == %{} end)
+  end
+
+  test "the Radio stopping ends every lease", %{kernel: kernel} = ctx do
+    advertise_ok(ctx, 2)
+
+    :ok = stop_supervised(Radio)
+    assert expect_command(kernel, @remove) == <<2>>
+  end
+
+  test "a lease from another Radio is refused", %{mgmt: mgmt, kernel: kernel} do
+    other = start_supervised!({Radio, name: nil}, id: :other_radio)
+    {holder, _lease} = TestLeaseHolder.start(other, 1)
+
+    assert TestLeaseHolder.call(holder, &Mgmt.advertise(&1, <<2, 1, 6>>, server: mgmt)) ==
+             {:error, :lease_expired}
+
+    assert {:error, :timeout} = :socket.recv(kernel, 0, 50)
+  end
+
+  test "a lease can't stop another lease's instance", %{mgmt: mgmt, radio: radio} = ctx do
+    advertise_ok(ctx, 4)
+    {other, _lease} = TestLeaseHolder.start(radio, 1)
+
+    assert TestLeaseHolder.call(other, &Mgmt.stop_advertising(&1, 4, mgmt)) ==
+             {:error, :unknown_instance}
+
+    assert %{4 => %{removing: false}} = :sys.get_state(mgmt).instances
+  end
+
+  test "held_instances/2 reports a wedged server as :unknown, not as holding nothing",
+       %{mgmt: mgmt} do
+    :ok = :sys.suspend(mgmt)
+    assert Mgmt.held_instances(mgmt, 50) == :unknown
+    :ok = :sys.resume(mgmt)
+    assert Mgmt.held_instances(mgmt) == []
+    assert Mgmt.held_instances(:no_such_mgmt) == []
   end
 
   test "only the lease holder may send, and only while the lease lasts",
@@ -341,7 +392,7 @@ defmodule Bluez.MgmtTest do
     assert await(ref) == {:error, :not_running}
   end
 
-  @tag mgmt_opts: [command_timeout: 50]
+  @tag mgmt_opts: [command_timeout: 250]
   test "a command the kernel never answers restarts the server; the caller gets an error",
        %{mgmt: mgmt, kernel: kernel} = ctx do
     mon = Process.monitor(mgmt)
