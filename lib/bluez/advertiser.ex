@@ -41,6 +41,12 @@ defmodule Bluez.Advertiser do
   so on controllers with several instances both can run side by side; on
   a one-instance controller they take turns.
 
+  The check is a snapshot, not a reservation: it can't see an
+  `Bluez.Mgmt.advertise/2` that starts after it, and `Bluez.Mgmt` can't
+  see a registration still in flight here. **Don't send through both on
+  the same controller concurrently** — issue them from one process (one
+  after the other), as a single protocol driver naturally does.
+
   ## Start options
 
     * `adapter_path:` — the adapter object path to advertise on (default:

@@ -32,7 +32,9 @@ defmodule Bluez.Mgmt do
   overwrite one. `Bluez.Advertiser` guards against that by consulting
   `held_instances/1` and refusing with `{:error, :instance_conflict}`
   while bluetoothd's next pick could collide; on a one-instance
-  controller the two paths take turns.
+  controller the two paths take turns. That check is a snapshot, not a
+  reservation, so don't advertise through both on the same controller
+  concurrently — drive them from one process.
 
   Without the `adapter_index:` start option, requests are refused with
   `{:error, :no_adapter_index}` until `Bluez.Client` has resolved the
