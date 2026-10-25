@@ -90,7 +90,6 @@ defmodule Bluez.Advertiser do
   @introspect_iface "org.freedesktop.DBus.Introspectable"
 
   @path_prefix "/org/exbluez/advertiser/adv"
-  @call_timeout 10_000
 
   # Retries of an unregistration BlueZ refused after its lease ended.
   @orphan_retries 3
@@ -279,9 +278,14 @@ defmodule Bluez.Advertiser do
     end
   end
 
-  # `catch :exit` idiom (see `Bluez`).
+  # `catch :exit` idiom (see `Bluez`): not running → error tuple. No call
+  # timeout: giving up while the request is still queued would let the
+  # holder carry on — say, send through Bluez.Mgmt — before this send has
+  # run, breaking the lease's one-send-at-a-time guarantee. The wait is
+  # bounded anyway: the server's handlers make only bounded calls, and the
+  # replies wait on D-Bus calls that carry their own timeouts.
   defp server_call(server, request) do
-    GenServer.call(server, request, @call_timeout)
+    GenServer.call(server, request, :infinity)
   catch
     :exit, _reason -> {:error, :not_running}
   end

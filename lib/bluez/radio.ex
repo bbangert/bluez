@@ -98,7 +98,7 @@ defmodule Bluez.Radio do
   # Polled rather than queued in the server: a waiter that gives up must
   # never be handed a lease it no longer expects.
   defp acquire_until(server, index, deadline) do
-    case call(server, {:acquire, index, self()}, {:error, :not_running}) do
+    case call(server, {:acquire, index, self()}, {:error, :not_running}, :infinity) do
       {:error, :draining} = draining ->
         if System.monotonic_time(:millisecond) < deadline do
           Process.sleep(@acquire_poll_ms)
@@ -177,8 +177,11 @@ defmodule Bluez.Radio do
   end
 
   # `catch :exit` idiom (see `Bluez`): not running → the given default.
-  defp call(server, request, default) do
-    GenServer.call(server, request)
+  # Acquisition waits without a timeout: a timed-out request stays queued,
+  # and would grant a lease the caller believes it never got. The Radio's
+  # handlers never block, so the wait is short.
+  defp call(server, request, default, timeout \\ 5_000) do
+    GenServer.call(server, request, timeout)
   catch
     :exit, _reason -> default
   end
