@@ -47,6 +47,72 @@ Start it under your supervision tree (directly, or under a
 `DynamicSupervisor` if you stop/start it at runtime — see "Switching
 radios").
 
+## Raw advertising and verbatim reports
+
+Opt in with `mgmt:` and/or `advert_receiver:` (each `true` or a keyword
+list):
+
+```elixir
+{Bluez,
+ client: [on_advertisement: &MyApp.Scanner.on_advertisement/1],
+ mgmt: true,
+ advert_receiver: [on_report: &MyApp.Beacons.on_report/1]}
+```
+
+`mgmt:` also starts `Bluez.Radio`. Sending needs the controller's lease:
+acquire it in the process that will send (typically the GenServer driving
+your protocol) and keep it for as long as that process transmits. That
+process is in charge of the controller: only it may send, and releasing
+the lease, or the process exiting, takes everything it sent off air. A
+send returning `{:error, :lease_expired}` means the lease is gone (e.g.
+`Bluez.Radio` restarted): acquire again.
+
+```elixir
+{:ok, lease} = Bluez.Radio.acquire(mode: :mgmt)
+```
+
+`acquire/1` returns `{:error, :no_adapter_index}` until `Bluez.Client`
+has resolved the adapter, and `{:error, {:held_by, pid}}` while another
+process holds it. Pass `adapter_index:` to pick a controller explicitly
+(e.g. a USB dongle next to an onboard radio). The first acquire fixes the
+controller's mode; `:mgmt` is the only one today.
+
+Send a payload as an ordered 16-bit UUID list (with Flags: exactly the
+31-byte legacy PDU for a 26-byte payload) for 300 ms:
+
+```elixir
+alias Bluez.AdData
+
+data = Bluez.Mgmt.legacy_adv_data([AdData.uuid16_list(payload)])
+{:ok, _instance} = Bluez.Mgmt.advertise(lease, data, duration_ms: 300)
+```
+
+Send an exact legacy advertising PDU (here Flags + Local Name + one
+128-bit UUID) at a 20–30 ms interval:
+
+```elixir
+data = Bluez.Mgmt.legacy_adv_data([AdData.local_name(name), AdData.uuid128_list([block])])
+{:ok, _instance} = Bluez.Mgmt.advertise(lease, data, duration_ms: 300)
+```
+
+Receive reports with the AD bytes as they were on air:
+
+```elixir
+def on_report(%{address: addr, rssi: rssi, data: data}) do
+  case Bluez.AdData.uuid16_list_payload(data) do
+    nil -> :ok
+    payload -> MyApp.Beacons.handle(addr, rssi, payload)
+  end
+end
+```
+
+`on_report:` runs in the receiver's process for every report the
+controller produces (far more than the deduplicated `on_advertisement:`
+stream), so filter cheaply and hand real work off. Reports only flow
+while `Bluez.Client` is scanning; prefer `:active` mode when every
+packet matters, since controllers that offload advertisement-monitor
+filtering can drop adverts in `:passive` mode.
+
 ## Advertisements
 
 `on_advertisement:` receives one map per emitted advert:

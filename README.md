@@ -44,6 +44,9 @@ The core modules carry the reference detail:
 - `Bluez.Gatt` — the GATT request API and event contract
 - `Bluez.Agent` — pairing authorization
 - `Bluez.BlueAlsa` — A2DP playback PCM discovery
+- `Bluez.Mgmt` — LE advertising with verbatim AD bytes (kernel MGMT)
+- `Bluez.Radio` — per-controller ownership for advertising
+- `Bluez.AdvertReceiver` — verbatim advertising reports off the HCI socket
 
 ## Features
 
@@ -66,6 +69,17 @@ The core modules carry the reference detail:
   connections.
 - **Pairing agent** that authorizes exactly the pairings your code
   initiated.
+- **LE advertising** (opt-in) — `Bluez.Mgmt` puts verbatim AD bytes on
+  air through the kernel MGMT socket, including layouts BlueZ's D-Bus API
+  refuses (Flags, names, 128-bit UUID lists, ordered 16-bit UUID lists
+  with duplicates), with a settable interval and millisecond-precise
+  durations, on any controller the kernel drives. It sends under a
+  `Bluez.Radio` lease: one owner per controller, and everything it sent
+  goes off air when the lease ends.
+- **Verbatim advert receive** (opt-in) — `Bluez.AdvertReceiver` reads the
+  controller's legacy and extended advertising reports off an HCI raw
+  socket, AD bytes untouched, for protocols that BlueZ's per-device
+  property merging would destroy. Pure `:socket`, no NIF or port.
 - **bluez-alsa integration** (optional) — enumerates ready-to-open A2DP
   playback PCMs and signals your app when the set changes.
 - **No host coupling** — configuration flows exclusively through
@@ -125,6 +139,10 @@ option surface and event contract.
 - dbus (this supervisor owns the *system* bus — don't run it next to a
   distro dbus/bluetoothd).
 - Optional: bluez-alsa v4 for `audio: true`.
+- Optional: `CAP_NET_RAW`/`CAP_NET_ADMIN` (root on Nerves) for
+  `Bluez.AdvertReceiver`/`Bluez.Mgmt`; Linux ≥ 5.17 for `Bluez.Mgmt`
+  (extended advertising commands, queued by the kernel instead of refused
+  as busy while another is pending).
 - Writable `/run/dbus` and `/data/bluetooth`; on a read-only rootfs point
   `/var/lib/bluetooth` at `/data/bluetooth` with an overlay symlink.
 
