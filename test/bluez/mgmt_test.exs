@@ -390,6 +390,24 @@ defmodule Bluez.MgmtTest do
     assert %{{0, 5} => %{removing: false}} = :sys.get_state(mgmt).instances
   end
 
+  test "stop_advertising/3 during a pending expiry removal waits for it instead of refusing",
+       %{mgmt: mgmt, kernel: kernel} = ctx do
+    advertise_ok(ctx, 4, duration_ms: 60_000)
+    %{{0, 4} => %{timer: timer}} = :sys.get_state(mgmt).instances
+
+    # The expiry's removal is in flight when the holder stops it too.
+    send(mgmt, {:expire, {0, 4}, timer})
+    assert expect_command(kernel, @remove) == <<4>>
+    ref = stop_async(ctx, 4)
+    assert eventually(fn -> :queue.len(:sys.get_state(mgmt).queue) == 1 end)
+
+    # The expiry's removal succeeds; the stop's is then stale and skipped.
+    complete(kernel, @remove, 0, <<4>>)
+    assert await(ref) == :ok
+    assert {:error, :timeout} = :socket.recv(kernel, 0, 100)
+    assert :sys.get_state(mgmt).instances == %{}
+  end
+
   test "a failed removal keeps the instance tracked so it can be retried",
        %{mgmt: mgmt, kernel: kernel} = ctx do
     advertise_ok(ctx, 4)

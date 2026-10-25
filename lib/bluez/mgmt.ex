@@ -35,8 +35,11 @@ defmodule Bluez.Mgmt do
 
   Every instance added here is removed again when its `duration_ms:` elapses,
   on `stop_advertising/3`, when its lease ends, and when this process
-  stops. A removal the kernel refuses after its lease ended — so no
-  holder is left to retry it — is retried here a few times.
+  stops (crashes included: `terminate/2` removes them). A removal the
+  kernel refuses after its lease ended — so no holder is left to retry it —
+  is retried here a few times. Only an untrappable kill (`Process.exit(pid,
+  :kill)`, the VM going down) skips that cleanup: the kernel keeps such
+  instances until they are removed or the controller is reset.
 
   `bluetoothd` doesn't know about instances added here, so a D-Bus
   advertisement could later be given the same number and silently
@@ -288,7 +291,9 @@ defmodule Bluez.Mgmt do
     key = {index, instance}
 
     case state.instances do
-      %{^key => %{lease_ref: ^ref, removing: false}} ->
+      # Also while a removal (an expiry's, say) is pending: this one queues
+      # behind it, and is skipped as stale if that one succeeds.
+      %{^key => %{lease_ref: ^ref}} ->
         {:noreply, cleanup(state, key, from)}
 
       _not_held_under_this_lease ->

@@ -91,6 +91,11 @@ defmodule Bluez.Advertiser do
 
   @path_prefix "/org/exbluez/advertiser/adv"
 
+  # bluetoothd frees a dropped advertisement's instance in its allocator
+  # only from an idle callback after answering, so for a moment it still
+  # counts toward bluetoothd's next pick (see mgmt_conflict?/3).
+  @retire_ms 500
+
   # Retries of an unregistration BlueZ refused after its lease ended.
   @orphan_retries 3
   @orphan_retry_ms 2_000
@@ -305,6 +310,11 @@ defmodule Bluez.Advertiser do
           conn_ref: Process.monitor(conn),
           # Test seam: the delay between orphan-unregistration retries.
           retry_ms: Keyword.get(opts, :retry_ms, @orphan_retry_ms),
+          # Test seam: how long a dropped advertisement still counts as
+          # holding an instance in bluetoothd's allocator.
+          retire_ms: Keyword.get(opts, :retire_ms, @retire_ms),
+          # index => advertisements dropped within retire_ms
+          retiring: %{},
           # The Radio whose lease ends we receive (see subscribe/1).
           radio: Keyword.get(opts, :radio, Radio),
           radio_pid: nil,
@@ -371,7 +381,9 @@ defmodule Bluez.Advertiser do
   defp mgmt_conflict?(_state, _index, :unknown), do: true
 
   defp mgmt_conflict?(state, index, mgmt_held) do
-    count = Enum.count(state.ads, fn {_id, entry} -> entry.index == index end)
+    count =
+      Enum.count(state.ads, fn {_id, entry} -> entry.index == index end) +
+        Map.get(state.retiring, index, 0)
 
     Enum.any?(mgmt_held, fn {held_index, instance} ->
       held_index == index and instance <= count + 1
@@ -497,6 +509,17 @@ defmodule Bluez.Advertiser do
     {:noreply, end_leases(state, fn _ref -> true end)}
   end
 
+  def handle_info({:retired, index}, state) do
+    retiring =
+      case state.retiring do
+        %{^index => 1} -> Map.delete(state.retiring, index)
+        %{^index => n} -> %{state.retiring | index => n - 1}
+        _none -> state.retiring
+      end
+
+    {:noreply, %{state | retiring: retiring}}
+  end
+
   def handle_info({:retry_unregister, id}, state) do
     case state.ads do
       %{^id => %{status: :active}} -> {:noreply, begin_unregister(state, id, [])}
@@ -617,7 +640,9 @@ defmodule Bluez.Advertiser do
 
       {entry, ads} ->
         if entry.timer, do: Process.cancel_timer(entry.timer)
-        settle(%{state | ads: ads})
+        Process.send_after(self(), {:retired, entry.index}, state.retire_ms)
+        retiring = Map.update(state.retiring, entry.index, 1, &(&1 + 1))
+        settle(%{state | ads: ads, retiring: retiring})
     end
   end
 

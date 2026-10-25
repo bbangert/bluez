@@ -73,7 +73,12 @@ defmodule Bluez.AdvertiserTest do
       # init/1 blocks on the bus Hello until this test answers it.
       starter =
         Task.async(fn ->
-          GenServer.start(Advertiser, connect_fun: connect_fun, radio: radio, retry_ms: 20)
+          GenServer.start(Advertiser,
+            connect_fun: connect_fun,
+            radio: radio,
+            retry_ms: 20,
+            retire_ms: 100
+          )
         end)
 
       assert_receive {^svr, %Message{header_fields: %{member: "Hello"}} = hello}, 1_000
@@ -172,6 +177,33 @@ defmodule Bluez.AdvertiserTest do
                {:error, :instance_conflict}
 
       refute_receive {^svr, %Message{header_fields: %{member: "RegisterAdvertisement"}}}, 50
+    end
+
+    test "a just-dropped advertisement still counts toward bluetoothd's next instance",
+         %{svr: svr} = ctx do
+      # Mgmt holds instance 2. With none of ours registered, bluetoothd's
+      # next pick is 1, so this registers.
+      mgmt = mgmt_holding(ctx, 2)
+      {id, path} = registered(ctx, mgmt: mgmt)
+
+      ref = stop_async(ctx, id)
+      reply(svr, assert_unregister(svr, path))
+      assert TestLeaseHolder.await(ref) == :ok
+
+      # bluetoothd frees instance 1 in its allocator only from an idle
+      # callback, so for a moment its next pick could be 2: refused.
+      assert ctx |> advertise_async(%{type: :broadcast}, mgmt: mgmt) |> TestLeaseHolder.await() ==
+               {:error, :instance_conflict}
+
+      # Once that has passed, it registers again.
+      Process.sleep(150)
+      ref = advertise_async(ctx, %{type: :broadcast}, mgmt: mgmt)
+
+      assert_receive {^svr, %Message{header_fields: %{member: "RegisterAdvertisement"}} = reg},
+                     1_000
+
+      reply(svr, reg)
+      assert {:ok, _id} = TestLeaseHolder.await(ref)
     end
 
     test "registers alongside a Bluez.Mgmt instance bluetoothd can't reach", %{svr: svr} = ctx do

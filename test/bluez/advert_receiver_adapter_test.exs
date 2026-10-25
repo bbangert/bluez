@@ -51,6 +51,18 @@ defmodule Bluez.AdvertReceiverAdapterTest do
     assert AdvertReceiver.listening?(receiver)
   end
 
+  test "an adapter_index outside 0..0xFFFE is refused, never wrapped onto another controller" do
+    for bad <- [0xFFFF, 0x10000, -1, "0"] do
+      assert {:error, {:invalid_option, :adapter_index}} =
+               GenServer.start(AdvertReceiver, adapter_index: bad)
+    end
+
+    # A resolved one out of range counts as unresolved.
+    :persistent_term.put(DevicePath.resolved_adapter_key(), "/org/bluez/hci65536")
+    start_receiver([])
+    refute_receive {:opened, _, _}, 250
+  end
+
   test "an explicit adapter_index: is never re-resolved" do
     :persistent_term.put(DevicePath.resolved_adapter_key(), "/org/bluez/hci1")
     start_receiver(adapter_index: 0)

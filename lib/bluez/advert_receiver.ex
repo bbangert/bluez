@@ -71,8 +71,20 @@ defmodule Bluez.AdvertReceiver do
     :exit, _ -> false
   end
 
+  # The controller index is 16 bits in sockaddr_hci, and 0xFFFF means "no
+  # controller": anything outside would wrap onto another controller.
+  defguardp valid_index?(index) when is_integer(index) and index in 0..0xFFFE
+
   @impl GenServer
   def init(opts) do
+    case Keyword.get(opts, :adapter_index) do
+      nil -> init_state(opts)
+      index when valid_index?(index) -> init_state(opts)
+      _bad -> {:stop, {:invalid_option, :adapter_index}}
+    end
+  end
+
+  defp init_state(opts) do
     state = %{
       sock: nil,
       on_report: Keyword.get(opts, :on_report, fn _report -> :ok end),
@@ -146,8 +158,14 @@ defmodule Bluez.AdvertReceiver do
 
   defp index(%{adapter_index: index}) when is_integer(index), do: {:ok, index}
 
+  # A resolved index out of range counts as unresolved (keep waiting).
   defp index(_state) do
-    with {:ok, path} <- DevicePath.resolved_adapter_path(), do: Hci.adapter_index(path)
+    with {:ok, path} <- DevicePath.resolved_adapter_path(),
+         {:ok, index} when valid_index?(index) <- Hci.adapter_index(path) do
+      {:ok, index}
+    else
+      _unresolved -> :error
+    end
   end
 
   defp schedule_adapter_check(state),
