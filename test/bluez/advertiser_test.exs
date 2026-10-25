@@ -204,6 +204,29 @@ defmodule Bluez.AdvertiserTest do
       assert {:ok, _id} = Task.await(task)
     end
 
+    test "Release mid-registration still unregisters if BlueZ then accepts it",
+         %{svr: svr, adv: adv} do
+      owner = self()
+
+      task =
+        Task.async(fn -> Advertiser.advertise(%{type: :broadcast}, server: adv, owner: owner) end)
+
+      assert_receive {^svr,
+                      %Message{
+                        header_fields: %{member: "RegisterAdvertisement"},
+                        body: [path, []]
+                      } = reg},
+                     1_000
+
+      method_call(svr, path, "org.bluez.LEAdvertisement1", "Release", nil, [])
+      assert_receive {^svr, %Message{type: :method_return}}, 1_000
+
+      reply(svr, reg)
+      assert Task.await(task) == {:error, :stopped}
+      reply(svr, assert_unregister(svr, path))
+      assert wait_until(fn -> :sys.get_state(adv).ads == %{} end) == :ok
+    end
+
     test "a BlueZ error is returned and the object is dropped", %{svr: svr, adv: adv} do
       task = Task.async(fn -> Advertiser.advertise(%{type: :broadcast}, server: adv) end)
 
@@ -248,6 +271,9 @@ defmodule Bluez.AdvertiserTest do
   end
 
   test "rejects bad options in the caller, before reaching the server" do
+    assert {:error, {:invalid_spec, _}} = Advertiser.advertise(%{type: :scanner})
+    assert {:error, {:invalid_spec, _}} = Advertiser.advertise(%{})
+
     spec = %{type: :broadcast}
     assert Advertiser.advertise(spec, owner: :worker) == {:error, {:invalid, "owner"}}
     assert Advertiser.advertise(spec, duration_ms: 0) == {:error, {:invalid, "duration_ms"}}
@@ -275,7 +301,7 @@ defmodule Bluez.AdvertiserTest do
     end
 
     mgmt = start_supervised!({Bluez.Mgmt, name: nil, adapter_index: 0, open: open})
-    assert_receive {:kernel, kernel}
+    assert_receive {:kernel, kernel}, 1_000
 
     task =
       Task.async(fn ->
@@ -354,17 +380,9 @@ defmodule Bluez.AdvertiserTest do
   defp method_call(svr, path, iface, member, signature, body) do
     serial = :sys.get_state(svr).serial
 
-    TestServer.push(
-      svr,
-      Message.new!(:method_call,
-        sender: ":1.1",
-        path: path,
-        interface: iface,
-        member: member,
-        signature: signature,
-        body: body
-      )
-    )
+    opts = [sender: ":1.1", path: path, interface: iface, member: member, body: body]
+    opts = if signature, do: Keyword.put(opts, :signature, signature), else: opts
+    TestServer.push(svr, Message.new!(:method_call, opts))
 
     serial
   end

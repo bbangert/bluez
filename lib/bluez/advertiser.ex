@@ -132,7 +132,9 @@ defmodule Bluez.Advertiser do
   rather than registering on the `hci0` fallback.
   """
   @spec advertise(spec(), keyword()) :: {:ok, pos_integer()} | {:error, term()}
-  def advertise(%{type: type} = spec, opts \\ []) when type in [:broadcast, :peripheral] do
+  def advertise(spec, opts \\ [])
+
+  def advertise(%{type: type} = spec, opts) when type in [:broadcast, :peripheral] do
     opts = Keyword.put_new(opts, :owner, self())
     server = Keyword.get(opts, :server, __MODULE__)
 
@@ -144,6 +146,9 @@ defmodule Bluez.Advertiser do
       server_call(server, {:advertise, props, opts, held})
     end
   end
+
+  def advertise(spec, _opts),
+    do: {:error, {:invalid_spec, "type must be :broadcast or :peripheral, got: #{inspect(spec)}"}}
 
   defp validate_opts(opts) do
     cond do
@@ -512,7 +517,14 @@ defmodule Bluez.Advertiser do
         reply_property(conn, msg, props, Enum.at(msg.body, 1))
         state
 
-      # bluetoothd dropped it (adapter powered off, daemon exiting).
+      # bluetoothd dropped it (adapter powered off, daemon exiting). Mid-
+      # registration, keep the entry (cancelled) so a RegisterAdvertisement
+      # that still succeeds gets unregistered instead of left untracked.
+      {@adv_iface, "Release", %{status: :registering}} ->
+        Bluez.Rebus.reply(conn, msg)
+        {:ok, id} = id_from_path(hf[:path])
+        cancel_registration(state, id, [])
+
       {@adv_iface, "Release", %{} = entry} ->
         Bluez.Rebus.reply(conn, msg)
         {:ok, id} = id_from_path(hf[:path])

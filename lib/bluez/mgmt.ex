@@ -58,6 +58,9 @@ defmodule Bluez.Mgmt do
 
   alias Bluez.{AdData, DevicePath, Hci}
 
+  # Per-send patience in terminate/2 (see there).
+  @terminate_send_timeout 100
+
   # Per-command patience for the kernel's reply; MGMT always answers, so
   # hitting this means the socket is wedged — restart with a fresh one.
   @command_timeout 5_000
@@ -281,6 +284,13 @@ defmodule Bluez.Mgmt do
   def handle_info({:"$socket", sock, :select, _handle}, %{sock: sock} = state),
     do: {:noreply, arm(state)}
 
+  # The pending select was aborted (socket closed under us): nothing would
+  # re-arm it, so restart with a fresh socket rather than go deaf.
+  def handle_info({:"$socket", sock, :abort, {_handle, reason}}, %{sock: sock} = state) do
+    Logger.error("Bluez.Mgmt: MGMT socket aborted (#{inspect(reason)}); restarting")
+    {:stop, {:mgmt_socket_abort, reason}, state}
+  end
+
   def handle_info({:command_timeout, ref}, %{job: %{ref: ref}} = state) do
     Logger.error("Bluez.Mgmt: MGMT command timed out; restarting with a fresh socket")
     {:stop, :mgmt_command_timeout, state}
@@ -316,8 +326,12 @@ defmodule Bluez.Mgmt do
         _other -> []
       end
 
+    # Bounded sends: we may be stopping *because* the socket is wedged
+    # (:mgmt_command_timeout), and an unbounded send would then block until
+    # the supervisor kills us, losing every cleanup after it.
     Enum.each(Enum.uniq(in_flight ++ tracked), fn {index, instance} ->
-      :socket.send(state.sock, Hci.mgmt_command(Hci.op_remove_advertising(), index, <<instance>>))
+      command = Hci.mgmt_command(Hci.op_remove_advertising(), index, <<instance>>)
+      :socket.send(state.sock, command, [], @terminate_send_timeout)
     end)
 
     :socket.close(state.sock)

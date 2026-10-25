@@ -30,10 +30,11 @@ defmodule Bluez.AdvertReceiver do
     * `on_report:` — `fun(report) -> any`, called in this process for every
       report (default: discard). Keep it fast: it runs on the receive
       path. Raises crash this process (the supervisor restarts it).
-    * `adapter_index:` — controller index to listen on; default: follow
-      `Bluez.DevicePath.adapter_path/0`, re-checked every 2 s so the
-      socket moves once `Bluez.Client` resolves (or the host switches)
-      the selected radio.
+    * `adapter_index:` — controller index to listen on; default: the
+      adapter `Bluez.Client` resolves (`Bluez.DevicePath.resolved_adapter_path/0`).
+      Until it has, the receiver waits rather than listen on the `hci0`
+      fallback; afterwards it re-checks every 2 s and moves its socket if
+      the selection changes (e.g. a radio switch).
     * `name:` — registered name (default `Bluez.AdvertReceiver`).
 
   When the socket can't be opened (no adapter yet, no Bluetooth in the
@@ -81,9 +82,8 @@ defmodule Bluez.AdvertReceiver do
       bound_index: nil
     }
 
-    # Following the selected adapter: the default path can still be the
-    # hci0 fallback when we first open (Bluez.Client resolves the selection
-    # asynchronously), so keep checking and move when it changes.
+    # Following the selected adapter: re-check periodically and move when
+    # Bluez.Client's resolution changes (open/1 waits for the first one).
     if state.adapter_index == nil, do: schedule_adapter_check(state)
 
     {:ok, state, {:continue, :open}}
@@ -96,11 +96,14 @@ defmodule Bluez.AdvertReceiver do
   def handle_call(:listening?, _from, state), do: {:reply, state.sock != nil, state}
 
   @impl GenServer
-  def handle_info(:reopen, state), do: {:noreply, open(state)}
+  # Guarded: a socket opened meanwhile must not be replaced (and leaked).
+  def handle_info(:reopen, %{sock: nil} = state), do: {:noreply, open(state)}
 
   def handle_info(:check_adapter, state) do
     schedule_adapter_check(state)
 
+    # Unresolved (a Client restart in progress) keeps the current socket;
+    # only a different resolved controller moves it.
     case {state.sock, index(state)} do
       {sock, {:ok, index}} when sock != nil and index != state.bound_index ->
         Logger.info("Bluez.AdvertReceiver: selected adapter changed to hci#{index}, moving")
@@ -115,6 +118,13 @@ defmodule Bluez.AdvertReceiver do
   def handle_info({:"$socket", sock, :select, _handle}, %{sock: sock} = state),
     do: {:noreply, drain(state, @drain_batch)}
 
+  # The pending select was aborted (socket closed under us): without this
+  # nothing re-arms the socket and the receiver goes silently deaf.
+  def handle_info({:"$socket", sock, :abort, {_handle, reason}}, %{sock: sock} = state) do
+    :socket.close(sock)
+    {:noreply, retry(%{state | sock: nil, bound_index: nil}, {:abort, reason})}
+  end
+
   def handle_info(:drain, %{sock: sock} = state) when sock != nil,
     do: {:noreply, drain(state, @drain_batch)}
 
@@ -127,12 +137,15 @@ defmodule Bluez.AdvertReceiver do
       drain(%{state | sock: sock, bound_index: index}, @drain_batch)
     else
       {:error, reason} -> retry(state, reason)
-      :error -> retry(state, :no_adapter_index)
+      :error -> retry(state, :adapter_not_resolved)
     end
   end
 
   defp index(%{adapter_index: index}) when is_integer(index), do: {:ok, index}
-  defp index(_state), do: Hci.adapter_index(DevicePath.adapter_path())
+
+  defp index(_state) do
+    with {:ok, path} <- DevicePath.resolved_adapter_path(), do: Hci.adapter_index(path)
+  end
 
   defp schedule_adapter_check(state),
     do: Process.send_after(self(), :check_adapter, state.adapter_check_ms)
@@ -161,7 +174,7 @@ defmodule Bluez.AdvertReceiver do
 
       {:error, reason} ->
         :socket.close(state.sock)
-        retry(%{state | sock: nil}, reason)
+        retry(%{state | sock: nil, bound_index: nil}, reason)
     end
   end
 end

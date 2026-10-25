@@ -21,8 +21,17 @@ defmodule Bluez.MgmtTest do
     end
 
     mgmt = start_supervised!({Mgmt, [name: nil, adapter_index: 0, open: open] ++ opts})
-    assert_receive {:kernel, kernel}
+    assert_receive {:kernel, kernel}, 1_000
     {mgmt, kernel}
+  end
+
+  # Datagrams on the kernel socket are processed in order, so once a later
+  # command round-trip has completed every earlier packet has been handled.
+  defp sync(mgmt, kernel) do
+    task = Task.async(fn -> Mgmt.read_advertising_features(mgmt) end)
+    expect_command(kernel, @read_features)
+    complete(kernel, @read_features, 0, features(5))
+    assert {:ok, _} = Task.await(task)
   end
 
   defp expect_command(kernel, opcode) do
@@ -202,10 +211,12 @@ defmodule Bluez.MgmtTest do
     advertise_ok(mgmt, kernel, 5, duration_ms: 30)
 
     # Re-advertise instance 5 and hold the kernel's reply until the old
-    # advertisement's duration has elapsed (its removal queues behind).
+    # advertisement's duration has fired (its removal queues behind): the
+    # old entry is then flagged as being removed.
     task = advertise_async(mgmt, <<2, 1, 6>>, instance: 5)
     expect_command(kernel, @params)
-    Process.sleep(60)
+    assert eventually(fn -> match?(%{5 => %{removing: true}}, :sys.get_state(mgmt).instances) end)
+    assert :queue.len(:sys.get_state(mgmt).queue) == 1
     complete(kernel, @params, 0, <<5, 0, 31, 31>>)
     expect_command(kernel, @data)
     complete(kernel, @data, 0, <<5>>)
@@ -225,8 +236,8 @@ defmodule Bluez.MgmtTest do
     expect_command(kernel, @data)
 
     second = advertise_async(mgmt, <<2, 1, 6>>, instance: 3)
-    # Let the second request reach the queue before the first fails.
-    _ = :sys.get_state(mgmt)
+    # The second request must be queued before the first fails.
+    assert eventually(fn -> :queue.len(:sys.get_state(mgmt).queue) == 1 end)
     complete(kernel, @data, 0x0D)
     assert Task.await(first) == {:error, :invalid_params}
 
@@ -271,10 +282,16 @@ defmodule Bluez.MgmtTest do
     {mgmt, kernel} = start_mgmt()
     advertise_ok(mgmt, kernel, 6)
 
-    # Instance 6 removed on hci1; ours is on hci0.
+    # Instance 6 removed on hci1; ours is on hci0. The sync round-trip
+    # proves the event was processed (not merely still in flight).
     :ok = :socket.send(kernel, <<0x24, 0, 1, 0, 1, 0, 6>>)
-    _ = :sys.get_state(mgmt)
+    sync(mgmt, kernel)
     assert %{6 => _} = :sys.get_state(mgmt).instances
+
+    # ...whereas the same event for hci0 does drop it.
+    :ok = :socket.send(kernel, <<0x24, 0, 0, 0, 1, 0, 6>>)
+    sync(mgmt, kernel)
+    assert :sys.get_state(mgmt).instances == %{}
   end
 
   test "shutdown also removes an instance whose data command is still in flight" do
@@ -284,8 +301,20 @@ defmodule Bluez.MgmtTest do
     complete(kernel, @params, 0, <<7, 0, 31, 31>>)
     expect_command(kernel, @data)
 
-    :ok = GenServer.stop(mgmt)
+    # Through the supervisor (as in production), which also keeps it from
+    # restarting the child under the test.
+    :ok = stop_supervised(Mgmt)
+    refute Process.alive?(mgmt)
     assert expect_command(kernel, @remove) == <<7>>
+  end
+
+  test "an aborted socket select stops the server instead of leaving it deaf" do
+    {mgmt, _kernel} = start_mgmt()
+    ref = Process.monitor(mgmt)
+    sock = :sys.get_state(mgmt).sock
+
+    send(mgmt, {:"$socket", sock, :abort, {make_ref(), :closed}})
+    assert_receive {:DOWN, ^ref, :process, ^mgmt, {:mgmt_socket_abort, :closed}}, 1_000
   end
 
   test "the default instance skips one held by someone else" do
@@ -333,6 +362,17 @@ defmodule Bluez.MgmtTest do
     assert {:error, {:invalid, _}} = Mgmt.advertise(<<>>, flags: [:bogus])
     assert {:error, {:invalid, _}} = Mgmt.advertise(<<>>, min_interval_ms: 5)
     assert {:error, {:invalid, _}} = Mgmt.advertise(<<>>, tx_power: :loud)
+  end
+
+  test "legacy_adv_data/2 builds the exact Flags + Local Name + UUID128 PDU (Tuya P1 shape)" do
+    block = <<0::8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15>>
+
+    assert Mgmt.legacy_adv_data([AdData.local_name("ABCDEFGH"), AdData.uuid128_list([block])]) ==
+             <<2, 1, 6>> <> <<9, 9, "ABCDEFGH">> <> <<17, 7, block::binary>>
+
+    assert byte_size(
+             Mgmt.legacy_adv_data([AdData.local_name("ABCDEFGH"), AdData.uuid128_list([block])])
+           ) == 31
   end
 
   test "legacy_adv_data/2 prepends Flags and enforces 31 bytes" do

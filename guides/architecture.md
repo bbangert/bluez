@@ -23,7 +23,7 @@ flowchart TB
     client --> agent["5 · Bluez.Agent<br/>(pairing)"]
     agent --> gatt["6 · Gatt Task.Supervisor + Bluez.Gatt"]
     gatt --> alsa["7 · bluealsad + Bluez.BlueAlsa<br/>(audio: true only)"]
-    alsa --> radio["8 · Advertiser / Mgmt / AdvertReceiver<br/>(opt-in only)"]
+    alsa --> radio["8 · AdvertReceiver / Mgmt / Advertiser<br/>(opt-in only)"]
     radio --> extra["9 · extra_children:<br/>(host consumers)"]
 
     style alsa stroke-dasharray: 5 5
@@ -52,11 +52,12 @@ flowchart TB
    default). Placed *after* the scanning/GATT clients so an audio-daemon
    fault never restarts the scanning stack; the children that follow it
    do restart with it, which is intended — they're the same audio path.
-8. **`Bluez.Advertiser`, `Bluez.Mgmt`, `Bluez.AdvertReceiver`** — each
-   only when its option (`advertiser:`, `mgmt:`, `advert_receiver:`) is
-   given. After audio so a fault here never touches it; a `bluetoothd`
-   restart rebuilds them, which costs nothing — advertisements registered
-   with the old daemon died with it.
+8. **`Bluez.AdvertReceiver`, `Bluez.Mgmt`, `Bluez.Advertiser`** — each
+   only when its option (`advert_receiver:`, `mgmt:`, `advertiser:`) is
+   given, in that order. After audio so a fault here never touches it.
+   The kernel-socket children come before the D-Bus Advertiser so an
+   Advertiser crash never restarts them (a `Bluez.Mgmt` restart takes its
+   raw advertisements off air). A `bluetoothd` restart rebuilds all three.
 9. **`extra_children:`** — host-supplied child specs, appended last.
    They restart with the audio path; a fault there never disturbs
    anything above. Ordering within the slot is the caller's contract.
@@ -175,8 +176,10 @@ payload as a 16-bit Service UUID list, where order and repeated values
   filter for LE Meta events). Listens to the controller's legacy and
   extended advertising reports while `Bluez.Client` scans, and hands each
   one — AD bytes untouched — to `on_report:`. Read-only, so it never
-  conflicts with `bluetoothd`; it retries opening instead of crash-looping
-  when no adapter is present.
+  conflicts with `bluetoothd`. Like the advertisers it waits for
+  `Bluez.Client` to resolve the adapter (never listening on the `hci0`
+  fallback), moves its socket if the selection changes, and retries
+  opening instead of crash-looping when no adapter is present.
 
 `Bluez.Hci` holds the socket setup and the pure codecs (HCI reports,
 MGMT framing), and `Bluez.AdData` the AD TLV helpers — both host-tested

@@ -1,59 +1,61 @@
 defmodule Bluez.AdvertReceiverAdapterTest do
-  # Not async: drives the global adapter-path :persistent_term.
+  # Not async: drives the global resolved-adapter :persistent_term.
   use ExUnit.Case, async: false
 
   alias Bluez.{AdvertReceiver, DevicePath, TestSocketPair}
 
   setup do
-    previous = :persistent_term.get(DevicePath.adapter_path_key(), nil)
+    previous = :persistent_term.get(DevicePath.resolved_adapter_key(), nil)
+    :persistent_term.erase(DevicePath.resolved_adapter_key())
 
     on_exit(fn ->
       if previous,
-        do: :persistent_term.put(DevicePath.adapter_path_key(), previous),
-        else: :persistent_term.erase(DevicePath.adapter_path_key())
+        do: :persistent_term.put(DevicePath.resolved_adapter_key(), previous),
+        else: :persistent_term.erase(DevicePath.resolved_adapter_key())
     end)
   end
 
-  test "without adapter_index:, moves to the adapter Bluez.Client selects later" do
-    :persistent_term.erase(DevicePath.adapter_path_key())
+  # Reports each open to the test; the test keeps the kernel side so it
+  # can't close and provoke a reopen of its own.
+  defp start_receiver(opts) do
     test_pid = self()
 
+    open = fn index ->
+      {proc, kernel} = TestSocketPair.open()
+      send(test_pid, {:opened, index, kernel})
+      {:ok, proc}
+    end
+
     start_supervised!(
-      {AdvertReceiver,
-       name: nil,
-       adapter_check_ms: 20,
-       open: fn index ->
-         {proc, _kernel} = TestSocketPair.open()
-         send(test_pid, {:opened, index})
-         {:ok, proc}
-       end}
+      {AdvertReceiver, [name: nil, retry_ms: 20, adapter_check_ms: 20, open: open] ++ opts}
     )
+  end
 
-    # Before the Client publishes its selection: the hci0 fallback.
-    assert_receive {:opened, 0}
+  test "without adapter_index:, waits for Bluez.Client's adapter, then follows changes" do
+    receiver = start_receiver([])
 
-    :persistent_term.put(DevicePath.adapter_path_key(), "/org/bluez/hci1")
-    assert_receive {:opened, 1}, 1_000
-    refute_receive {:opened, _}, 100
+    # Not resolved yet: never listens on the hci0 fallback.
+    refute_receive {:opened, _, _}, 100
+    refute AdvertReceiver.listening?(receiver)
+
+    :persistent_term.put(DevicePath.resolved_adapter_key(), "/org/bluez/hci1")
+    assert_receive {:opened, 1, _kernel}, 1_000
+
+    # A later selection change (e.g. a radio switch) moves the socket...
+    :persistent_term.put(DevicePath.resolved_adapter_key(), "/org/bluez/hci2")
+    assert_receive {:opened, 2, _kernel}, 1_000
+
+    # ...while a Client restart in progress (unresolved) keeps it.
+    :persistent_term.erase(DevicePath.resolved_adapter_key())
+    refute_receive {:opened, _, _}, 100
+    assert AdvertReceiver.listening?(receiver)
   end
 
   test "an explicit adapter_index: is never re-resolved" do
-    :persistent_term.put(DevicePath.adapter_path_key(), "/org/bluez/hci1")
-    test_pid = self()
+    :persistent_term.put(DevicePath.resolved_adapter_key(), "/org/bluez/hci1")
+    start_receiver(adapter_index: 0)
 
-    start_supervised!(
-      {AdvertReceiver,
-       name: nil,
-       adapter_index: 0,
-       adapter_check_ms: 20,
-       open: fn index ->
-         {proc, _kernel} = TestSocketPair.open()
-         send(test_pid, {:opened, index})
-         {:ok, proc}
-       end}
-    )
-
-    assert_receive {:opened, 0}
-    refute_receive {:opened, _}, 100
+    assert_receive {:opened, 0, _kernel}, 1_000
+    refute_receive {:opened, _, _}, 100
   end
 end
