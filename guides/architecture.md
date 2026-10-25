@@ -169,7 +169,10 @@ payload as a 16-bit Service UUID list, where order and repeated values
   `ServiceUUIDs` in order with duplicates and writes 16-bit UUIDs
   little-endian, so `Bluez.AdData.uuid16_strings/1` puts a payload on air
   verbatim. Lifetime: `duration_ms:` (ms-precise, unlike BlueZ's
-  whole-second `Timeout`), `stop/3`, or the lease ending.
+  whole-second `Timeout`), `stop/3`, or the lease ending. Like
+  `Bluez.Mgmt`, it refuses a finite duration (`{:error, :rotation_busy}`)
+  on a controller that rotates instances in software while another is
+  registered, since it could expire before its first transmission.
 - **`Bluez.Mgmt`** (kernel MGMT over an `HCI_CHANNEL_CONTROL` socket).
   For AD layouts BlueZ refuses: its `Data` property rejects Flags, UUID
   lists, names and service data, and it moves `LocalName` to the scan

@@ -27,8 +27,13 @@ defmodule Bluez.Mgmt do
   is free or already ours (Read Advertising Features lists the occupied
   ones), so it never takes over `bluetoothd`'s; repeated default sends
   reuse that one instance, each replacing the last. An explicit
-  `instance:` is used as given — replacing whatever occupies it. Every
-  instance added here is removed again when its `duration_ms:` elapses,
+  `instance:` is used as given — replacing whatever occupies it, including
+  an instance `bluetoothd` has only queued for removal (it answers
+  `UnregisterAdvertisement` before the kernel has removed it), whose removal
+  would then take the new advertisement down; the default never picks an
+  instance the kernel still lists.
+
+  Every instance added here is removed again when its `duration_ms:` elapses,
   on `stop_advertising/3`, when its lease ends, and when this process
   stops. A removal the kernel refuses after its lease ended — so no
   holder is left to retry it — is retried here a few times.
@@ -544,7 +549,10 @@ defmodule Bluez.Mgmt do
 
     key = {lease.index, instance}
     gen = make_ref()
-    entry = %{new_entry(lease, gen) | removing: true}
+    # The lease may have ended while the data command was in flight (its
+    # lease-end cleanup found nothing tracked): then nobody is left to
+    # retry a refused rollback but us.
+    entry = %{new_entry(lease, gen) | removing: true, lease_ended: not Radio.valid?(lease)}
     state = %{state | instances: Map.put(state.instances, key, entry)}
 
     enqueue(%{state | job: nil}, remove_job(key, gen, nil))

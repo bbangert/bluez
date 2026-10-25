@@ -185,6 +185,32 @@ defmodule Bluez.AdvertiserTest do
       assert {:ok, _id} = TestLeaseHolder.await(ref)
     end
 
+    test "a finite advertisement is refused while a software-rotating controller has another instance",
+         %{svr: svr} = ctx do
+      {mgmt, kernel} = start_mgmt(ctx)
+      ref = advertise_async(ctx, %{type: :broadcast}, mgmt: mgmt, duration_ms: 300)
+
+      # No hardware offload, and instance 1 is registered: ours would wait
+      # for a ~2 s rotation slot, so 300 ms may never air.
+      kernel_reply(kernel, 0x003D, <<0::little-32, 31, 31, 5, 1, 1>>)
+      assert TestLeaseHolder.await(ref) == {:error, :rotation_busy}
+      refute_receive {^svr, %Message{header_fields: %{member: "RegisterAdvertisement"}}}, 50
+    end
+
+    test "with hardware offload a finite advertisement registers alongside others",
+         %{svr: svr} = ctx do
+      {mgmt, kernel} = start_mgmt(ctx)
+      ref = advertise_async(ctx, %{type: :broadcast}, mgmt: mgmt, duration_ms: 60_000)
+
+      kernel_reply(kernel, 0x003D, <<Bitwise.bsl(1, 11)::little-32, 31, 31, 5, 1, 1>>)
+
+      assert_receive {^svr, %Message{header_fields: %{member: "RegisterAdvertisement"}} = reg},
+                     1_000
+
+      reply(svr, reg)
+      assert {:ok, _id} = TestLeaseHolder.await(ref)
+    end
+
     test "Release mid-registration still unregisters if BlueZ then accepts it",
          %{svr: svr, adv: adv} = ctx do
       ref = advertise_async(ctx, %{type: :broadcast})
@@ -364,9 +390,8 @@ defmodule Bluez.AdvertiserTest do
   defp stop_async(%{adv: adv, holder: holder}, id),
     do: TestLeaseHolder.run(holder, &Advertiser.stop(&1, id, adv))
 
-  # A Bluez.Mgmt (against a scripted kernel) holding `instance` on hci0,
-  # sent by the same lease holder.
-  defp mgmt_holding(%{radio: radio, holder: holder}, instance) do
+  # A Bluez.Mgmt against a scripted kernel: {mgmt, kernel}.
+  defp start_mgmt(%{radio: radio}) do
     test_pid = self()
 
     open = fn ->
@@ -378,6 +403,24 @@ defmodule Bluez.AdvertiserTest do
 
     mgmt = start_supervised!({Bluez.Mgmt, name: nil, radio: radio, open: open})
     assert_receive {:kernel, kernel}, 1_000
+    {mgmt, kernel}
+  end
+
+  # Answer the kernel's next command, which must be `opcode`.
+  defp kernel_reply(kernel, opcode, rp) do
+    {:ok, <<^opcode::little-16, _::binary>>} = :socket.recv(kernel, 0, 1_000)
+    reply = <<opcode::little-16, 0, rp::binary>>
+
+    :ok =
+      :socket.send(
+        kernel,
+        <<1::little-16, 0::little-16, byte_size(reply)::little-16, reply::binary>>
+      )
+  end
+
+  # A Bluez.Mgmt holding `instance` on hci0, sent by the same lease holder.
+  defp mgmt_holding(%{holder: holder} = ctx, instance) do
+    {mgmt, kernel} = start_mgmt(ctx)
 
     ref =
       TestLeaseHolder.run(
@@ -389,20 +432,9 @@ defmodule Bluez.AdvertiserTest do
     # then the parameters and data commands.
     features = <<Bitwise.bsl(1, 11)::little-32, 31, 31, 5, 0>>
 
-    for {opcode, rp} <- [
-          {0x003D, features},
-          {0x0054, <<instance, 0, 31, 31>>},
-          {0x0055, <<instance>>}
-        ] do
-      {:ok, <<^opcode::little-16, _::binary>>} = :socket.recv(kernel, 0, 1_000)
-      reply = <<opcode::little-16, 0, rp::binary>>
-
-      :ok =
-        :socket.send(
-          kernel,
-          <<1::little-16, 0::little-16, byte_size(reply)::little-16, reply::binary>>
-        )
-    end
+    kernel_reply(kernel, 0x003D, features)
+    kernel_reply(kernel, 0x0054, <<instance, 0, 31, 31>>)
+    kernel_reply(kernel, 0x0055, <<instance>>)
 
     assert TestLeaseHolder.await(ref) == {:ok, instance}
     assert Bluez.Mgmt.held_instances(mgmt) == [{0, instance}]

@@ -219,6 +219,27 @@ defmodule Bluez.MgmtTest do
     assert {:ok, _lease} = Radio.acquire(server: radio, adapter_index: 0, wait: 1_000)
   end
 
+  @tag mgmt_opts: [retry_ms: 20]
+  test "a rollback refused after the lease ended mid-send is retried",
+       %{kernel: kernel, lease: lease} = ctx do
+    ref = advertise_async(ctx, <<2, 1, 6>>, instance: 3)
+    answer_features(kernel)
+    expect_command(kernel, @params)
+    complete(kernel, @params, 0, <<3, 0, 31, 31>>)
+    expect_command(kernel, @data)
+
+    # The lease ends with the data command in flight, which is then refused.
+    :ok = Radio.release(lease)
+    complete(kernel, @data, 0x0D)
+    assert await(ref) == {:error, :invalid_params}
+
+    assert expect_command(kernel, @remove) == <<3>>
+    complete(kernel, @remove, 0x0A)
+    assert expect_command(kernel, @remove) == <<3>>
+    complete(kernel, @remove, 0, <<3>>)
+    assert eventually(fn -> :sys.get_state(ctx.mgmt).instances == %{} end)
+  end
+
   test "the Radio stopping ends every lease", %{kernel: kernel} = ctx do
     advertise_ok(ctx, 2)
 

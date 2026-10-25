@@ -141,7 +141,11 @@ defmodule Bluez.Advertiser do
   Returns `{:error, :instance_conflict}` instead of registering when
   `bluetoothd` could hand this advertisement an instance `Bluez.Mgmt`
   holds on the same controller (see "Sharing the controller with
-  `Bluez.Mgmt`" above).
+  `Bluez.Mgmt`" above), and `{:error, :rotation_busy}` for a finite
+  `duration_ms:` on a controller that rotates instances in software while
+  another instance is registered — it could be unregistered before it ever
+  transmits (see `Bluez.Mgmt`'s "Software rotation"; checked only while
+  `Bluez.Mgmt` is running).
   """
   @spec advertise(Lease.t(), spec(), keyword()) :: {:ok, pos_integer()} | {:error, term()}
   def advertise(lease, spec, opts \\ [])
@@ -151,11 +155,13 @@ defmodule Bluez.Advertiser do
 
     # Checked here, in the caller: only the holder sends, and a bad option
     # must not crash the shared server and lose every other advertisement.
+    mgmt = Keyword.get(opts, :mgmt, Bluez.Mgmt)
+
     with :ok <- Radio.check_holder(lease),
          :ok <- validate_opts(opts),
-         {:ok, props} <- properties(spec) do
-      held = Bluez.Mgmt.held_instances(Keyword.get(opts, :mgmt, Bluez.Mgmt))
-      server_call(server, {:advertise, lease, props, opts, held})
+         {:ok, props} <- properties(spec),
+         :ok <- check_rotation(lease, opts[:duration_ms], mgmt) do
+      server_call(server, {:advertise, lease, props, opts, Bluez.Mgmt.held_instances(mgmt)})
     end
   end
 
@@ -168,6 +174,24 @@ defmodule Bluez.Advertiser do
 
   defp valid_duration?(nil), do: true
   defp valid_duration?(ms), do: is_integer(ms) and ms > 0
+
+  # Without hardware offload the kernel shares one advertising set between
+  # instances in ~2 s software slots, so with any instance already
+  # registered a finite advertisement could be unregistered before it ever
+  # transmits (same rule as Bluez.Mgmt's "Software rotation"). The
+  # controller's features come through Bluez.Mgmt's MGMT socket; without
+  # it running the check is skipped.
+  defp check_rotation(_lease, nil, _mgmt), do: :ok
+
+  defp check_rotation(lease, _duration_ms, mgmt) do
+    case Bluez.Mgmt.read_advertising_features(lease.index, mgmt) do
+      {:ok, %{supported_flags: flags, instances: [_ | _]}} ->
+        if Bluez.Hci.adv_hw_offload?(flags), do: :ok, else: {:error, :rotation_busy}
+
+      _free_or_unknown ->
+        :ok
+    end
+  end
 
   @doc """
   Unregister an advertisement `advertise/3` registered under `lease`
