@@ -21,9 +21,12 @@ defmodule Bluez.AdvertReceiver do
     * Controllers that offload advertisement-monitor filtering (MSFT/AOSP
       extensions) may drop non-matching adverts in passive mode before
       they reach the host; use `:active` mode where every advert matters.
-    * With `DuplicateData=false` (the Client's active-mode filter) some
-      controllers filter duplicates by address alone. Payload-carrying
-      protocols that change their data per packet are unaffected.
+    * With `DuplicateData=false` (the Client's active-mode filter) the
+      controller filters duplicate reports. Most compare address *and*
+      data, so a changed payload still gets through; some compare the
+      address alone and then also suppress changed payloads from an
+      address they've already reported. Protocols that need every packet
+      from one device should be verified on the target controller.
 
   ## Options
 
