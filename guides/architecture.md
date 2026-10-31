@@ -254,9 +254,19 @@ can only happen once `bluetoothd` answers. The contract has two halves:
    (`adapter_path_key/0`), falling back to the lowest-index adapter when
    the MAC is absent. A crash-restart re-resolves against the same term.
 
-Known caveat: the setup retry loop waits for *any* adapter, not the
-desired one — if the desired radio enumerates late (observed with
-UART-attached radios racing rootfs mount on a Raspberry Pi 3), the
+Radios listed under `Bluez.DevicePath.excluded_adapters_key/0` (the
+`exclude_adapters:` opt, published the same way) are dropped before step
+2's matching — never claimed, even when desired (the Client then falls
+back among the rest). When every present adapter is excluded, setup
+behaves exactly as with no adapter: it retries, then stops with
+`:no_adapter`, logging the excluded set instead of "no adapter". The
+claim only: excluded adapters stay in the Client's tracked set, so
+`adapters_info/0` and the `{:bluetooth_adapters_changed}` hotplug
+broadcasts still cover them.
+
+Known caveat: the setup retry loop waits for *any* non-excluded adapter,
+not the desired one — if the desired radio enumerates late (observed
+with UART-attached radios racing rootfs mount on a Raspberry Pi 3), the
 Client falls back until the host restarts the subtree.
 
 ## Benign failure loops

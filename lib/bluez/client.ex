@@ -454,26 +454,45 @@ defmodule Bluez.Client do
   # ── setup ────────────────────────────────────────────────────────────────
 
   defp attempt_setup(state, retries) do
-    case discover_adapters(state.conn) do
-      [] when retries > 0 ->
+    # `discovered` keeps every adapter, excluded ones included: the claim
+    # skips them, but they're still tracked for adapters_info/0 and hotplug
+    # broadcasts so a host's radio list shows every controller.
+    discovered = discover_adapters(state.conn)
+    desired = DevicePath.desired_adapter()
+
+    case select_adapter(discovered, desired, DevicePath.excluded_adapters()) do
+      # Nothing claimable yet — absent and all-excluded alike wait for a
+      # (non-excluded) controller to appear.
+      {:error, _reason} when retries > 0 ->
         Process.send_after(self(), {:setup_retry, retries - 1}, @setup_retry_ms)
         {:noreply, state}
 
-      [] ->
+      {:error, :no_adapter} ->
         # No controllers at all — don't log adapter_path()/the resolved
         # path here: it's a persistent_term that defaults to hci0 (or a
         # previously-selected radio) and would misrepresent the failure.
         # Report the absence + the desired radio for context.
         Logger.error(
           "Bluez.Client: no Bluetooth adapter appeared on org.bluez " <>
-            "(desired: #{DevicePath.desired_adapter() || "auto"})"
+            "(desired: #{desired || "auto"})"
         )
 
         {:stop, :no_adapter, state}
 
-      adapters ->
-        claim_adapter(adapters)
-        state = %{state | adapters: MapSet.new(adapters, & &1.path)}
+      {:error, :all_excluded} ->
+        # Same stop as no adapter (the supervisor's benign retry loop), but
+        # say why: the radios are there, the host told us to leave them be.
+        Logger.error(
+          "Bluez.Client: all #{length(discovered)} Bluetooth adapter(s) present are excluded: " <>
+            Enum.map_join(discovered, ", ", &"#{&1.path} (#{&1.address})") <>
+            " (desired: #{desired || "auto"})"
+        )
+
+        {:stop, :no_adapter, state}
+
+      {:ok, chosen} ->
+        claim_adapter(chosen)
+        state = %{state | adapters: MapSet.new(discovered, & &1.path)}
         power_on(state.conn)
         state = seed_existing(state)
         # Tell RadioMonitor the adapter set is live (its identity is now
@@ -863,27 +882,55 @@ defmodule Bluez.Client do
     Enum.each(rules, &DBus.add_match(conn, &1))
   end
 
-  # Resolve which of the discovered adapters this subtree drives and publish
-  # its object path. The kernel exposes no BT MAC in sysfs, so the
-  # user-selected MAC (DevicePath.desired_adapter/0, written by
-  # Bluetooth.Manager before the subtree started) can only be matched here,
-  # against bluetoothd's Adapter1 objects: the desired MAC's adapter if
-  # present, else the lowest-index one (auto/onboard).
-  defp claim_adapter(adapters) do
-    desired = DevicePath.desired_adapter()
+  @doc false
+  # Pick which of the discovered adapters this subtree drives. The kernel
+  # exposes no BT MAC in sysfs, so the user-selected MAC
+  # (DevicePath.desired_adapter/0, written by the host before the subtree
+  # started) can only be matched here, against bluetoothd's Adapter1
+  # objects. Excluded adapters (upper-cased MACs) are dropped first — they
+  # are never claimed, not even when desired; among the rest, the desired
+  # MAC's adapter if present, else the lowest-index one (auto/onboard).
+  # Public only for unit tests.
+  @spec select_adapter([map()], String.t() | nil, [String.t()]) ::
+          {:ok, map()} | {:error, :no_adapter | :all_excluded}
+  def select_adapter([], _desired, _excluded), do: {:error, :no_adapter}
 
-    chosen =
-      Enum.find(adapters, fn %{address: address} -> address == desired end) ||
-        fallback_adapter(adapters, desired)
+  def select_adapter(adapters, desired, excluded) do
+    case Enum.reject(adapters, &excluded?(&1.address, excluded)) do
+      [] ->
+        {:error, :all_excluded}
 
+      candidates ->
+        chosen =
+          Enum.find(candidates, fn %{address: address} -> address == desired end) ||
+            fallback_adapter(candidates, desired, excluded)
+
+        {:ok, chosen}
+    end
+  end
+
+  defp excluded?(nil, _excluded), do: false
+  defp excluded?(address, excluded), do: String.upcase(address) in excluded
+
+  # Publish the chosen adapter's object path for the whole subtree.
+  defp claim_adapter(chosen) do
     :persistent_term.put(DevicePath.adapter_path_key(), chosen.path)
     :persistent_term.put(DevicePath.resolved_adapter_key(), chosen.path)
     Logger.info("Bluez.Client: driving #{chosen.path} (#{chosen.address})")
   end
 
-  defp fallback_adapter(adapters, desired) do
-    if desired != nil do
-      Logger.warning("Bluez.Client: selected radio #{desired} not present, using first adapter")
+  defp fallback_adapter(adapters, desired, excluded) do
+    cond do
+      desired == nil ->
+        :ok
+
+      excluded?(desired, excluded) ->
+        Logger.warning(
+          "Bluez.Client: selected radio #{desired} is excluded, using first non-excluded adapter"
+        )
+
+      true ->
+        Logger.warning("Bluez.Client: selected radio #{desired} not present, using first adapter")
     end
 
     Enum.min_by(adapters, &path_index(&1.path))

@@ -18,9 +18,11 @@ defmodule Bluez.DevicePath do
        (re)starting the subtree — directly, or via the `desired_adapter:`
        opt on `Bluez.start_link/1`.
     2. `Bluez.Client` — already waiting for the daemon in
-       its setup phase — matches that MAC against the `Adapter1` objects
-       and writes the resolved object path (`adapter_path_key/0`),
-       falling back to the lowest-index adapter when the MAC is absent.
+       its setup phase — drops the excluded adapters
+       (`excluded_adapters_key/0`), matches that MAC against the remaining
+       `Adapter1` objects and writes the resolved object path
+       (`adapter_path_key/0`), falling back to the lowest-index remaining
+       adapter when the MAC is absent or excluded.
 
   The path is then consistent for the lifetime of a subtree incarnation
   (crash-restarts re-resolve against the same desired MAC). The default —
@@ -33,6 +35,7 @@ defmodule Bluez.DevicePath do
   @adapter_path_key {Bluez, :adapter_path}
   @resolved_adapter_key {Bluez, :resolved_adapter_path}
   @desired_adapter_key {Bluez, :desired_adapter}
+  @excluded_adapters_key {Bluez, :excluded_adapters}
   @default_adapter_path "/org/bluez/hci0"
   @max_address 0xFFFFFFFFFFFF
 
@@ -87,6 +90,27 @@ defmodule Bluez.DevicePath do
   @doc "The selected radio MAC (`nil` = auto/first)."
   @spec desired_adapter() :: String.t() | nil
   def desired_adapter, do: :persistent_term.get(@desired_adapter_key, nil)
+
+  @doc """
+  The `:persistent_term` key holding the radio MACs the subtree must never
+  drive (`["AA:BB:CC:DD:EE:FF", …]`, default `[]`) — e.g. a controller
+  the host dedicates to raw-HCI use. Written by the host before each
+  subtree start (or via the `exclude_adapters:` opt); read via
+  `excluded_adapters/0` during `Bluez.Client` setup.
+  """
+  @spec excluded_adapters_key() :: tuple()
+  def excluded_adapters_key, do: @excluded_adapters_key
+
+  @doc """
+  The excluded radio MACs (`[]` = none), upper-cased: BlueZ reports
+  `Address` upper-case, and a host-published term may not be.
+  """
+  @spec excluded_adapters() :: [String.t()]
+  def excluded_adapters do
+    @excluded_adapters_key
+    |> :persistent_term.get([])
+    |> Enum.map(&String.upcase/1)
+  end
 
   @doc """
   Whether `address` is a representable 48-bit MAC. The wire type is uint64,

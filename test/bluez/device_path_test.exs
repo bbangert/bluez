@@ -92,4 +92,68 @@ defmodule Bluez.DevicePathTest do
                {:ok, 0xC0FFEE010203}
     end
   end
+
+  describe "adapter selection terms" do
+    setup do
+      keys = [DevicePath.desired_adapter_key(), DevicePath.excluded_adapters_key()]
+      saved = for key <- keys, do: {key, :persistent_term.get(key, :unset)}
+
+      on_exit(fn ->
+        for {key, value} <- saved do
+          if value == :unset,
+            do: :persistent_term.erase(key),
+            else: :persistent_term.put(key, value)
+        end
+      end)
+
+      Enum.each(keys, &:persistent_term.erase/1)
+    end
+
+    test "excluded_adapters/0 defaults to [] and upper-cases a published term" do
+      assert DevicePath.excluded_adapters() == []
+
+      :persistent_term.put(DevicePath.excluded_adapters_key(), ["aa:bb:cc:dd:ee:ff"])
+      assert DevicePath.excluded_adapters() == ["AA:BB:CC:DD:EE:FF"]
+    end
+
+    test "the exclude_adapters: opt publishes the list, normalised" do
+      :ok = Bluez.publish_adapter_selection(exclude_adapters: ["aa:bb:cc:dd:ee:ff"])
+
+      assert :persistent_term.get(DevicePath.excluded_adapters_key()) == ["AA:BB:CC:DD:EE:FF"]
+    end
+
+    test "an explicit exclude_adapters: [] clears a previously published list" do
+      :persistent_term.put(DevicePath.excluded_adapters_key(), ["AA:BB:CC:DD:EE:FF"])
+
+      :ok = Bluez.publish_adapter_selection(exclude_adapters: [])
+      assert DevicePath.excluded_adapters() == []
+    end
+
+    test "an absent opt leaves a host-published term alone" do
+      :persistent_term.put(DevicePath.excluded_adapters_key(), ["AA:BB:CC:DD:EE:FF"])
+      :persistent_term.put(DevicePath.desired_adapter_key(), "AA:BB:CC:DD:EE:01")
+
+      :ok = Bluez.publish_adapter_selection(audio: false)
+
+      assert DevicePath.excluded_adapters() == ["AA:BB:CC:DD:EE:FF"]
+      assert DevicePath.desired_adapter() == "AA:BB:CC:DD:EE:01"
+    end
+
+    test "desired_adapter: nil still clears a stale selection" do
+      :persistent_term.put(DevicePath.desired_adapter_key(), "AA:BB:CC:DD:EE:01")
+
+      :ok = Bluez.publish_adapter_selection(desired_adapter: nil)
+      assert DevicePath.desired_adapter() == nil
+    end
+
+    test "a malformed exclude_adapters: is refused" do
+      for bad <- ["AA:BB:CC:DD:EE:FF", [:hci0], nil] do
+        assert_raise ArgumentError, ~r/exclude_adapters:/, fn ->
+          Bluez.publish_adapter_selection(exclude_adapters: bad)
+        end
+      end
+
+      assert DevicePath.excluded_adapters() == []
+    end
+  end
 end

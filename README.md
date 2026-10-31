@@ -91,7 +91,7 @@ The core modules carry the reference detail:
 ```elixir
 def deps do
   [
-    {:bluez, "~> 0.4"}
+    {:bluez, "~> 0.5"}
   ]
 end
 ```
@@ -113,6 +113,7 @@ children = [
    client: [on_advertisement: &MyApp.Scanner.on_advertisement/1],
    gatt: [on_gatt_event: &MyApp.BLEProxy.gatt_event/2],
    desired_adapter: nil,     # nil = auto (lowest-index adapter)
+   exclude_adapters: [],     # MACs of radios this stack must never drive
    audio: true}              # bluealsad + Bluez.BlueAlsa
 ]
 ```
