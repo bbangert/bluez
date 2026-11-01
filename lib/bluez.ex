@@ -73,6 +73,19 @@ defmodule Bluez do
       `Bluez.DevicePath.desired_adapter_key/0` BEFORE (re)starting this
       supervisor — the opt and the pre-published term coexist (the opt,
       when present, wins by writing last).
+    * `exclude_adapters:` — list of MAC strings of radios the stack must
+      never drive (default: none), e.g. a controller the host dedicates to
+      raw-HCI use. `Bluez.Client` drops them before matching
+      `desired_adapter:` (an excluded desired radio falls back to the
+      lowest-index remaining one) and, when every present adapter is
+      excluded, treats it like no adapter at all. Compared
+      case-insensitively. They still appear in
+      `Bluez.Client.adapters_info/0`. Written to `:persistent_term` before
+      the children start; `[]` clears an earlier list. Hosts that change
+      exclusions at runtime may instead publish the term themselves under
+      `Bluez.DevicePath.excluded_adapters_key/0` BEFORE (re)starting this
+      supervisor — as with `desired_adapter:`, the opt, when present, wins
+      by writing last.
     * `dbus_daemon_path:` — dbus-daemon binary (default
       `/usr/bin/dbus-daemon`).
     * `bluetoothd_path:` — bluetoothd binary (default
@@ -129,14 +142,7 @@ defmodule Bluez do
   @impl Supervisor
   def init(opts) do
     prepare_runtime()
-
-    # Publish the desired radio before any child can resolve it (see the
-    # `desired_adapter:` opt doc; Keyword.fetch so an explicit nil = auto
-    # is also written, clearing a stale earlier selection).
-    case Keyword.fetch(opts, :desired_adapter) do
-      {:ok, mac} -> :persistent_term.put(Bluez.DevicePath.desired_adapter_key(), mac)
-      :error -> :ok
-    end
+    publish_adapter_selection(opts)
 
     # Explicit restart budget so the documented "benign endless retry
     # loop" (Client `{:stop, :no_adapter}` while the controller is absent)
@@ -145,6 +151,36 @@ defmodule Bluez do
     # both fit in 10-per-60 s, while a genuinely hot crash loop still
     # escalates to the host's supervisor within a minute.
     Supervisor.init(children(opts), strategy: :rest_for_one, max_restarts: 10, max_seconds: 60)
+  end
+
+  # Publish the desired/excluded radios before any child can resolve them
+  # (see the `desired_adapter:`/`exclude_adapters:` opt docs). Keyword.fetch
+  # so an explicit nil = auto / [] = none is also written, clearing a stale
+  # earlier selection; an absent opt leaves a host-published term alone.
+  @doc false
+  @spec publish_adapter_selection(keyword()) :: :ok
+  def publish_adapter_selection(opts) do
+    case Keyword.fetch(opts, :desired_adapter) do
+      {:ok, mac} -> :persistent_term.put(Bluez.DevicePath.desired_adapter_key(), mac)
+      :error -> :ok
+    end
+
+    case Keyword.fetch(opts, :exclude_adapters) do
+      {:ok, macs} ->
+        :persistent_term.put(Bluez.DevicePath.excluded_adapters_key(), normalize_macs!(macs))
+
+      :error ->
+        :ok
+    end
+  end
+
+  defp normalize_macs!(macs) do
+    if is_list(macs) and Enum.all?(macs, &is_binary/1) do
+      Enum.map(macs, &String.upcase/1)
+    else
+      raise ArgumentError,
+            "exclude_adapters: expected a list of MAC strings, got: #{inspect(macs)}"
+    end
   end
 
   @doc """

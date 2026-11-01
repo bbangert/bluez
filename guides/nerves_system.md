@@ -84,7 +84,8 @@ CONFIG_BT_HCIBTUSB_MTK=y
 
 `btusb` probes on USB enumeration — no attach step, independent of the
 serdev path above. With both configured, onboard and USB radios coexist
-and `desired_adapter:` picks which one this library drives.
+and `desired_adapter:` picks which one this library drives
+(`exclude_adapters:` keeps it off one you dedicate elsewhere).
 
 ## Device tree (Raspberry Pi)
 

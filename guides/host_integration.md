@@ -34,6 +34,9 @@ defmodule MyApp.Bluetooth do
      audio: true,
      blue_alsa: [pubsub: MyApp.PubSub],
      desired_adapter: nil,
+     # Radios this stack must never claim (e.g. one your app drives over
+     # raw HCI). Still listed by Bluez.Client.adapters_info/0.
+     exclude_adapters: [],
      extra_children: [
        # Your own BlueZ consumers. They restart with the audio path and
        # can rely on everything above them being up.
@@ -243,6 +246,18 @@ manager process:
 Active connections drop by design; the scanner re-engages the configured
 mode on the new radio. For a fixed single-radio device, skip all of this
 and pass `desired_adapter:` (or nothing — auto).
+
+To dedicate a controller to something else (say, a protocol your app
+drives over raw HCI), list its MAC in `exclude_adapters:` — or, if the set
+changes at runtime, publish it under
+`Bluez.DevicePath.excluded_adapters_key/0` in step 1 alongside the
+desired MAC. `Bluez.Client` then never claims it: an excluded desired
+radio falls back to the lowest-index remaining one, and with every
+present adapter excluded the Client waits and stops with `:no_adapter`
+exactly as if none were there (logging that they are all excluded).
+Excluded radios still appear in `Bluez.Client.adapters_info/0`, so a
+radio picker keeps showing them. The library only stops *claiming* the
+controller: `bluetoothd` still manages it like any other.
 
 ## Status surfaces
 
