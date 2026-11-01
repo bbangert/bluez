@@ -381,7 +381,8 @@ defmodule Bluez.ClientTest do
 
     # A Client running its real setup (500 ms retries) and real mode calls
     # against a BusStub serving `objects`; returns {client, bus}. The first
-    # setup attempt has completed when this returns.
+    # setup attempt has completed when this returns, and its discovery call
+    # is drained so a later `GetManagedObjects` receive waits for a retry.
     defp start_retrying_client(objects, opts \\ []) do
       {:ok, bus} = BusStub.start_link(objects, self())
 
@@ -393,6 +394,7 @@ defmodule Bluez.ClientTest do
       end)
 
       _ = :sys.get_state(client)
+      assert_receive {:bus_call, "GetManagedObjects", "/"}, 1_000
       {client, bus}
     end
 
