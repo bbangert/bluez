@@ -44,7 +44,9 @@ defmodule Bluez.Client do
       mid-transition parks in a one-slot pending queue keyed by target mode:
       callers asking for the same target coalesce (all get `:ok` when it
       lands); a different target displaces them with `{:error, :superseded}`
-      (latest target wins).
+      (latest target wins). Until setup has claimed an adapter, requests
+      park the same way and the claim runs them — so nothing is ever
+      engaged on an unresolved (possibly excluded) adapter path.
     * Transitions engage the new mode BEFORE disengaging the old one
       (monitor and discovery can legally coexist in BlueZ): a failed engage
       leaves the previous mode still scanning rather than going dark.
@@ -127,7 +129,9 @@ defmodule Bluez.Client do
   transition's own result. Only callers parked *behind* an in-flight
   transition can get `{:error, :superseded}` — when a newer `set_mode/1`
   asking for a different mode displaces them (same-mode callers coalesce
-  and succeed together).
+  and succeed together). Before this Client has claimed an adapter, a
+  request parks the same way and runs once setup claims one; if setup
+  gives up instead (`:no_adapter`), the caller gets the Client's exit.
 
   Callers must `catch :exit` for the not-running/timeout cases (see the
   moduledoc idiom note in `Bluez`).
@@ -256,7 +260,13 @@ defmodule Bluez.Client do
           # seeded at setup and maintained from InterfacesAdded/Removed.
           # `adapters_info/0` does a cheap per-path GetAll over this set
           # instead of a whole-tree GetManagedObjects.
-          adapters: MapSet.new()
+          adapters: MapSet.new(),
+          # Whether this incarnation has claimed an adapter. Until it has,
+          # adapter_path/0 is the hci0 default or a previous incarnation's
+          # pick — possibly an excluded radio — so mode requests park in
+          # `pending` and setup engages them after the claim. `setup: false`
+          # (test seam) never claims, so there is nothing to wait for.
+          claimed: not Keyword.get(opts, :setup, true)
         }
 
         if Keyword.get(opts, :setup, true) do
@@ -305,6 +315,12 @@ defmodule Bluez.Client do
       # into one pending slot and all succeed together; a different target
       # displaces them (latest target wins).
       state.transition != nil ->
+        merge_pending(state, target, froms)
+
+      # No adapter claimed yet: every D-Bus call would hit an unresolved
+      # (maybe excluded) adapter path. Park with the same coalesce/displace
+      # rules; attempt_setup's claim runs it.
+      not state.claimed ->
         merge_pending(state, target, froms)
 
       # Already there (and actually engaged — a failed initial setup leaves
@@ -465,7 +481,7 @@ defmodule Bluez.Client do
       # (non-excluded) controller to appear.
       {:error, _reason} when retries > 0 ->
         Process.send_after(self(), {:setup_retry, retries - 1}, @setup_retry_ms)
-        {:noreply, state}
+        {:noreply, track_unclaimed(state, discovered)}
 
       {:error, :no_adapter} ->
         # No controllers at all — don't log adapter_path()/the resolved
@@ -500,15 +516,38 @@ defmodule Bluez.Client do
         # replaced its poll; hotplug edges come from InterfacesAdded/Removed.
         broadcast_adapters_changed(state)
 
-        # An early set_mode/1 may already have a transition in flight (its
-        # D-Bus calls work as soon as the adapter answers) — don't race it;
-        # it engages the caller's mode and run_pending takes over from there.
-        state =
-          if state.transition == nil,
-            do: start_transition(state, configured_mode(), []),
-            else: state
+        {:noreply, engage_after_claim(%{state | claimed: true})}
+    end
+  end
 
-        {:noreply, state}
+  # Mode requests that arrived before the claim parked in `pending`: engage
+  # that (it answers its callers, and a parked suspend_scan/0 stays
+  # honoured) instead of the configured mode. A transition can only already
+  # be in flight under the `setup: false` test seam — don't race it;
+  # run_pending takes over when it lands.
+  defp engage_after_claim(%{transition: nil, pending: nil} = state),
+    do: start_transition(state, configured_mode(), [])
+
+  defp engage_after_claim(%{transition: nil} = state), do: run_pending(state)
+  defp engage_after_claim(state), do: state
+
+  # While setup waits for a claimable adapter, still track the adapters it
+  # can see (e.g. all excluded) so adapters_info/0 lists them — they exist
+  # already, so no InterfacesAdded will announce them later. Broadcast only
+  # when the set actually changes, so retries don't repeat it. An empty
+  # discovery is left alone: it is also what a failed GetManagedObjects
+  # returns, and InterfacesRemoved already untracks real removals.
+  defp track_unclaimed(state, []), do: state
+
+  defp track_unclaimed(state, discovered) do
+    adapters = MapSet.new(discovered, & &1.path)
+
+    if MapSet.equal?(adapters, state.adapters) do
+      state
+    else
+      state = %{state | adapters: adapters}
+      broadcast_adapters_changed(state)
+      state
     end
   end
 

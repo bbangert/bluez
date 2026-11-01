@@ -35,41 +35,52 @@ defmodule Bluez.ClientTest do
   defmodule BusStub do
     @moduledoc """
     A `Bluez.Rebus.Connection` stand-in that answers the setup path's
-    D-Bus calls from a fixed org.bluez object tree: `GetManagedObjects`
+    D-Bus calls from an org.bluez object tree: `GetManagedObjects`
     returns `objects` whole, `Properties.GetAll` the object's props, and
-    every other method call an empty return (so `power_on` etc. succeed).
+    every other method call an empty return (so `power_on` and the real
+    mode calls succeed). Every method call is reported to `tap` as
+    `{:bus_call, member, path}`; `set_objects/2` swaps the tree (e.g. a
+    radio appearing between setup retries).
     """
     use GenServer
 
     alias Bluez.Rebus.Message
 
-    def start_link(objects), do: GenServer.start_link(__MODULE__, objects)
+    def start_link(objects, tap \\ nil),
+      do: GenServer.start_link(__MODULE__, %{objects: objects, tap: tap})
+
+    def set_objects(stub, objects), do: GenServer.call(stub, {:set_objects, objects})
 
     @impl true
-    def init(objects), do: {:ok, objects}
+    def init(state), do: {:ok, state}
 
     @impl true
-    def handle_call({:add_signal_handler, _pid}, _from, objects),
-      do: {:reply, make_ref(), objects}
+    def handle_call({:add_signal_handler, _pid}, _from, state),
+      do: {:reply, make_ref(), state}
 
-    def handle_call({:send, %Message{header_fields: hf}}, _from, objects) do
+    def handle_call({:set_objects, objects}, _from, state),
+      do: {:reply, :ok, %{state | objects: objects}}
+
+    def handle_call({:send, %Message{header_fields: hf}}, _from, state) do
+      if state.tap, do: send(state.tap, {:bus_call, hf[:member], hf[:path]})
+
       body =
         case hf[:member] do
           "GetManagedObjects" ->
-            [objects]
+            [state.objects]
 
           "GetAll" ->
-            {_path, [{_iface, props}]} = List.keyfind(objects, hf[:path], 0)
+            {_path, [{_iface, props}]} = List.keyfind(state.objects, hf[:path], 0)
             [props]
 
           _other ->
             []
         end
 
-      {:reply, method_return(body), objects}
+      {:reply, method_return(body), state}
     end
 
-    def handle_call(_other, _from, objects), do: {:reply, :ok, objects}
+    def handle_call(_other, _from, state), do: {:reply, :ok, state}
 
     defp method_return(body) do
       %Message{
@@ -337,7 +348,10 @@ defmodule Bluez.ClientTest do
         Bluez.DevicePath.adapter_path_key(),
         Bluez.DevicePath.resolved_adapter_key(),
         Bluez.DevicePath.desired_adapter_key(),
-        Bluez.DevicePath.excluded_adapters_key()
+        Bluez.DevicePath.excluded_adapters_key(),
+        # Client's private configured-mode term: a set_mode/1 here would
+        # otherwise leak :active into later tests.
+        {Client, :configured_mode}
       ]
 
       saved = for key <- keys, do: {key, :persistent_term.get(key, :unset)}
@@ -364,6 +378,25 @@ defmodule Bluez.ClientTest do
           ]}
        ]}
     end
+
+    # A Client running its real setup (500 ms retries) and real mode calls
+    # against a BusStub serving `objects`; returns {client, bus}. The first
+    # setup attempt has completed when this returns.
+    defp start_retrying_client(objects, opts \\ []) do
+      {:ok, bus} = BusStub.start_link(objects, self())
+
+      {:ok, client} =
+        Client.start_link(Keyword.merge([connect_fun: fn -> {:ok, bus} end], opts))
+
+      on_exit(fn ->
+        for pid <- [client, bus], Process.alive?(pid), do: Process.exit(pid, :kill)
+      end)
+
+      _ = :sys.get_state(client)
+      {client, bus}
+    end
+
+    @mode_calls ["SetDiscoveryFilter", "StartDiscovery", "RegisterMonitor"]
 
     # A Client wired to a BusStub serving `objects`, with setup deferred:
     # the test triggers the final setup attempt itself ({:setup_retry, 0}),
@@ -438,6 +471,56 @@ defmodule Bluez.ClientTest do
       _ = :sys.get_state(client)
 
       assert Bluez.DevicePath.resolved_adapter_path() == {:ok, "/org/bluez/hci1"}
+    end
+
+    test "an early mode request waits out an all-excluded retry, then runs on the claim" do
+      :persistent_term.put(Bluez.DevicePath.excluded_adapters_key(), ["AA:BB:CC:DD:EE:00"])
+      excluded = adapter_object(0, "AA:BB:CC:DD:EE:00")
+      {client, bus} = start_retrying_client([excluded])
+
+      # adapter_path/0 still answers the hci0 default here — exactly the
+      # excluded radio — so engaging now would scan on it.
+      task = Task.async(fn -> Client.set_mode(:active) end)
+      _ = :sys.get_state(client)
+
+      # A whole retry passes with the request parked: no mode call at all.
+      assert_receive {:bus_call, "GetManagedObjects", "/"}, 2_000
+      for member <- @mode_calls, do: refute_received({:bus_call, ^member, _path})
+      assert Task.yield(task, 0) == nil
+
+      # A claimable radio appears; the next retry claims it and the parked
+      # request engages there, answering the caller.
+      :ok = BusStub.set_objects(bus, [excluded, adapter_object(1, "AA:BB:CC:DD:EE:01")])
+      assert Task.await(task, 3_000) == :ok
+
+      assert Bluez.DevicePath.resolved_adapter_path() == {:ok, "/org/bluez/hci1"}
+      assert_received {:bus_call, "SetDiscoveryFilter", "/org/bluez/hci1"}
+      assert_received {:bus_call, "StartDiscovery", "/org/bluez/hci1"}
+
+      for member <- @mode_calls,
+          do: refute_received({:bus_call, ^member, "/org/bluez/hci0"})
+    end
+
+    test "an all-excluded retry still tracks (and announces once) the present adapters" do
+      pubsub = :"#{__MODULE__}.PubSub"
+      start_supervised!({Phoenix.PubSub, name: pubsub})
+      Phoenix.PubSub.subscribe(pubsub, Client.adapters_topic())
+
+      :persistent_term.put(Bluez.DevicePath.excluded_adapters_key(), ["AA:BB:CC:DD:EE:00"])
+
+      {client, _bus} =
+        start_retrying_client([adapter_object(0, "AA:BB:CC:DD:EE:00")], pubsub: pubsub)
+
+      assert [%{path: "/org/bluez/hci0", address: "AA:BB:CC:DD:EE:00"}] =
+               GenServer.call(client, :adapters_info)
+
+      assert_received {:bluetooth_adapters_changed}
+
+      # Later retries see the same set: no repeat broadcast.
+      assert_receive {:bus_call, "GetManagedObjects", "/"}, 2_000
+      _ = :sys.get_state(client)
+      refute_received {:bluetooth_adapters_changed}
+      assert Bluez.DevicePath.resolved_adapter_path() == :error
     end
   end
 end

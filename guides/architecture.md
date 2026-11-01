@@ -262,7 +262,10 @@ behaves exactly as with no adapter: it retries, then stops with
 `:no_adapter`, logging the excluded set instead of "no adapter". The
 claim only: excluded adapters stay in the Client's tracked set, so
 `adapters_info/0` and the `{:bluetooth_adapters_changed}` hotplug
-broadcasts still cover them.
+broadcasts still cover them — also while setup is still retrying. Mode
+requests (`set_mode/1`, `resume_scan/0`) arriving before the claim park
+and run once an adapter is claimed, so nothing ever scans on an
+unresolved (possibly excluded) adapter path.
 
 Known caveat: the setup retry loop waits for *any* non-excluded adapter,
 not the desired one — if the desired radio enumerates late (observed
