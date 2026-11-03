@@ -1,6 +1,6 @@
 defmodule Bluez.Hci do
   @moduledoc """
-  Kernel Bluetooth socket plumbing and pure codecs for the two
+  Kernel Bluetooth socket plumbing and pure codecs for the
   `AF_BLUETOOTH`/`BTPROTO_HCI` channels this library talks to directly
   (everything else goes through `bluetoothd` over D-Bus):
 
@@ -13,6 +13,9 @@ defmodule Bluez.Hci do
       advertising instances whose data `LEAdvertisement1` refuses to carry
       (raw Flags, Local Name and 128-bit UUID lists in the advertising PDU
       itself) — `Bluez.Mgmt`.
+    * **`HCI_CHANNEL_USER`** — exclusive, raw access to one controller:
+      the kernel and `bluetoothd` let go of it while the socket is bound
+      (`Bluez.HciUser`).
 
   Sockets are opened with OTP's `:socket` using integer protocol constants
   and native `sockaddr`s — no NIF or port. Opening needs `CAP_NET_RAW`
@@ -30,6 +33,7 @@ defmodule Bluez.Hci do
   @hci_filter 2
 
   @channel_raw 0
+  @channel_user 1
   @channel_control 3
   @dev_none 0xFFFF
 
@@ -46,6 +50,9 @@ defmodule Bluez.Hci do
   @mgmt_ev_adv_removed 0x0024
 
   # MGMT commands.
+  @mgmt_op_read_index_list 0x0003
+  @mgmt_op_read_controller_info 0x0004
+  @mgmt_op_set_powered 0x0005
   @mgmt_op_read_adv_features 0x003D
   @mgmt_op_remove_advertising 0x003F
   @mgmt_op_add_ext_adv_params 0x0054
@@ -96,7 +103,7 @@ defmodule Bluez.Hci do
   }
 
   @typedoc "Which HCI socket channel to open."
-  @type channel :: :raw | :control
+  @type channel :: :raw | :control | :user
 
   @typedoc """
   One LE advertising report, normalized across the legacy (`0x02`) and
@@ -150,9 +157,20 @@ defmodule Bluez.Hci do
       with a filter passing only LE Meta events (the advertising reports).
     * `open(:control, _)` — `HCI_CHANNEL_CONTROL` (MGMT), bound to no
       controller (commands carry their own index).
+    * `open(:user, index)` — `HCI_CHANNEL_USER`: exclusive access to
+      controller `index`, H4 packets in both directions (packet-type byte
+      first). The kernel only binds a controller that is powered off
+      (`:ebusy` otherwise; MGMT Set Powered off first, see
+      `Bluez.HciUser`). While the socket is bound the kernel removes the
+      index from MGMT (an Index Removed event), so `bluetoothd` drops the
+      adapter; closing the socket hands it back (Index Added) and
+      `bluetoothd` takes it over again. Prefer `Bluez.HciUser`, which owns
+      the socket and runs the command flow control.
 
   Returns `{:ok, socket}` or `{:error, reason}` (`:eafnosupport` on a
-  kernel without Bluetooth, `:eperm`/`:eacces` without the capability).
+  kernel without Bluetooth, `:eperm`/`:eacces` without the capability,
+  `:ebusy` for a controller that is up or already bound, `:enodev` for an
+  index that doesn't exist).
   """
   @spec open(channel(), non_neg_integer()) :: {:ok, :socket.socket()} | {:error, term()}
   def open(channel, index \\ 0) do
@@ -176,6 +194,8 @@ defmodule Bluez.Hci do
 
   defp setup(sock, :control, _index),
     do: :socket.bind(sock, sockaddr(@dev_none, @channel_control))
+
+  defp setup(sock, :user, index), do: :socket.bind(sock, sockaddr(index, @channel_user))
 
   @doc """
   Native `struct sockaddr_hci` for `:socket.bind/2`: family, then device
@@ -334,6 +354,18 @@ defmodule Bluez.Hci do
   @spec mgmt_command(non_neg_integer(), non_neg_integer(), binary()) :: binary()
   def mgmt_command(opcode, index, params \\ <<>>),
     do: <<opcode::little-16, index::little-16, byte_size(params)::little-16, params::binary>>
+
+  @doc "Opcode of MGMT Read Index List (no parameters; sent to `index_none/0`)."
+  @spec op_read_index_list() :: non_neg_integer()
+  def op_read_index_list, do: @mgmt_op_read_index_list
+
+  @doc "Opcode of MGMT Read Controller Information (no parameters)."
+  @spec op_read_controller_info() :: non_neg_integer()
+  def op_read_controller_info, do: @mgmt_op_read_controller_info
+
+  @doc "Opcode of MGMT Set Powered (`<<0>>` off, `<<1>>` on)."
+  @spec op_set_powered() :: non_neg_integer()
+  def op_set_powered, do: @mgmt_op_set_powered
 
   @doc "Opcode of MGMT Read Advertising Features (no parameters)."
   @spec op_read_adv_features() :: non_neg_integer()
@@ -526,4 +558,51 @@ defmodule Bluez.Hci do
   end
 
   def decode_adv_features(_bin), do: :error
+
+  @doc """
+  Decode the return parameters of Read Index List: the controller indexes
+  the kernel currently exposes over MGMT (a controller bound to a user
+  channel is not among them).
+
+      iex> Bluez.Hci.decode_index_list(<<2::little-16, 0::little-16, 1::little-16>>)
+      {:ok, [0, 1]}
+  """
+  @spec decode_index_list(binary()) :: {:ok, [non_neg_integer()]} | :error
+  def decode_index_list(<<count::little-16, indexes::binary-size(count * 2), _::binary>>),
+    do: {:ok, for(<<index::little-16 <- indexes>>, do: index)}
+
+  def decode_index_list(_bin), do: :error
+
+  @doc """
+  Decode the return parameters of Read Controller Information. `address`
+  is packed MSB-first like `t:adv_report/0`'s; `powered` is bit 0 of the
+  current settings.
+  """
+  @spec decode_controller_info(binary()) ::
+          {:ok,
+           %{
+             address: non_neg_integer(),
+             version: byte(),
+             manufacturer: non_neg_integer(),
+             supported_settings: non_neg_integer(),
+             current_settings: non_neg_integer(),
+             powered: boolean()
+           }}
+          | :error
+  def decode_controller_info(
+        <<addr::binary-size(6), version, manufacturer::little-16, supported::little-32,
+          current::little-32, _::binary>>
+      ) do
+    {:ok,
+     %{
+       address: address(addr),
+       version: version,
+       manufacturer: manufacturer,
+       supported_settings: supported,
+       current_settings: current,
+       powered: (current &&& 1) == 1
+     }}
+  end
+
+  def decode_controller_info(_bin), do: :error
 end

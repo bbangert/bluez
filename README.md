@@ -47,6 +47,7 @@ The core modules carry the reference detail:
 - `Bluez.Mgmt` — LE advertising with verbatim AD bytes (kernel MGMT)
 - `Bluez.Radio` — per-controller ownership for advertising
 - `Bluez.AdvertReceiver` — verbatim advertising reports off the HCI socket
+- `Bluez.HciUser` — exclusive raw HCI access to a dedicated controller
 
 ## Features
 
@@ -80,6 +81,13 @@ The core modules carry the reference detail:
   controller's legacy and extended advertising reports off an HCI raw
   socket, AD bytes untouched, for protocols that BlueZ's per-device
   property merging would destroy. Pure `:socket`, no NIF or port.
+- **Exclusive controller access** (opt-in) — `Bluez.HciUser` takes a
+  dedicated controller away from `bluetoothd` over an `HCI_CHANNEL_USER`
+  socket and speaks raw HCI: commands with the controller's flow control
+  and timeouts, advertising reports and errors delivered to an owner
+  process, and the controller handed back to BlueZ on close. For protocols
+  that scan and advertise continuously, where `bluetoothd` would cost more
+  CPU than the protocol itself.
 - **bluez-alsa integration** (optional) — enumerates ready-to-open A2DP
   playback PCMs and signals your app when the set changes.
 - **No host coupling** — configuration flows exclusively through
@@ -91,7 +99,7 @@ The core modules carry the reference detail:
 ```elixir
 def deps do
   [
-    {:bluez, "~> 0.5"}
+    {:bluez, "~> 0.6"}
   ]
 end
 ```
@@ -141,7 +149,7 @@ option surface and event contract.
   distro dbus/bluetoothd).
 - Optional: bluez-alsa v4 for `audio: true`.
 - Optional: `CAP_NET_RAW`/`CAP_NET_ADMIN` (root on Nerves) for
-  `Bluez.AdvertReceiver`/`Bluez.Mgmt`; Linux ≥ 5.17 for `Bluez.Mgmt`
+  `Bluez.AdvertReceiver`/`Bluez.Mgmt`/`Bluez.HciUser`; Linux ≥ 5.17 for `Bluez.Mgmt`
   (extended advertising commands, queued by the kernel instead of refused
   as busy while another is pending).
 - Writable `/run/dbus` and `/data/bluetooth`; on a read-only rootfs point

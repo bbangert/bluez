@@ -1,7 +1,7 @@
 defmodule Bluez.MixProject do
   use Mix.Project
 
-  @version "0.5.2"
+  @version "0.6.0"
   @source_url "https://github.com/bbangert/bluez"
 
   def project do
@@ -89,7 +89,9 @@ defmodule Bluez.MixProject do
           Bluez.Mgmt,
           Bluez.AdvertReceiver,
           Bluez.AdData,
-          Bluez.Hci
+          Bluez.Hci,
+          Bluez.HciUser,
+          Bluez.HciUser.Codec
         ],
         GATT: [
           Bluez.Gatt,
