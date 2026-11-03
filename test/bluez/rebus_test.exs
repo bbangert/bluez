@@ -8,6 +8,7 @@ defmodule Bluez.RebusTest do
 
   alias Bluez.Rebus.Connection
   alias Bluez.Rebus.Message
+  alias Bluez.Rebus.SignalHandler
   alias Bluez.Rebus.TestServer
 
   describe "Connections" do
@@ -298,6 +299,128 @@ defmodule Bluez.RebusTest do
                [{"Value", {"ay", [1, 2, 3]}}],
                []
              ] = rcvd.body
+    end
+  end
+
+  describe "Partial reads" do
+    setup [:server_setup, :client_setup]
+
+    test "a message split at every byte boundary is delivered and the connection survives",
+         %{cli: cli, svr: svr} do
+      ref = Bluez.Rebus.add_signal_handler(cli)
+
+      signal =
+        Message.new!(
+          :signal,
+          path: "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF",
+          interface: "org.freedesktop.DBus.Properties",
+          member: "PropertiesChanged",
+          signature: "sa{sv}as",
+          body: ["org.bluez.Device1", [{"RSSI", {"n", -61}}], []]
+        )
+
+      {:ok, iodata} = Message.encode(%{signal | serial: 100})
+      binary = IO.iodata_to_binary(iodata)
+
+      for split <- 1..(byte_size(binary) - 1) do
+        <<head::binary-size(^split), tail::binary>> = binary
+        :ok = TestServer.push_raw(svr, head)
+        # The connection buffers the head and waits (rather than stopping).
+        assert await_buffered(cli, split)
+        :ok = TestServer.push_raw(svr, tail)
+
+        assert_receive {^ref, %Message{header_fields: %{member: "PropertiesChanged"}}}, 1_000
+        assert Process.alive?(cli)
+      end
+    end
+  end
+
+  describe "Buffered messages" do
+    setup [:server_setup]
+
+    test "complete messages read together with the Hello reply are delivered at once",
+         %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      {:ok, cli} = Bluez.Rebus.connect(addr)
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+
+      # Register straight on the signal bus: add_signal_handler/1 is a call
+      # the connection can't serve until the Hello exchange is over.
+      ref = make_ref()
+      :ok = :gen_event.add_handler(SignalHandler, {SignalHandler, ref}, {cli, self(), ref})
+      on_exit(fn -> :gen_event.delete_handler(SignalHandler, {SignalHandler, ref}, nil) end)
+
+      frames =
+        [
+          Message.new!(:method_return,
+            reply_serial: 1,
+            signature: "s",
+            flags: [],
+            body: [":1.100"]
+          ),
+          Message.new!(:signal,
+            path: "/org/freedesktop/DBus",
+            interface: "org.freedesktop.DBus",
+            member: "NameAcquired",
+            destination: ":1.100",
+            signature: "s",
+            body: [":1.100"]
+          ),
+          Message.new!(:signal,
+            path: "/org/freedesktop/DBus",
+            interface: "org.freedesktop.DBus",
+            member: "Buffered",
+            signature: "s",
+            body: ["foobar"]
+          )
+        ]
+        |> Enum.with_index(1)
+        |> Enum.map(fn {msg, serial} ->
+          {:ok, iodata} = Message.encode(%{msg | serial: serial})
+          iodata
+        end)
+
+      # One write, so the connection reads all three in a single recv.
+      :ok = TestServer.push_raw(svr, IO.iodata_to_binary(frames))
+
+      assert_receive {^ref, %Message{header_fields: %{member: "Buffered"}}}, 1_000
+    end
+  end
+
+  describe "Malformed messages" do
+    setup [:server_setup, :client_setup]
+
+    test "a complete message with a corrupt type byte stops the connection cleanly",
+         %{cli: cli, svr: svr} do
+      # Finish the Hello continuations first, so the frame can't be read
+      # together with the Hello reply.
+      :sys.get_state(cli)
+
+      signal =
+        Message.new!(:signal, path: "/", interface: "test.Interface", member: "Test")
+
+      {:ok, iodata} = Message.encode(%{signal | serial: 100})
+      <<endian, _type, rest::binary>> = IO.iodata_to_binary(iodata)
+
+      ref = Process.monitor(cli)
+      :ok = TestServer.push_raw(svr, <<endian, 0xFF, rest::binary>>)
+
+      assert_receive {:DOWN, ^ref, :process, ^cli, {:invalid_message, :invalid_message_type}},
+                     1_000
+    end
+  end
+
+  defp await_buffered(cli, size, attempts \\ 200) do
+    cond do
+      byte_size(:sys.get_state(cli).prev) == size ->
+        true
+
+      attempts == 0 ->
+        false
+
+      true ->
+        Process.sleep(5)
+        await_buffered(cli, size, attempts - 1)
     end
   end
 

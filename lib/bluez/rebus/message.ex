@@ -442,7 +442,8 @@ defmodule Bluez.Rebus.Message do
       <<endian_flag, _type_byte, _flags_byte, _version_byte, body_length::binary-size(4),
         _serial::binary-size(4), rest::binary>> = binary
 
-      # Determine endianness
+      # Determine endianness. extract_array_length/2 yields nil (the `with`
+      # result) until the 4-byte header-fields length has arrived too.
       with {:ok, endianness} <- parse_endianness(endian_flag),
            {:ok, header_fields_length} <- extract_array_length(rest, endianness) do
         # Calculate header fields size: array length field (4 bytes) + array data
@@ -837,6 +838,8 @@ defmodule Bluez.Rebus.Message do
   defp parse_endianness(?B), do: {:ok, :big}
   defp parse_endianness(_), do: {:error, :invalid_endianness}
 
+  # nil (not an error) when the 4-byte length hasn't fully arrived: parse/1
+  # passes that straight through as "need more data".
   defp extract_array_length(binary, endianness) do
     # D-Bus arrays start with a 4-byte length field
     if byte_size(binary) >= 4 do
@@ -849,8 +852,6 @@ defmodule Bluez.Rebus.Message do
           <<array_length::big-32, _rest::binary>> = binary
           {:ok, array_length}
       end
-    else
-      {:error, :insufficient_data}
     end
   end
 

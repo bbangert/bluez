@@ -163,7 +163,9 @@ defmodule Bluez.Rebus.Connection do
       {:ok, data} ->
         case Message.parse(state.prev <> data) do
           {:ok, %Message{type: :method_return, header_fields: %{reply_serial: 1}} = msg, rest} ->
-            {:noreply, %{state | name: hd(msg.body), prev: rest}, {:continue, :recv}}
+            # Anything read past the reply is already complete messages:
+            # parse them now rather than when the next socket data arrives.
+            parse(rest, %{state | name: hd(msg.body), prev: <<>>})
 
           nil ->
             # Incomplete message, store data for next recv
@@ -245,7 +247,7 @@ defmodule Bluez.Rebus.Connection do
         {:noreply, %{state | prev: data}, {:continue, :recv}}
 
       {:error, reason} ->
-        {:stop, reason}
+        {:stop, {:invalid_message, reason}, state}
     end
   end
 
