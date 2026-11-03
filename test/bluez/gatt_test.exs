@@ -11,6 +11,33 @@ defmodule Bluez.GattTest do
   @address 0xAABBCCDDEEFF
   @gen 7
 
+  defmodule BusTap do
+    @moduledoc """
+    A `Bluez.Rebus.Connection` stand-in: reports every message sent through
+    it to `tap` as `{:bus_send, member, body, flags}` and answers `:ok`.
+    """
+    use GenServer
+
+    def start_link(tap), do: GenServer.start_link(__MODULE__, tap)
+
+    @impl true
+    def init(tap), do: {:ok, tap}
+
+    @impl true
+    def handle_call({:send, %Bluez.Rebus.Message{} = msg}, _from, tap) do
+      send(tap, {:bus_send, msg.header_fields[:member], msg.body, msg.flags})
+      {:reply, :ok, tap}
+    end
+  end
+
+  # Every handler state gets a BusTap as its connection (state/2 reads it
+  # from the test process's dictionary), so match-rule traffic is observable.
+  setup do
+    {:ok, conn} = BusTap.start_link(self())
+    Process.put(:bus_tap, conn)
+    :ok
+  end
+
   defp entry(subscriber, overrides \\ %{}) do
     Map.merge(
       %{
@@ -30,6 +57,7 @@ defmodule Bluez.GattTest do
   defp state(subscriber, overrides \\ %{}) do
     Map.merge(
       %{
+        conn: Process.get(:bus_tap),
         conns: %{@address => entry(subscriber)},
         notify_paths: %{},
         gen_seq: @gen,
@@ -92,11 +120,13 @@ defmodule Bluez.GattTest do
                  state
                )
 
-      # The op reply must land before the connection teardown envelope.
+      # The op reply must land before the connection teardown envelope;
+      # dropping the entry then removes its signal match rule.
       assert {:messages,
               [
                 {:gatt_unpair, @address, true, 0},
-                {:gatt_connection, @address, {:error, -2}}
+                {:gatt_connection, @address, {:error, -2}},
+                {:bus_send, "RemoveMatch", [_rule], [:no_reply_expected]}
               ]} = Process.info(self(), :messages)
 
       # Entry gone; only this address's notification routes swept.
@@ -229,6 +259,98 @@ defmodule Bluez.GattTest do
                )
 
       assert_receive :slots_changed
+    end
+  end
+
+  describe "per-device signal match rules" do
+    @path "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF"
+    @rule "type='signal',sender='org.bluez',interface='org.freedesktop.DBus.Properties'," <>
+            "member='PropertiesChanged',path_namespace='#{@path}'"
+
+    @describetag :capture_log
+
+    setup do
+      start_supervised!({Task.Supervisor, name: Gatt.task_supervisor()})
+      :ok
+    end
+
+    defp received_sends do
+      receive do
+        {:bus_send, member, body, flags} -> [{member, body, flags} | received_sends()]
+      after
+        200 -> []
+      end
+    end
+
+    defp signal(path, body) do
+      %Bluez.Rebus.Message{
+        type: :signal,
+        flags: [],
+        version: 1,
+        body_length: 0,
+        serial: 1,
+        header_fields: %{member: "PropertiesChanged", path: path},
+        body: body
+      }
+    end
+
+    test "the rule covers the device object and everything below it" do
+      assert Gatt.device_match_rule(@path) == @rule
+    end
+
+    test "connect installs the device's rule before Device1.Connect is sent" do
+      assert {:noreply, state} = Gatt.handle_cast({:connect, @address, [], self()}, bare_state())
+      assert Map.has_key?(state.conns, @address)
+
+      assert [
+               {"AddMatch", [@rule], [:no_reply_expected]},
+               {"Connect", [], []} | _
+             ] = received_sends()
+    end
+
+    test "a refused connect installs no rule" do
+      full = for a <- 1..Gatt.max_connections(), into: %{}, do: {a, entry(self())}
+      state = bare_state(%{conns: full})
+
+      assert {:noreply, ^state} = Gatt.handle_cast({:connect, @address, [], self()}, state)
+      assert_receive {:gatt_connection, @address, {:error, -1}}
+      assert received_sends() == []
+    end
+
+    test "a requested disconnect removes the device's rule" do
+      assert {:noreply, state} = Gatt.handle_cast({:disconnect, @address}, state(self()))
+      assert state.conns == %{}
+
+      sends = received_sends()
+      assert {"RemoveMatch", [@rule], [:no_reply_expected]} in sends
+      refute Enum.any?(sends, &match?({"AddMatch", _, _}, &1))
+    end
+
+    test "an unexpected Connected=false drops the entry and its rule" do
+      sig_ref = make_ref()
+      state = state(self(), %{sig_ref: sig_ref})
+      msg = signal(@path, ["org.bluez.Device1", [{"Connected", {"b", false}}], []])
+
+      assert {:noreply, state} = Gatt.handle_info({sig_ref, msg}, state)
+      assert state.conns == %{}
+      assert_receive {:gatt_connection, @address, {:error, -1}}
+      assert received_sends() == [{"RemoveMatch", [@rule], [:no_reply_expected]}]
+    end
+
+    test "replacing a stale entry removes its rule before the new entry adds one" do
+      assert {:noreply, state} = Gatt.handle_cast({:connect, @address, [], self()}, state(self()))
+      assert %{gen: gen} = state.conns[@address]
+      assert gen == @gen + 1
+
+      matches =
+        for {member, _body, _flags} = send <- received_sends(),
+            member in ["AddMatch", "RemoveMatch"],
+            do: send
+
+      assert matches == [
+               {"RemoveMatch", [@rule], [:no_reply_expected]},
+               {"AddMatch", [@rule], [:no_reply_expected]}
+             ]
     end
   end
 end

@@ -98,18 +98,42 @@ defmodule Bluez.DBus do
   @doc """
   Install a bus-side match rule so the daemon routes matching signals to
   this connection (rebus installs none by itself).
+
+  Waits for the daemon's reply and returns it (a `%Bluez.Rebus.Message{}`)
+  by default. With `no_reply: true` the call is flagged
+  `NO_REPLY_EXPECTED` and returns as soon as the frame is written: the
+  daemon still applies rules in the order a connection sends them, so a
+  rule sent before a method call is in force before that call's
+  consequences are signalled.
+
+  The daemon counts rules: adding the same rule twice needs two
+  `remove_match/3` calls to remove it.
   """
-  @spec add_match(pid(), String.t()) :: term()
-  def add_match(conn, rule) do
+  @spec add_match(pid(), String.t(), keyword()) :: term()
+  def add_match(conn, rule, opts \\ []), do: send_match(conn, "AddMatch", rule, opts)
+
+  @doc """
+  Remove one instance of a match rule installed by `add_match/3` (the rule
+  string must be identical). Same options and return as `add_match/3`;
+  removing a rule the connection doesn't hold answers
+  `org.freedesktop.DBus.Error.MatchRuleNotFound`.
+  """
+  @spec remove_match(pid(), String.t(), keyword()) :: term()
+  def remove_match(conn, rule, opts \\ []), do: send_match(conn, "RemoveMatch", rule, opts)
+
+  defp send_match(conn, member, rule, opts) do
+    flags = if Keyword.get(opts, :no_reply, false), do: [:no_reply_expected], else: []
+
     Connection.send(
       conn,
       Message.new!(:method_call,
         destination: "org.freedesktop.DBus",
         path: "/org/freedesktop/DBus",
         interface: "org.freedesktop.DBus",
-        member: "AddMatch",
+        member: member,
         signature: "s",
-        body: [rule]
+        body: [rule],
+        flags: flags
       )
     )
   end

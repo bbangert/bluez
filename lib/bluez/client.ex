@@ -23,17 +23,37 @@ defmodule Bluez.Client do
   Flow:
 
     1. `Bluez.Rebus.connect(:system)`, `set_method_handler(self())`, monitor the
-       connection, and install bus match rules for org.bluez device signals.
-    2. Power the adapter on, then engage `configured_mode/0`: either
+       connection, and install the bus match rule for org.bluez's
+       ObjectManager signals.
+    2. Claim an adapter and route its `Device1` property changes (see
+       "Signal scope" below).
+    3. Power the adapter on, then engage `configured_mode/0`: either
        `AdvertisementMonitorManager1.RegisterMonitor` our root object (BlueZ
        enumerates the monitor via `ObjectManager.GetManagedObjects` and calls
        `Activate`/`DeviceFound` on it; the monitor's `or_patterns` (FLAGS
        \\x02/\\x06/\\x1a) match effectively all advertisers — the habluetooth
        "match all" recipe), or `SetDiscoveryFilter` + `StartDiscovery`.
-    3. Matched devices surface as `InterfacesAdded`/`PropertiesChanged` signals;
+    4. Matched devices surface as `InterfacesAdded`/`PropertiesChanged` signals;
        props are unwrapped (`Bluez.Variant`) and fed to
        `Bluez.DeviceCache`, which reconstructs + emit-gates and
        returns the adverts to fan out via `BluetoothScanner.on_advertisement/1`.
+
+  Signal scope:
+
+    * bluetoothd emits a `Device1` `PropertiesChanged` for every advert it
+      receives on every adapter. The rule routing them to this connection
+      is scoped to the claimed adapter (`path_namespace='/org/bluez/hciN'`),
+      so an adapter this Client doesn't drive — excluded via
+      `exclude_adapters:` and scanned by another consumer, say — costs it
+      nothing. No such rule exists before the claim (setup seeds existing
+      devices from `GetManagedObjects` right after installing it).
+    * The `InterfacesAdded`/`InterfacesRemoved` rule stays bus-wide: it
+      carries adapter hotplug, and fires once per object rather than once
+      per advert.
+    * A claim is made once per Client incarnation; a radio switch restarts
+      the Client on a new connection, whose rules start empty. Should the
+      claim move within an incarnation, the old adapter's rule is removed
+      once the new one is installed.
 
   Mode transitions:
 
@@ -226,9 +246,11 @@ defmodule Bluez.Client do
         # Restart (and reconnect) if the connection dies.
         conn_ref = Process.monitor(conn)
 
-        # rebus installs no bus-side match rules, so org.bluez's device signals
-        # wouldn't reach us; ask the daemon to route them.
-        if Keyword.get(opts, :setup, true), do: add_signal_matches(conn)
+        # rebus installs no bus-side match rules, so org.bluez's signals
+        # wouldn't reach us; ask the daemon to route the ObjectManager ones.
+        # Device1 property changes are routed per claimed adapter, at the
+        # claim (see scope_device_signals/2).
+        if Keyword.get(opts, :setup, true), do: add_object_manager_match(conn)
 
         state = %{
           conn: conn,
@@ -266,7 +288,10 @@ defmodule Bluez.Client do
           # pick — possibly an excluded radio — so mode requests park in
           # `pending` and setup engages them after the claim. `setup: false`
           # (test seam) never claims, so there is nothing to wait for.
-          claimed: not Keyword.get(opts, :setup, true)
+          claimed: not Keyword.get(opts, :setup, true),
+          # The installed adapter-scoped Device1 PropertiesChanged match
+          # rule (nil until an adapter is claimed).
+          device_match: nil
         }
 
         if Keyword.get(opts, :setup, true) do
@@ -508,6 +533,9 @@ defmodule Bluez.Client do
 
       {:ok, chosen} ->
         claim_adapter(chosen)
+        # Before seeding, so no property change between the seed's
+        # GetManagedObjects and the rule taking effect is lost.
+        state = scope_device_signals(state, chosen.path)
         state = %{state | adapters: MapSet.new(discovered, & &1.path)}
         power_on(state.conn)
         state = seed_existing(state)
@@ -910,15 +938,41 @@ defmodule Bluez.Client do
 
   # ── outbound org.bluez calls + helpers ──────────────────────────────────
 
-  defp add_signal_matches(conn) do
-    # Scope to org.bluez so we only receive the daemon's signals, not
-    # ObjectManager/PropertiesChanged from unrelated bus peers.
-    rules = [
-      "type='signal',sender='#{@bluez}',interface='org.freedesktop.DBus.ObjectManager'",
-      "type='signal',sender='#{@bluez}',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',arg0='#{@device_iface}'"
-    ]
+  # Unscoped by adapter on purpose: adapter hotplug arrives here, and
+  # InterfacesAdded/Removed fire once per object (first sighting, expiry),
+  # not once per advert, so another adapter's discovery costs little.
+  defp add_object_manager_match(conn) do
+    DBus.add_match(conn, "type='signal',sender='#{@bluez}',interface='#{@om_iface}'")
+  end
 
-    Enum.each(rules, &DBus.add_match(conn, &1))
+  @doc false
+  # The Device1 PropertiesChanged rule for one adapter. bluetoothd emits a
+  # PropertiesChanged per received advert (RSSI/ManufacturerData/...) on
+  # the device object, so an unscoped rule would make this connection
+  # decode every advert on every adapter — including ones excluded and
+  # scanned hard by another consumer. `path_namespace` matches the adapter
+  # path and the paths below it only (`hci1` never matches `hci10`).
+  # Public only for unit tests.
+  @spec device_match_rule(String.t()) :: String.t()
+  def device_match_rule(adapter_path) do
+    "type='signal',sender='#{@bluez}',interface='#{@props_iface}'," <>
+      "member='PropertiesChanged',arg0='#{@device_iface}',path_namespace='#{adapter_path}'"
+  end
+
+  # Route the claimed adapter's Device1 property changes, and only its.
+  # Moving the claim adds the new rule before removing the old one. A
+  # claimed adapter that disappears keeps its rule: no signals come from a
+  # path with no objects, and they resume if the same path comes back.
+  defp scope_device_signals(%{device_match: old} = state, adapter_path) do
+    case device_match_rule(adapter_path) do
+      ^old ->
+        state
+
+      rule ->
+        DBus.add_match(state.conn, rule)
+        if old, do: DBus.remove_match(state.conn, old)
+        %{state | device_match: rule}
+    end
   end
 
   @doc false

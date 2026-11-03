@@ -267,6 +267,16 @@ requests (`set_mode/1`, `resume_scan/0`) arriving before the claim park
 and run once an adapter is claimed, so nothing ever scans on an
 unresolved (possibly excluded) adapter path.
 
+D-Bus signal routing follows the claim. bluetoothd emits a `Device1`
+`PropertiesChanged` for every advert it receives, on every adapter, so
+the Client's match rule for them is scoped to the claimed adapter
+(`path_namespace='/org/bluez/hciN'`) and `Bluez.Gatt` installs one rule
+per active connection, scoped to that device's path. An excluded radio
+scanned hard by another consumer therefore costs these connections
+nothing to decode. Only the ObjectManager (`InterfacesAdded`/`Removed`)
+rule stays bus-wide — it carries adapter hotplug and fires per object,
+not per advert.
+
 Known caveat: the setup retry loop waits for *any* non-excluded adapter,
 not the desired one — if the desired radio enumerates late (observed
 with UART-attached radios racing rootfs mount on a Raspberry Pi 3), the
