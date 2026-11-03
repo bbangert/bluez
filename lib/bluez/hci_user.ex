@@ -23,19 +23,36 @@ defmodule Bluez.HciUser do
 
   ## Bring-up
 
-  `start_link/1` resolves the controller (`:index`, or `:address` through
-  MGMT), powers it off through MGMT (the kernel only binds a controller
-  that is down; skip with `power_off_first: false`), then binds the user
-  channel. Any failure is returned as `{:error, reason}`, and the process
-  exits normally (so a linked caller doesn't crash): `{:resolve, reason}`
+  `start_link/1` brings the channel up in the order hardware testing
+  showed to work:
+
+   1. **Find the controller.** By `:address`, through MGMT Read Index List
+      and Read Controller Information (`find_index/2`) — not sysfs: an
+      index shows up in sysfs long before its setup is done, and MGMT only
+      lists it once it is. Never assume an index number; re-resolve by
+      address every time (see "Events").
+   2. **Power it off** through MGMT, since the kernel only binds a
+      controller that is down (skip with `power_off_first: false`).
+   3. **Bind**, retrying every 20 ms while the kernel answers `:ebusy`,
+      for up to `:bind_timeout`. The kernel refuses the bind until its
+      vendor setup and init have finished — about 600 ms after a USB
+      dongle (re)enumerates — and while `bluetoothd` is powering the
+      controller on, which it starts ~150 ms after the index appears; if
+      Read Controller Information shows it powered on meanwhile, it is
+      powered off again (a bounded number of times). A successful bind
+      therefore also guarantees the kernel's firmware patch is loaded.
+
+  Any failure is returned as `{:error, reason}`, and the process exits
+  normally (so a linked caller doesn't crash): `{:resolve, reason}`
   (`:not_found` when no controller has the address), `{:power_off,
   reason}` (a MGMT status such as `:invalid_index`, or a socket error),
-  or `{:bind, reason}` (e.g. `:ebusy`).
+  or `{:bind, reason}` (`:ebusy` once the budget is spent).
 
   The sequence that brought up a Realtek RTL8761B (UB500 dongle) on a
   Raspberry Pi 3, every command answering status 0x00:
 
-   1. MGMT Set Powered off, then bind (done by `start_link/1`).
+   1. Find by address, power off, bind (done by `start_link/1`): 15–20 ms
+      with the index already present, ~630 ms after a re-enumeration.
    2. `reset/2` (~11 ms).
    3. `read_bd_addr/2` — check it is the controller you meant.
    4. `read_local_version/2` — on the RTL8761B, `lmp_subversion` 0xD922
@@ -112,8 +129,8 @@ defmodule Bluez.HciUser do
       subevent code first in `params`. Data packets (ACL, SCO, ISO) are
       dropped.
     * `{:closed, reason}` — the socket failed: `reason` is the error the
-      socket reported, passed through unchanged (unplugging a USB dongle
-      surfaces as a socket error), `:eof` for an empty read,
+      socket reported, passed through unchanged (`:epipe` when a USB
+      dongle is unplugged), `:eof` for an empty read,
       `{:abort, reason}` for an aborted select, `:command_timeout` /
       `:send_timeout` for a command that timed out in flight, or
       `:malformed_reply`. Always the last message; not sent when the
@@ -130,11 +147,16 @@ defmodule Bluez.HciUser do
 
   On `{:closed, _}` every queued and in-flight command returns `{:error,
   :closed}` (the faulty one: `{:error, :timeout}` or `{:error,
-  :malformed_reply}`) and the
-  process **stops** (exit reason `:normal`): to re-bind
-  — after an unplug, once the controller is back — start a new one (find
-  its new index by address with `find_index/2`). It also stops, closing
-  the socket, when the owner exits.
+  :malformed_reply}`) and the process **stops** (exit reason `:normal`).
+  It also stops, closing the socket, when the owner exits.
+
+  The socket is closed on the **first** error. Linux reports an unplug as
+  `:epipe` to one read only (later reads just time out), and a dead
+  socket kept open across the replug pins the old controller, so the
+  kernel re-registers the dongle under a new index (`hci2` instead of
+  `hci0`). The index can change anyway: to re-bind once the controller is
+  back (~600 ms after it re-enumerates), start a new process by
+  `:address`, never with the old index.
 
   ## Start options
 
@@ -148,6 +170,8 @@ defmodule Bluez.HciUser do
     * `:max_owner_backlog` — see "Events" (default `5_000` messages).
     * `:mgmt_timeout` — patience per MGMT command during bring-up
       (default `2_000` ms).
+    * `:bind_timeout` — how long to keep retrying a bind refused with
+      `:ebusy` (default `3_000` ms), see "Bring-up".
     * `:name` — optional registered name.
 
   The child spec is `restart: :temporary`: the owner decides when to
@@ -166,6 +190,10 @@ defmodule Bluez.HciUser do
   @ncmd_timeout 4_000
   @max_owner_backlog 5_000
   @mgmt_timeout 2_000
+  @bind_timeout 3_000
+  @bind_retry_ms 20
+  # Power-offs while retrying the bind, on top of the first.
+  @max_power_offs 5
   # Bounded drain per wakeup so a flood of reports can't starve the mailbox.
   @drain_batch 64
 
@@ -420,7 +448,7 @@ defmodule Bluez.HciUser do
 
     with {:ok, index} <- resolve(opts, open_control, mgmt_timeout),
          :ok <- maybe_power_off(opts, index, open_control, mgmt_timeout),
-         {:ok, sock} <- bind(open, index) do
+         {:ok, sock} <- bind(opts, index, open, open_control, mgmt_timeout) do
       state = %{
         sock: sock,
         index: index,
@@ -474,12 +502,58 @@ defmodule Bluez.HciUser do
     end
   end
 
-  defp bind(open, index) do
-    case open.(index) do
-      {:ok, sock} -> {:ok, sock}
-      {:error, reason} -> {:error, {:bind, reason}}
+  # The kernel refuses the bind with :ebusy until its vendor setup (the
+  # firmware patch) and init have finished — ~600 ms after a dongle
+  # (re)enumerates — and while bluetoothd is powering the controller on.
+  # Retry until the budget is spent, powering it off again (a bounded
+  # number of times) whenever bluetoothd has powered it on meanwhile.
+  defp bind(opts, index, open, open_control, mgmt_timeout) do
+    bind_loop(%{
+      index: index,
+      open: open,
+      open_control: open_control,
+      mgmt_timeout: mgmt_timeout,
+      power_offs_left:
+        if(Keyword.get(opts, :power_off_first, true), do: @max_power_offs, else: 0),
+      deadline: now() + Keyword.get(opts, :bind_timeout, @bind_timeout)
+    })
+  end
+
+  defp bind_loop(retry) do
+    case retry.open.(retry.index) do
+      {:ok, sock} ->
+        {:ok, sock}
+
+      {:error, :ebusy} ->
+        if now() + @bind_retry_ms < retry.deadline do
+          retry = power_off_if_powered(retry)
+          Process.sleep(@bind_retry_ms)
+          bind_loop(retry)
+        else
+          {:error, {:bind, :ebusy}}
+        end
+
+      {:error, reason} ->
+        {:error, {:bind, reason}}
     end
   end
+
+  defp power_off_if_powered(%{power_offs_left: left} = retry) when left > 0 do
+    timeout = max(min(retry.mgmt_timeout, retry.deadline - now()), 1)
+
+    powered_off =
+      with_control(retry.open_control, fn sock ->
+        with {:ok, rp} <- mgmt(sock, Hci.op_read_controller_info(), retry.index, <<>>, timeout),
+             {:ok, %{powered: true}} <- Hci.decode_controller_info(rp),
+             {:ok, _settings} <- mgmt(sock, Hci.op_set_powered(), retry.index, <<0>>, timeout) do
+          :powered_off
+        end
+      end)
+
+    if powered_off == :powered_off, do: %{retry | power_offs_left: left - 1}, else: retry
+  end
+
+  defp power_off_if_powered(retry), do: retry
 
   @impl GenServer
   def handle_continue(:drain, state), do: state |> drain(@drain_batch) |> noreply()

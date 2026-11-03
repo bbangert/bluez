@@ -114,6 +114,14 @@ defmodule Bluez.HciUserTest do
     end
   end
 
+  defp assert_receive_command_sent(server, tries \\ 100) do
+    cond do
+      :sys.get_state(server).in_flight != nil -> :ok
+      tries == 0 -> flunk("command never sent")
+      true -> Process.sleep(5) && assert_receive_command_sent(server, tries - 1)
+    end
+  end
+
   # Whether the server has sent the task's command (it is in flight), or
   # the task finished first. While a send blocks, the server can't answer.
   defp sent_or_done(server, task) do
@@ -535,6 +543,34 @@ defmodule Bluez.HciUserTest do
       assert HciUser.command(server, @reset) == {:error, :closed}
     end
 
+    test "the first recv error closes it, though later reads wouldn't fail" do
+      %{server: server, kernel: kernel} = start_server(socket_type: :seqpacket)
+      mon = Process.monitor(server)
+
+      # The controller side goes away with a command still unread: the next
+      # read fails once (:econnreset), then would only see end of file.
+      # Like an unplug's :epipe, the single error must close the channel.
+      task = async(fn -> HciUser.command(server, @reset) end)
+      assert_receive_command_sent(server)
+      :socket.close(kernel)
+
+      assert_receive {:bluez_hci_user, ^server, {:closed, :econnreset}}, 1_000
+      assert Task.await(task) == {:error, :closed}
+      assert_receive {:DOWN, ^mon, :process, ^server, :normal}, 1_000
+    end
+
+    test "an :epipe send (an unplugged controller) closes it" do
+      %{server: server, kernel: kernel} = start_server(socket_type: :seqpacket)
+      mon = Process.monitor(server)
+
+      # The controller side stops reading: sending to it fails with :epipe.
+      :ok = :socket.shutdown(kernel, :read)
+
+      assert HciUser.command(server, @reset) == {:error, :closed}
+      assert_receive {:bluez_hci_user, ^server, {:closed, :epipe}}, 1_000
+      assert_receive {:DOWN, ^mon, :process, ^server, :normal}, 1_000
+    end
+
     test "end of file on the socket closes it" do
       %{server: server, kernel: kernel} = start_server(socket_type: :seqpacket)
       mon = Process.monitor(server)
@@ -618,10 +654,20 @@ defmodule Bluez.HciUserTest do
       end
     end
 
-    defp controller_info(address),
+    defp controller_info(address, current_settings \\ 0),
       do:
-        <<address::little-48, 10, 93::little-16, 0xFFFF::little-32, 0::little-32>> <>
+        <<address::little-48, 10, 93::little-16, 0xFFFF::little-32, current_settings::little-32>> <>
           :binary.copy(<<0>>, 263)
+
+    # Refuses the first `busy` binds with :ebusy, counting every attempt.
+    defp busy_then_open(busy, attempts) do
+      inner = user_channel_open()
+
+      fn index ->
+        :counters.add(attempts, 1, 1)
+        if :counters.get(attempts, 1) <= busy, do: {:error, :ebusy}, else: inner.(index)
+      end
+    end
 
     @other_addr 0x001122334455
 
@@ -706,13 +752,73 @@ defmodule Bluez.HciUserTest do
       refute_received {:bound, _, _, _}
     end
 
-    test "a failed bind fails start_link without taking the caller down" do
+    test "a bind refused with :ebusy is retried until it succeeds" do
+      attempts = :counters.new(1, [])
+      %{server: server} = start_server(open: busy_then_open(3, attempts))
+
+      assert :counters.get(attempts, 1) == 4
+      assert HciUser.index(server) == {:ok, 0}
+    end
+
+    test "a controller bluetoothd powers on while the bind is retried is powered off again" do
+      powered = :atomics.new(1, [])
+      :atomics.put(powered, 1, 1)
+
+      answer = fn
+        @set_powered, 0, <<0>> ->
+          :atomics.put(powered, 1, 0)
+          {0, <<0::little-32>>}
+
+        @read_controller_info, 0, <<>> ->
+          {0, controller_info(@bd_addr, :atomics.get(powered, 1))}
+      end
+
+      attempts = :counters.new(1, [])
+
+      busy = busy_then_open(2, attempts)
+
+      # bluetoothd powers it back on after the first power-off.
+      open = fn index ->
+        if :counters.get(attempts, 1) == 0, do: :atomics.put(powered, 1, 1)
+        busy.(index)
+      end
+
+      start_server(power_off_first: true, open_control: fake_mgmt(answer), open: open)
+
+      assert_received {:mgmt, @set_powered, 0, <<0>>}
+      assert_received {:mgmt, @read_controller_info, 0, <<>>}
+      assert_received {:mgmt, @set_powered, 0, <<0>>}
+    end
+
+    test "a bind still refused when the budget is spent fails with :ebusy" do
+      attempts = :counters.new(1, [])
+      started = System.monotonic_time(:millisecond)
+
       assert HciUser.start_link(
                index: 0,
                power_off_first: false,
-               open: fn 0 -> {:error, :ebusy} end
-             ) ==
-               {:error, {:bind, :ebusy}}
+               bind_timeout: 100,
+               open: busy_then_open(1_000, attempts)
+             ) == {:error, {:bind, :ebusy}}
+
+      assert :counters.get(attempts, 1) >= 3
+      assert System.monotonic_time(:millisecond) - started < 1_000
+    end
+
+    test "a failed bind fails start_link without taking the caller down" do
+      attempts = :counters.new(1, [])
+
+      # Anything but :ebusy is not retried.
+      assert HciUser.start_link(
+               index: 0,
+               power_off_first: false,
+               open: fn 0 ->
+                 :counters.add(attempts, 1, 1)
+                 {:error, :enodev}
+               end
+             ) == {:error, {:bind, :enodev}}
+
+      assert :counters.get(attempts, 1) == 1
 
       assert HciUser.start_link(power_off_first: false) ==
                {:error, {:invalid_option, :index_or_address}}

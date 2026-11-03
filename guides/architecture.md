@@ -218,6 +218,11 @@ sequenceDiagram
     K-->>B: Index Added (bluetoothd powers it on)
 ```
 
+- **Bring-up order.** Find the controller by address in MGMT's index
+  list (not sysfs, which shows it before its setup is done), power it
+  off, then bind — retrying while the kernel answers `:ebusy`, which it
+  does until its vendor setup (the firmware patch) has finished, so a
+  bound controller always has its patch loaded.
 - **Not supervised by `Bluez`.** The owner starts it (`restart:
   :temporary`) and runs the bring-up itself — Reset, event masks, scan
   and advertising parameters; the moduledoc lists the sequence that works
@@ -235,13 +240,14 @@ sequenceDiagram
 - **Bounded report delivery.** Advertising reports are dropped (and
   counted, then reported as `{:reports_dropped, n}`) while the owner's
   message queue is past a limit; every other event is always delivered.
-- **Gone means stopped.** A socket error (a dongle unplugged, say) fails
-  every pending command with `{:error, :closed}`, sends the owner
-  `{:closed, reason}` and stops the process. The owner re-binds by
-  starting a new one once the controller is back; `find_index/2` finds
-  its (possibly new) index by address. The process also closes the
-  socket when its owner exits, so a crashed owner never keeps the
-  controller from `bluetoothd`.
+- **Gone means stopped.** A socket error (a dongle unplugged: `:epipe`)
+  closes the socket at once, fails every pending command with
+  `{:error, :closed}`, sends the owner `{:closed, reason}` and stops the
+  process. The owner re-binds by starting a new one by address once the
+  controller is back — never by the old index: a socket left open across
+  a replug makes the kernel register the dongle under a new one. The
+  process also closes the socket when its owner exits, so a crashed owner
+  never keeps the controller from `bluetoothd`.
 - **Invisible to the rest of the stack.** While bound, the controller is
   absent from MGMT and D-Bus: `Bluez.Client`, `Bluez.Radio`/`Bluez.Mgmt`
   and `Bluez.AdvertReceiver` can't see or use it, and a host showing its
