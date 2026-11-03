@@ -334,6 +334,25 @@ defmodule Bluez.RebusTest do
     end
   end
 
+  describe "Malformed messages" do
+    setup [:server_setup, :client_setup]
+
+    test "a complete message with a corrupt type byte stops the connection cleanly",
+         %{cli: cli, svr: svr} do
+      signal =
+        Message.new!(:signal, path: "/", interface: "test.Interface", member: "Test")
+
+      {:ok, iodata} = Message.encode(%{signal | serial: 100})
+      <<endian, _type, rest::binary>> = IO.iodata_to_binary(iodata)
+
+      ref = Process.monitor(cli)
+      :ok = TestServer.push_raw(svr, <<endian, 0xFF, rest::binary>>)
+
+      assert_receive {:DOWN, ^ref, :process, ^cli, {:invalid_message, :invalid_message_type}},
+                     1_000
+    end
+  end
+
   defp await_buffered(cli, size, attempts \\ 200) do
     cond do
       byte_size(:sys.get_state(cli).prev) == size ->
