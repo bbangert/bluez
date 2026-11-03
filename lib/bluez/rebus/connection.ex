@@ -245,7 +245,7 @@ defmodule Bluez.Rebus.Connection do
         {:noreply, %{state | prev: data}, {:continue, :recv}}
 
       {:error, reason} ->
-        {:stop, reason}
+        {:stop, {:invalid_message, reason}, state}
     end
   end
 

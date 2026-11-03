@@ -1302,6 +1302,32 @@ defmodule Bluez.Rebus.MessageTest do
       assert Message.parse(<<1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11>>) == nil
     end
 
+    test "returns nil for every strict prefix of a message, parses the whole" do
+      {:ok, message} =
+        Message.new(:signal,
+          path: "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF",
+          interface: "org.freedesktop.DBus.Properties",
+          member: "PropertiesChanged",
+          destination: ":1.42",
+          signature: "sa{sv}as",
+          body: ["org.bluez.Device1", [{"RSSI", {"n", -61}}, {"Connected", {"b", true}}], []]
+        )
+
+      for endianness <- [:little, :big] do
+        {:ok, binary} = encode_to_binary(message, endianness)
+
+        for len <- 0..(byte_size(binary) - 1) do
+          assert Message.parse(binary_part(binary, 0, len)) == nil,
+                 "#{endianness} prefix of #{len}/#{byte_size(binary)} bytes"
+        end
+
+        assert {:ok, %Message{header_fields: %{member: "PropertiesChanged"}}, <<>>} =
+                 Message.parse(binary)
+
+        assert {:ok, %Message{}, "tail"} = Message.parse(binary <> "tail")
+      end
+    end
+
     test "returns nil for invalid header data" do
       # Invalid endianness flag
       invalid_header = <<255, 4, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0>>

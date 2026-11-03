@@ -17,6 +17,11 @@ defmodule Bluez.Rebus.TestServer do
     GenServer.cast(svr, {:push, msg})
   end
 
+  @doc "Sends raw bytes to the client verbatim (for split / partial writes)."
+  def push_raw(svr, data) when is_pid(svr) and is_binary(data) do
+    GenServer.call(svr, {:push_raw, data})
+  end
+
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts)
   end
@@ -96,6 +101,10 @@ defmodule Bluez.Rebus.TestServer do
   @impl true
   def handle_call(:get_listen_addr, _from, %__MODULE__{} = state) do
     {:reply, :socket.sockname(state.svr_sock), state}
+  end
+
+  def handle_call({:push_raw, data}, _from, %__MODULE__{} = state) do
+    {:reply, :socket.send(state.cli_sock, data), state}
   end
 
   @impl true

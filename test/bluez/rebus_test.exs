@@ -301,6 +301,53 @@ defmodule Bluez.RebusTest do
     end
   end
 
+  describe "Partial reads" do
+    setup [:server_setup, :client_setup]
+
+    test "a message split at every byte boundary is delivered and the connection survives",
+         %{cli: cli, svr: svr} do
+      ref = Bluez.Rebus.add_signal_handler(cli)
+
+      signal =
+        Message.new!(
+          :signal,
+          path: "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF",
+          interface: "org.freedesktop.DBus.Properties",
+          member: "PropertiesChanged",
+          signature: "sa{sv}as",
+          body: ["org.bluez.Device1", [{"RSSI", {"n", -61}}], []]
+        )
+
+      {:ok, iodata} = Message.encode(%{signal | serial: 100})
+      binary = IO.iodata_to_binary(iodata)
+
+      for split <- 1..(byte_size(binary) - 1) do
+        <<head::binary-size(^split), tail::binary>> = binary
+        :ok = TestServer.push_raw(svr, head)
+        # The connection buffers the head and waits (rather than stopping).
+        assert await_buffered(cli, split)
+        :ok = TestServer.push_raw(svr, tail)
+
+        assert_receive {^ref, %Message{header_fields: %{member: "PropertiesChanged"}}}, 1_000
+        assert Process.alive?(cli)
+      end
+    end
+  end
+
+  defp await_buffered(cli, size, attempts \\ 200) do
+    cond do
+      byte_size(:sys.get_state(cli).prev) == size ->
+        true
+
+      attempts == 0 ->
+        false
+
+      true ->
+        Process.sleep(5)
+        await_buffered(cli, size, attempts - 1)
+    end
+  end
+
   defp server_setup(_) do
     # The 'tap' process will receive all messages received by the test server.
     # The server does not respond to any messages unless instructed to do so.
