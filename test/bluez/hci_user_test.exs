@@ -814,6 +814,57 @@ defmodule Bluez.HciUserTest do
       assert Task.yield(task, 1_500) == {:ok, {:error, {:power_off, :timeout}}}
     end
 
+    test "an unanswered MGMT command times out by :mgmt_timeout, leaving the bind budget" do
+      # Read Controller Info during the retry is never answered.
+      answer = fn
+        @set_powered, 0, <<0>> -> {0, <<0::little-32>>}
+        @read_controller_info, 0, <<>> -> :no_reply
+      end
+
+      attempts = :counters.new(1, [])
+
+      # It gives up on the reply after 100 ms, and the second bind (well
+      # inside the 2 s budget) succeeds.
+      %{server: server} =
+        start_server(
+          power_off_first: true,
+          mgmt_timeout: 100,
+          bind_timeout: 2_000,
+          open_control: fake_mgmt(answer),
+          open: busy_then_open(1, attempts)
+        )
+
+      assert HciUser.index(server) == {:ok, 0}
+      assert :counters.get(attempts, 1) == 2
+      assert_received {:mgmt, @read_controller_info, 0, <<>>}
+    end
+
+    test "no pause is taken once the MGMT work has spent the bind budget" do
+      test_pid = self()
+
+      answer = fn
+        @set_powered, 0, <<0>> -> {0, <<0::little-32>>}
+        @read_controller_info, 0, <<>> -> :no_reply
+      end
+
+      assert HciUser.start_link(
+               index: 0,
+               power_off_first: true,
+               mgmt_timeout: 2_000,
+               bind_timeout: 300,
+               open_control: fake_mgmt(answer),
+               open: fn 0 -> {:error, :ebusy} end,
+               sleep: fn ms ->
+                 send(test_pid, :slept)
+                 Process.sleep(ms)
+               end
+             ) == {:error, {:bind, :ebusy}}
+
+      # The unanswered Read Controller Info used up the budget.
+      assert_received {:mgmt, @read_controller_info, 0, <<>>}
+      refute_received :slept
+    end
+
     test "a bind due after the deadline (the retry overslept) is not attempted" do
       attempts = :counters.new(1, [])
 
