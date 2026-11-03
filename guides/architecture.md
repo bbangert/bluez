@@ -224,11 +224,14 @@ sequenceDiagram
   on a Realtek RTL8761B. A failed bring-up step returns `{:error,
   reason}` from `start_link/1` without crashing a linked caller, so the
   owner can fall back to the BlueZ path.
-- **Flow control like the kernel's.** Commands are correlated by opcode,
-  wait for `Num_HCI_Command_Packets` credits, and by default only one is
-  in flight. Every command has a timeout; an abandoned command frees the
-  controller for the next, and a controller that grants no credit for
-  4 s is reported as `:command_stall`.
+- **Flow control like the kernel's.** Exactly one command is in flight,
+  answered by its Command Complete/Status; the rest queue in call order
+  and also wait for `Num_HCI_Command_Packets` credits. Every command has
+  a deadline fixed at the call: one that expires before it is sent is
+  dropped, and one that expires in flight (or a send the socket can't
+  take in time) closes the channel as a controller fault, so a late
+  reply can never be taken for a later command's. A controller that
+  grants no credit for 4 s is reported as `:command_stall`.
 - **Gone means stopped.** A socket error (a dongle unplugged, say) fails
   every pending command with `{:error, :closed}`, sends the owner
   `{:closed, reason}` and stops the process. The owner re-binds by

@@ -70,20 +70,24 @@ defmodule Bluez.HciUser do
   return parameter is the Status, as for every command in the Core spec
   that returns Command Complete.
 
-  Flow control follows the controller's `Num_HCI_Command_Packets` credits
-  from every Command Complete/Status: a command waits in a queue while
-  none are granted. On top of that at most `:max_outstanding` commands
-  (default 1, as the Linux kernel does) are in flight, so a reply always
-  matches its command unambiguously. Commands are sent in call order.
+  Exactly one command is in flight at a time (as in the Linux kernel), so
+  a reply always belongs to the command it answers; the rest wait in a
+  queue, sent in call order. On top of that the controller's
+  `Num_HCI_Command_Packets` credits from every Command Complete/Status
+  are honoured: while it grants none, nothing is sent. When it grants no
+  credit with nothing in flight for `:ncmd_timeout` ms (default 4 000,
+  the kernel's), one credit is restored and the owner gets
+  `:command_stall` — a sign the controller is wedged (reset it).
 
-  Each command's timeout (default 2 000 ms, the kernel's) runs from the
-  call, queueing included. A command that times out in flight is
-  abandoned, and like the kernel this process then assumes the
-  controller can take a command again (one credit). A late reply to it
-  only updates the credits. When the controller grants no credit with
-  nothing in flight for `:ncmd_timeout` ms (default 4 000, again the
-  kernel's), one credit is restored and the owner gets `:command_stall` —
-  a sign the controller is wedged (reset it).
+  Each command's timeout (default 2 000 ms, the kernel's) is a deadline
+  fixed when `command/4` is called, so time spent in this process's
+  mailbox and queue counts. A command whose deadline passes before it is
+  sent returns `{:error, :timeout}` and is never sent. One whose deadline
+  passes **in flight** — unanswered, or a send the socket couldn't take
+  in time — is a controller fault: its caller gets `{:error, :timeout}`
+  and the channel closes (`{:closed, :command_timeout}` or
+  `{:closed, :send_timeout}`, see "Events"), because a late reply could
+  otherwise be taken for a later command's.
 
   ## Events
 
@@ -102,13 +106,15 @@ defmodule Bluez.HciUser do
       dropped.
     * `{:closed, reason}` — the socket failed: `reason` is the error the
       socket reported, passed through unchanged (unplugging a USB dongle
-      surfaces as a socket error), `:eof` for an empty read, or
-      `{:abort, reason}` for an aborted select. Always the last message;
+      surfaces as a socket error), `:eof` for an empty read,
+      `{:abort, reason}` for an aborted select, or `:command_timeout` /
+      `:send_timeout` for a command that timed out in flight. Always the last message;
       not sent when the socket is closed on purpose (`close/1`, the owner
       exiting).
 
   On `{:closed, _}` every queued and in-flight command returns `{:error,
-  :closed}` and the process **stops** (exit reason `:normal`): to re-bind
+  :closed}` (the one that timed out: `{:error, :timeout}`) and the
+  process **stops** (exit reason `:normal`): to re-bind
   — after an unplug, once the controller is back — start a new one (find
   its new index by address with `find_index/2`). It also stops, closing
   the socket, when the owner exits.
@@ -121,7 +127,6 @@ defmodule Bluez.HciUser do
     * `:owner` — pid that receives the events (default: the caller).
     * `:power_off_first` — MGMT Set Powered off before binding (default
       `true`).
-    * `:max_outstanding` — commands in flight at once (default `1`).
     * `:ncmd_timeout` — see "Commands" (default `4_000` ms).
     * `:mgmt_timeout` — patience per MGMT command during bring-up
       (default `2_000` ms).
@@ -276,9 +281,11 @@ defmodule Bluez.HciUser do
   def command(server, opcode, params \\ <<>>, timeout \\ @command_timeout)
       when opcode in 0..0xFFFF and is_binary(params) and byte_size(params) <= 255 and
              is_integer(timeout) and timeout > 0 do
-    # The server answers within `timeout`; the margin only covers a server
-    # too busy to (a wedged one surfaces as a timeout, not as "closed").
-    GenServer.call(server, {:command, opcode, params, timeout}, timeout + 1_000)
+    # The deadline is absolute, so time spent in the server's mailbox counts.
+    # The server answers by then; the margin only covers a server too busy
+    # to (a wedged one surfaces as a timeout, not as "closed").
+    deadline = now() + timeout
+    GenServer.call(server, {:command, opcode, params, deadline}, timeout + 1_000)
   catch
     :exit, {:timeout, _} -> {:error, :timeout}
     :exit, _reason -> {:error, :closed}
@@ -398,14 +405,13 @@ defmodule Bluez.HciUser do
         index: index,
         owner: owner,
         owner_mon: Process.monitor(owner),
-        max_outstanding: Keyword.get(opts, :max_outstanding, 1),
         ncmd_timeout: Keyword.get(opts, :ncmd_timeout, @ncmd_timeout),
         # Num_HCI_Command_Packets: the controller starts out able to take one.
         credits: 1,
         ncmd_timer: nil,
-        # Waiting for a credit, in call order, and sent (oldest first).
+        # Waiting to be sent, in call order, and the one command sent.
         queue: :queue.new(),
-        in_flight: [],
+        in_flight: nil,
         closed: nil
       }
 
@@ -455,20 +461,26 @@ defmodule Bluez.HciUser do
   def handle_continue(:drain, state), do: state |> drain(@drain_batch) |> noreply()
 
   @impl GenServer
-  def handle_call({:command, opcode, params, timeout}, from, state) do
-    ref = make_ref()
+  def handle_call({:command, opcode, params, deadline}, from, state) do
+    if now() >= deadline do
+      # Expired while waiting in the mailbox: never sent.
+      {:reply, {:error, :timeout}, state}
+    else
+      ref = make_ref()
 
-    entry = %{
-      ref: ref,
-      opcode: opcode,
-      packet: Codec.command_packet(opcode, params),
-      from: from,
-      timer: Process.send_after(self(), {:command_timeout, ref}, timeout)
-    }
+      entry = %{
+        ref: ref,
+        opcode: opcode,
+        packet: Codec.command_packet(opcode, params),
+        from: from,
+        deadline: deadline,
+        timer: Process.send_after(self(), {:command_timeout, ref}, deadline, abs: true)
+      }
 
-    %{state | queue: :queue.in(entry, state.queue)}
-    |> dispatch()
-    |> noreply()
+      %{state | queue: :queue.in(entry, state.queue)}
+      |> dispatch()
+      |> noreply()
+    end
   end
 
   def handle_call(:index, _from, state), do: {:reply, {:ok, state.index}, state}
@@ -482,20 +494,12 @@ defmodule Bluez.HciUser do
 
   def handle_info(:drain, state), do: state |> drain(@drain_batch) |> noreply()
 
-  def handle_info({:command_timeout, ref}, state) do
-    case pop_in_flight(state, ref) do
-      {%{} = entry, state} ->
-        GenServer.reply(entry.from, {:error, :timeout})
-        # As the kernel does: an abandoned command frees the controller.
-        %{state | credits: max(state.credits, 1)}
-        |> cancel_ncmd_timer()
-        |> dispatch()
-        |> noreply()
+  # Unanswered in flight: the controller is faulty, and a late reply could
+  # be taken for a later command's. Close rather than guess.
+  def handle_info({:command_timeout, ref}, %{in_flight: %{ref: ref}} = state),
+    do: state |> fault(:command_timeout) |> noreply()
 
-      {nil, state} ->
-        state |> drop_queued(ref) |> noreply()
-    end
-  end
+  def handle_info({:command_timeout, ref}, state), do: state |> drop_queued(ref) |> noreply()
 
   def handle_info({:ncmd_timeout, timer}, %{ncmd_timer: timer} = state) do
     Logger.warning("Bluez.HciUser: hci#{state.index} granted no command credit; assuming one")
@@ -522,35 +526,56 @@ defmodule Bluez.HciUser do
 
   # ── flow control ──────────────────────────────────────────────────────────
 
-  defp dispatch(%{closed: nil} = state) do
-    if state.credits > 0 and length(state.in_flight) < state.max_outstanding do
-      case :queue.out(state.queue) do
-        {{:value, entry}, queue} -> send_command(%{state | queue: queue}, entry)
-        {:empty, _queue} -> state
-      end
-    else
-      state
+  defp dispatch(%{closed: nil, in_flight: nil} = state) when state.credits > 0 do
+    case :queue.out(state.queue) do
+      {{:value, entry}, queue} -> send_command(%{state | queue: queue}, entry)
+      {:empty, _queue} -> state
     end
   end
 
   defp dispatch(state), do: state
 
+  # Bounded by the command's deadline: a socket that can't take the packet
+  # by then is as faulty as a controller that doesn't answer.
   defp send_command(state, entry) do
-    case :socket.send(state.sock, entry.packet) do
-      :ok ->
-        dispatch(%{state | credits: state.credits - 1, in_flight: state.in_flight ++ [entry]})
+    case remaining(entry) do
+      0 ->
+        Process.cancel_timer(entry.timer)
+        GenServer.reply(entry.from, {:error, :timeout})
+        dispatch(state)
 
-      {:error, reason} ->
-        # Fails it along with everything else.
-        close_down(%{state | in_flight: state.in_flight ++ [entry]}, reason)
+      timeout ->
+        case :socket.send(state.sock, entry.packet, [], timeout) do
+          :ok ->
+            %{state | credits: state.credits - 1, in_flight: entry}
+
+          {:error, :timeout} ->
+            fault(%{state | in_flight: entry}, :send_timeout)
+
+          {:error, {:timeout, _unsent}} ->
+            fault(%{state | in_flight: entry}, :send_timeout)
+
+          {:error, reason} ->
+            close_down(%{state | in_flight: entry}, reason)
+        end
     end
+  end
+
+  defp remaining(entry), do: max(entry.deadline - now(), 0)
+
+  # The in-flight command failed by timing out: its caller gets
+  # {:error, :timeout}, everything else {:error, :closed}.
+  defp fault(%{in_flight: entry} = state, reason) do
+    Process.cancel_timer(entry.timer)
+    GenServer.reply(entry.from, {:error, :timeout})
+    close_down(%{state | in_flight: nil}, reason)
   end
 
   # Num_HCI_Command_Packets from a Command Complete/Status.
   defp credits(state, ncmd) do
     state = %{state | credits: ncmd}
 
-    if ncmd == 0 and state.in_flight == [],
+    if ncmd == 0 and state.in_flight == nil,
       do: arm_ncmd_timer(state),
       else: cancel_ncmd_timer(state)
   end
@@ -566,26 +591,15 @@ defmodule Bluez.HciUser do
   # A stale timer message is ignored by its ref.
   defp cancel_ncmd_timer(state), do: %{state | ncmd_timer: nil}
 
-  # The oldest in-flight command with `opcode` gets `reply`.
-  defp complete(state, opcode, reply) do
-    case Enum.split_while(state.in_flight, &(&1.opcode != opcode)) do
-      {before, [entry | rest]} ->
-        Process.cancel_timer(entry.timer)
-        GenServer.reply(entry.from, reply)
-        %{state | in_flight: before ++ rest}
-
-      {_all, []} ->
-        # Unsolicited (opcode 0x0000) or a late reply to an abandoned command.
-        state
-    end
+  # The reply to the in-flight command, if it is for its opcode.
+  defp complete(%{in_flight: %{opcode: opcode} = entry} = state, opcode, reply) do
+    Process.cancel_timer(entry.timer)
+    GenServer.reply(entry.from, reply)
+    %{state | in_flight: nil}
   end
 
-  defp pop_in_flight(state, ref) do
-    case Enum.split_with(state.in_flight, &(&1.ref == ref)) do
-      {[entry], rest} -> {entry, %{state | in_flight: rest}}
-      {[], _all} -> {nil, state}
-    end
-  end
+  # Unsolicited (opcode 0x0000): it only grants credits.
+  defp complete(state, _opcode, _reply), do: state
 
   defp drop_queued(state, ref) do
     {timed_out, queue} = state.queue |> :queue.to_list() |> Enum.split_with(&(&1.ref == ref))
@@ -659,14 +673,14 @@ defmodule Bluez.HciUser do
   defp close_down(state, _reason), do: state
 
   defp fail_pending(state) do
-    entries = state.in_flight ++ :queue.to_list(state.queue)
+    entries = List.wrap(state.in_flight) ++ :queue.to_list(state.queue)
 
     Enum.each(entries, fn entry ->
       Process.cancel_timer(entry.timer)
       GenServer.reply(entry.from, {:error, :closed})
     end)
 
-    %{state | in_flight: [], queue: :queue.new()}
+    %{state | in_flight: nil, queue: :queue.new()}
   end
 
   defp notify(state, event), do: send(state.owner, {:bluez_hci_user, self(), event})

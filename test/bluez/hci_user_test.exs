@@ -70,6 +70,25 @@ defmodule Bluez.HciUserTest do
 
   defp async(fun), do: Task.async(fun)
 
+  # Whether the server has sent the task's command (it is in flight), or
+  # the task finished first. While a send blocks, the server can't answer.
+  defp sent_or_done(server, task) do
+    case Task.yield(task, 10) do
+      {:ok, result} ->
+        {:done, result}
+
+      nil ->
+        in_flight =
+          try do
+            :sys.get_state(server, 100).in_flight
+          catch
+            :exit, _reason -> nil
+          end
+
+        if in_flight, do: :sent, else: sent_or_done(server, task)
+    end
+  end
+
   describe "commands" do
     test "a Command Complete answers its command, Status byte stripped" do
       %{server: server, kernel: kernel} = start_server()
@@ -174,21 +193,16 @@ defmodule Bluez.HciUserTest do
       assert Task.await(second) == {:ok, @addr_le}
     end
 
-    test "with max_outstanding > 1, replies are matched by opcode" do
-      %{server: server, kernel: kernel} = start_server(max_outstanding: 2)
+    test "a reply for another opcode doesn't answer the command in flight" do
+      %{server: server, kernel: kernel} = start_server()
 
-      first = async(fn -> HciUser.command(server, @read_bd_addr) end)
+      task = async(fn -> HciUser.command(server, @read_bd_addr) end)
       expect_command(kernel, @read_bd_addr)
-      # Credits from the controller allow a second one in flight.
-      complete(kernel, 0x0000, <<>>, 2)
-      second = async(fn -> HciUser.command(server, @read_local_version) end)
-      expect_command(kernel, @read_local_version)
+      complete(kernel, @reset, <<0>>)
+      refute Task.yield(task, 100)
 
-      complete(kernel, @read_local_version, <<0, 10, 0x0B, 0, 10, 93, 0, 0x22, 0xD9>>)
       complete(kernel, @read_bd_addr, <<0>> <> @addr_le)
-
-      assert Task.await(first) == {:ok, @addr_le}
-      assert {:ok, <<10, _::binary>>} = Task.await(second)
+      assert Task.await(task) == {:ok, @addr_le}
     end
 
     test "Num_HCI_Command_Packets = 0 holds commands until a credit is granted" do
@@ -211,18 +225,78 @@ defmodule Bluez.HciUserTest do
   end
 
   describe "timeouts" do
-    test "an unanswered command times out; the next one is still sent" do
+    test "an unanswered command is a fault: the channel closes" do
+      %{server: server, kernel: kernel} = start_server()
+      mon = Process.monitor(server)
+
+      enable = async(fn -> HciUser.le_set_advertising_enable(server, true, 100) end)
+      assert expect_command(kernel, 0x200A) == <<1>>
+      # Same opcode, queued behind it: a late enable reply must never
+      # acknowledge this disable.
+      disable = async(fn -> HciUser.le_set_advertising_enable(server, false) end)
+
+      assert Task.await(enable) == {:error, :timeout}
+      assert Task.await(disable) == {:error, :closed}
+      assert_receive {:bluez_hci_user, ^server, {:closed, :command_timeout}}, 1_000
+      assert_receive {:DOWN, ^mon, :process, ^server, :normal}, 1_000
+
+      # The disable was never sent, and the socket is closed.
+      refute_command(kernel)
+      assert {:error, :econnrefused} = :socket.send(kernel, <<0x04, 0x0E, 4, 1, 0x0A, 0x20, 0>>)
+      assert HciUser.le_set_advertising_enable(server, false) == {:error, :closed}
+    end
+
+    test "a request that expired in the mailbox is rejected, never sent" do
       %{server: server, kernel: kernel} = start_server()
 
-      assert HciUser.command(server, @reset, <<>>, 100) == {:error, :timeout}
-      expect_command(kernel, @reset)
+      :ok = :sys.suspend(server)
+      task = async(fn -> HciUser.command(server, @reset, <<>>, 50) end)
+      Process.sleep(100)
+      :ok = :sys.resume(server)
 
+      assert Task.await(task) == {:error, :timeout}
+      refute_command(kernel)
+
+      # Nothing faulted: the next command goes out as usual.
       task = async(fn -> HciUser.command(server, @read_bd_addr) end)
       expect_command(kernel, @read_bd_addr)
-      # A late reply to the abandoned command is ignored.
-      complete(kernel, @reset, <<0>>)
       complete(kernel, @read_bd_addr, <<0>> <> @addr_le)
       assert Task.await(task) == {:ok, @addr_le}
+    end
+
+    test "a send the socket can't take by the deadline is a fault" do
+      # The smallest send buffer: a few unread commands fill it.
+      inner = user_channel_open()
+
+      open = fn index ->
+        {:ok, proc} = inner.(index)
+        :ok = :socket.setopt(proc, {:socket, :sndbuf}, 1)
+        {:ok, proc}
+      end
+
+      %{server: server, kernel: kernel} = start_server(open: open)
+      mon = Process.monitor(server)
+      big = :binary.copy(<<0xA5>>, 255)
+
+      # Each command is answered but never read, until a send blocks.
+      result =
+        Enum.reduce_while(1..100, nil, fn _i, nil ->
+          task = async(fn -> HciUser.command(server, 0xFC01, big, 300) end)
+
+          case sent_or_done(server, task) do
+            :sent ->
+              complete(kernel, 0xFC01, <<0>>)
+              assert Task.await(task) == {:ok, <<>>}
+              {:cont, nil}
+
+            {:done, result} ->
+              {:halt, result}
+          end
+        end)
+
+      assert result == {:error, :timeout}
+      assert_receive {:bluez_hci_user, ^server, {:closed, :send_timeout}}, 1_000
+      assert_receive {:DOWN, ^mon, :process, ^server, :normal}, 1_000
     end
 
     test "a command waiting for a credit times out without being sent" do
