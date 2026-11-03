@@ -525,27 +525,34 @@ defmodule Bluez.HciUser do
         {:ok, sock}
 
       {:error, :ebusy} ->
-        if now() + @bind_retry_ms < retry.deadline do
-          retry = power_off_if_powered(retry)
-          Process.sleep(@bind_retry_ms)
-          bind_loop(retry)
-        else
-          {:error, {:bind, :ebusy}}
-        end
+        retry_bind(retry)
 
       {:error, reason} ->
         {:error, {:bind, reason}}
     end
   end
 
-  defp power_off_if_powered(%{power_offs_left: left} = retry) when left > 0 do
-    timeout = max(min(retry.mgmt_timeout, retry.deadline - now()), 1)
+  # The deadline is checked again after the power-off: its MGMT commands
+  # take time out of the same budget.
+  defp retry_bind(retry) do
+    with true <- time_for_another_bind?(retry),
+         retry = power_off_if_powered(retry),
+         true <- time_for_another_bind?(retry) do
+      Process.sleep(@bind_retry_ms)
+      bind_loop(retry)
+    else
+      false -> {:error, {:bind, :ebusy}}
+    end
+  end
 
+  defp time_for_another_bind?(retry), do: now() + @bind_retry_ms < retry.deadline
+
+  defp power_off_if_powered(%{power_offs_left: left} = retry) when left > 0 do
     powered_off =
       with_control(retry.open_control, fn sock ->
-        with {:ok, rp} <- mgmt(sock, Hci.op_read_controller_info(), retry.index, <<>>, timeout),
+        with {:ok, rp} <- budgeted_mgmt(sock, retry, Hci.op_read_controller_info(), <<>>),
              {:ok, %{powered: true}} <- Hci.decode_controller_info(rp),
-             {:ok, _settings} <- mgmt(sock, Hci.op_set_powered(), retry.index, <<0>>, timeout) do
+             {:ok, _settings} <- budgeted_mgmt(sock, retry, Hci.op_set_powered(), <<0>>) do
           :powered_off
         end
       end)
@@ -554,6 +561,15 @@ defmodule Bluez.HciUser do
   end
 
   defp power_off_if_powered(retry), do: retry
+
+  # Each command gets what is left of the bind budget (at most
+  # :mgmt_timeout), and none once it is spent.
+  defp budgeted_mgmt(sock, retry, opcode, params) do
+    case min(retry.mgmt_timeout, retry.deadline - now()) do
+      timeout when timeout > 0 -> mgmt(sock, opcode, retry.index, params, timeout)
+      _spent -> {:error, :timeout}
+    end
+  end
 
   @impl GenServer
   def handle_continue(:drain, state), do: state |> drain(@drain_batch) |> noreply()

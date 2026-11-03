@@ -641,13 +641,14 @@ defmodule Bluez.HciUserTest do
           {status, rp} = answer.(opcode, index, params)
           ev = <<opcode::little-16, status, rp::binary>>
 
-          :ok =
-            :socket.send(
-              kernel,
-              <<0x0001::little-16, index::little-16, byte_size(ev)::little-16, ev::binary>>
-            )
-
-          mgmt_loop(kernel, test_pid, answer)
+          # The other side may have given up (and closed) meanwhile.
+          case :socket.send(
+                 kernel,
+                 <<0x0001::little-16, index::little-16, byte_size(ev)::little-16, ev::binary>>
+               ) do
+            :ok -> mgmt_loop(kernel, test_pid, answer)
+            {:error, _reason} -> :socket.close(kernel)
+          end
 
         {:error, _reason} ->
           :socket.close(kernel)
@@ -788,6 +789,33 @@ defmodule Bluez.HciUserTest do
       assert_received {:mgmt, @set_powered, 0, <<0>>}
       assert_received {:mgmt, @read_controller_info, 0, <<>>}
       assert_received {:mgmt, @set_powered, 0, <<0>>}
+    end
+
+    test "slow MGMT replies while re-powering off count against the bind budget" do
+      # Every reply takes 80 ms, and the controller always reads powered.
+      answer = fn
+        @set_powered, 0, <<0>> ->
+          Process.sleep(80)
+          {0, <<0::little-32>>}
+
+        @read_controller_info, 0, <<>> ->
+          Process.sleep(80)
+          {0, controller_info(@bd_addr, 1)}
+      end
+
+      attempts = :counters.new(1, [])
+
+      # Read Controller Info leaves ~20 ms of the 100 ms budget: Set Powered
+      # gets only that, and no bind is attempted past the budget.
+      assert HciUser.start_link(
+               index: 0,
+               power_off_first: true,
+               bind_timeout: 100,
+               open_control: fake_mgmt(answer),
+               open: busy_then_open(1_000, attempts)
+             ) == {:error, {:bind, :ebusy}}
+
+      assert :counters.get(attempts, 1) == 1
     end
 
     test "a bind still refused when the budget is spent fails with :ebusy" do
