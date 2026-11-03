@@ -189,6 +189,73 @@ MGMT framing), and `Bluez.AdData` the AD TLV helpers — both host-tested
 with byte fixtures; the socket-owning processes are tested against
 AF_UNIX datagram sockets standing in for the kernel.
 
+### Exclusive controller access (`Bluez.HciUser`)
+
+The paths above share a controller with `bluetoothd`. For a radio
+dedicated to one protocol that scans continuously without duplicate
+filtering and advertises in short windows, `bluetoothd` and the kernel's
+advertising bookkeeping cost more CPU than the protocol itself.
+`Bluez.HciUser` takes the controller away from them instead: it powers
+the controller off through MGMT, binds an `HCI_CHANNEL_USER` socket
+(`Bluez.Hci.open(:user, index)`), and from then on speaks raw HCI —
+commands out, every event to one owner process.
+
+```mermaid
+sequenceDiagram
+    participant O as owner
+    participant U as Bluez.HciUser
+    participant K as kernel
+    participant B as bluetoothd
+    O->>U: start_link(index: / address:)
+    U->>K: MGMT Set Powered off
+    U->>K: bind HCI_CHANNEL_USER
+    K-->>B: Index Removed (adapter gone)
+    O->>U: reset / read_bd_addr / set masks / scan
+    K-->>U: LE advertising reports
+    U-->>O: {:bluez_hci_user, pid, {:adv_report, report}}
+    O->>U: close/1 (or owner exits)
+    U->>K: close socket
+    K-->>B: Index Added (bluetoothd powers it on)
+```
+
+- **Bring-up order.** Find the controller by address in MGMT's index
+  list (not sysfs, which shows it before its setup is done), power it
+  off, then bind — retrying while the kernel answers `:ebusy`, which it
+  does until its vendor setup (the firmware patch) has finished, so a
+  bound controller always has its patch loaded.
+- **Not supervised by `Bluez`.** The owner starts it (`restart:
+  :temporary`) and runs the bring-up itself — Reset, event masks, scan
+  and advertising parameters; the moduledoc lists the sequence that works
+  on a Realtek RTL8761B. A failed bring-up step returns `{:error,
+  reason}` from `start_link/1` without crashing a linked caller, so the
+  owner can fall back to the BlueZ path.
+- **Flow control like the kernel's.** Exactly one command is in flight,
+  answered by its Command Complete/Status; the rest queue in call order
+  and also wait for `Num_HCI_Command_Packets` credits. Every command has
+  a deadline fixed at the call: one that expires before it is sent is
+  dropped, and one that expires in flight (or a send the socket can't
+  take in time) closes the channel as a controller fault, so a late
+  reply can never be taken for a later command's. A controller that
+  grants no credit for 4 s is reported as `:command_stall`.
+- **Bounded report delivery.** Advertising reports are dropped (and
+  counted, then reported as `{:reports_dropped, n}`) while the owner's
+  message queue is past a limit; every other event is always delivered.
+- **Gone means stopped.** A socket error (a dongle unplugged: `:epipe`)
+  closes the socket at once, fails every pending command with
+  `{:error, :closed}`, sends the owner `{:closed, reason}` and stops the
+  process. The owner re-binds by starting a new one by address once the
+  controller is back — never by the old index: a socket left open across
+  a replug makes the kernel register the dongle under a new one. The
+  process also closes the socket when its owner exits, so a crashed owner
+  never keeps the controller from `bluetoothd`.
+- **Invisible to the rest of the stack.** While bound, the controller is
+  absent from MGMT and D-Bus: `Bluez.Client`, `Bluez.Radio`/`Bluez.Mgmt`
+  and `Bluez.AdvertReceiver` can't see or use it, and a host showing its
+  radios must account for one held this way.
+
+`Bluez.HciUser.Codec` holds the pure command encoders and event
+decoders (advertising reports reuse `Bluez.Hci.decode_le_meta/1`).
+
 ## GATT (`Bluez.Gatt`)
 
 Connection lifecycle:
