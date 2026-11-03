@@ -443,7 +443,8 @@ defmodule Bluez.HciUser do
     owner = Keyword.fetch!(opts, :owner)
     mgmt_timeout = Keyword.get(opts, :mgmt_timeout, @mgmt_timeout)
     # Test seams: fun(index) -> {:ok, socket} | {:error, reason}, and
-    # fun() -> {:ok, socket} | {:error, reason} for MGMT.
+    # fun() -> {:ok, socket} | {:error, reason} for MGMT; `:sleep` (below)
+    # for the pause between bind attempts.
     open = Keyword.get(opts, :open, &Hci.open(:user, &1))
     open_control = Keyword.get(opts, :open_control, &open_control/0)
 
@@ -516,6 +517,7 @@ defmodule Bluez.HciUser do
       open: open,
       open_control: open_control,
       mgmt_timeout: mgmt_timeout,
+      sleep: Keyword.get(opts, :sleep, &Process.sleep/1),
       power_offs_left:
         if(Keyword.get(opts, :power_off_first, true), do: @max_power_offs, else: 0),
       deadline: now() + Keyword.get(opts, :bind_timeout, @bind_timeout)
@@ -542,7 +544,7 @@ defmodule Bluez.HciUser do
     with true <- time_for_another_bind?(retry),
          retry = power_off_if_powered(retry),
          true <- time_for_another_bind?(retry),
-         :ok <- Process.sleep(@bind_retry_ms),
+         :ok <- retry.sleep.(@bind_retry_ms),
          true <- now() < retry.deadline do
       bind_loop(retry)
     else
