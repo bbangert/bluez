@@ -66,9 +66,12 @@ defmodule Bluez.HciUser do
   *without* the leading Status byte), `{:ok, :pending}` (Command Status
   with status 0: the command runs on and reports through its own event),
   `{:error, {:status, code}}` for a non-zero HCI status, `{:error,
-  :timeout}` or `{:error, :closed}`. Every command assumes the first
-  return parameter is the Status, as for every command in the Core spec
-  that returns Command Complete.
+  :timeout}`, `{:error, :malformed_reply}` or `{:error, :closed}`. Every
+  command assumes the first return parameter is the Status, as for every
+  command in the Core spec that returns Command Complete; a Command
+  Complete without one (only valid for the opcode-0 credit update) is a
+  controller fault that closes the channel (`{:closed,
+  :malformed_reply}`).
 
   Exactly one command is in flight at a time (as in the Linux kernel), so
   a reply always belongs to the command it answers; the rest wait in a
@@ -83,8 +86,9 @@ defmodule Bluez.HciUser do
   fixed when `command/4` is called, so time spent in this process's
   mailbox and queue counts. A command whose deadline passes before it is
   sent returns `{:error, :timeout}` and is never sent. One whose deadline
-  passes **in flight** — unanswered, or a send the socket couldn't take
-  in time — is a controller fault: its caller gets `{:error, :timeout}`
+  passes **in flight** — unanswered, answered but read only after the
+  deadline (this process was backlogged), or a send the socket couldn't
+  take in time — is a controller fault: its caller gets `{:error, :timeout}`
   and the channel closes (`{:closed, :command_timeout}` or
   `{:closed, :send_timeout}`, see "Events"), because a late reply could
   otherwise be taken for a later command's.
@@ -97,6 +101,9 @@ defmodule Bluez.HciUser do
 
     * `{:adv_report, report}` — one per legacy or extended LE advertising
       report (`t:Bluez.Hci.adv_report/0`, AD bytes verbatim).
+    * `{:reports_dropped, count}` — reports were dropped because the
+      owner fell behind (see below); sent before the next report that is
+      delivered, or before `{:closed, _}`.
     * `{:hardware_error, code}` — Hardware Error event: the controller
       needs a Reset (pending commands are left to their timeouts).
     * `:command_stall` — see "Commands".
@@ -107,13 +114,21 @@ defmodule Bluez.HciUser do
     * `{:closed, reason}` — the socket failed: `reason` is the error the
       socket reported, passed through unchanged (unplugging a USB dongle
       surfaces as a socket error), `:eof` for an empty read,
-      `{:abort, reason}` for an aborted select, or `:command_timeout` /
-      `:send_timeout` for a command that timed out in flight. Always the last message;
-      not sent when the socket is closed on purpose (`close/1`, the owner
-      exiting).
+      `{:abort, reason}` for an aborted select, `:command_timeout` /
+      `:send_timeout` for a command that timed out in flight, or
+      `:malformed_reply`. Always the last message; not sent when the
+      socket is closed on purpose (`close/1`, the owner exiting).
+
+  A busy radio reports hundreds of adverts a second, so delivery is
+  bounded: while the owner's message queue holds `:max_owner_backlog`
+  messages or more (default 5 000), advertising reports are dropped and
+  counted instead of sent, and `{:reports_dropped, count}` tells the
+  owner once it catches up. Every other event is always delivered.
+  The backlog is only checked for an owner on the local node.
 
   On `{:closed, _}` every queued and in-flight command returns `{:error,
-  :closed}` (the one that timed out: `{:error, :timeout}`) and the
+  :closed}` (the faulty one: `{:error, :timeout}` or `{:error,
+  :malformed_reply}`) and the
   process **stops** (exit reason `:normal`): to re-bind
   — after an unplug, once the controller is back — start a new one (find
   its new index by address with `find_index/2`). It also stops, closing
@@ -128,6 +143,7 @@ defmodule Bluez.HciUser do
     * `:power_off_first` — MGMT Set Powered off before binding (default
       `true`).
     * `:ncmd_timeout` — see "Commands" (default `4_000` ms).
+    * `:max_owner_backlog` — see "Events" (default `5_000` messages).
     * `:mgmt_timeout` — patience per MGMT command during bring-up
       (default `2_000` ms).
     * `:name` — optional registered name.
@@ -146,6 +162,7 @@ defmodule Bluez.HciUser do
   @command_timeout 2_000
   @reset_timeout 5_000
   @ncmd_timeout 4_000
+  @max_owner_backlog 5_000
   @mgmt_timeout 2_000
   # Bounded drain per wakeup so a flood of reports can't starve the mailbox.
   @drain_batch 64
@@ -153,6 +170,7 @@ defmodule Bluez.HciUser do
   @typedoc "Event delivered to the owner as `{:bluez_hci_user, server, event}`."
   @type event ::
           {:adv_report, Hci.adv_report()}
+          | {:reports_dropped, pos_integer()}
           | {:hardware_error, byte()}
           | :command_stall
           | {:event, byte(), binary()}
@@ -161,10 +179,11 @@ defmodule Bluez.HciUser do
   @typedoc "Outcome of `command/4`."
   @type result ::
           {:ok, binary() | :pending}
-          | {:error, {:status, byte()} | :timeout | :closed}
+          | {:error, {:status, byte()} | :timeout | :closed | :malformed_reply}
 
   @typedoc "Outcome of the commands whose return parameters are only a Status."
-  @type status_result :: :ok | {:error, {:status, byte()} | :timeout | :closed}
+  @type status_result ::
+          :ok | {:error, {:status, byte()} | :timeout | :closed | :malformed_reply}
 
   @typedoc "Outcome of a read command."
   @type read_result(value) ::
@@ -406,6 +425,9 @@ defmodule Bluez.HciUser do
         owner: owner,
         owner_mon: Process.monitor(owner),
         ncmd_timeout: Keyword.get(opts, :ncmd_timeout, @ncmd_timeout),
+        max_owner_backlog: Keyword.get(opts, :max_owner_backlog, @max_owner_backlog),
+        # Reports dropped since the owner last got one.
+        dropped: 0,
         # Num_HCI_Command_Packets: the controller starts out able to take one.
         credits: 1,
         ncmd_timer: nil,
@@ -497,7 +519,7 @@ defmodule Bluez.HciUser do
   # Unanswered in flight: the controller is faulty, and a late reply could
   # be taken for a later command's. Close rather than guess.
   def handle_info({:command_timeout, ref}, %{in_flight: %{ref: ref}} = state),
-    do: state |> fault(:command_timeout) |> noreply()
+    do: state |> fault({:error, :timeout}, :command_timeout) |> noreply()
 
   def handle_info({:command_timeout, ref}, state), do: state |> drop_queued(ref) |> noreply()
 
@@ -550,10 +572,10 @@ defmodule Bluez.HciUser do
             %{state | credits: state.credits - 1, in_flight: entry}
 
           {:error, :timeout} ->
-            fault(%{state | in_flight: entry}, :send_timeout)
+            fault(%{state | in_flight: entry}, {:error, :timeout}, :send_timeout)
 
           {:error, {:timeout, _unsent}} ->
-            fault(%{state | in_flight: entry}, :send_timeout)
+            fault(%{state | in_flight: entry}, {:error, :timeout}, :send_timeout)
 
           {:error, reason} ->
             close_down(%{state | in_flight: entry}, reason)
@@ -563,11 +585,11 @@ defmodule Bluez.HciUser do
 
   defp remaining(entry), do: max(entry.deadline - now(), 0)
 
-  # The in-flight command failed by timing out: its caller gets
-  # {:error, :timeout}, everything else {:error, :closed}.
-  defp fault(%{in_flight: entry} = state, reason) do
+  # The in-flight command failed (timed out, or a garbled reply): its
+  # caller gets `reply`, everything else {:error, :closed}.
+  defp fault(%{in_flight: entry} = state, reply, reason) do
     Process.cancel_timer(entry.timer)
-    GenServer.reply(entry.from, {:error, :timeout})
+    GenServer.reply(entry.from, reply)
     close_down(%{state | in_flight: nil}, reason)
   end
 
@@ -591,14 +613,25 @@ defmodule Bluez.HciUser do
   # A stale timer message is ignored by its ref.
   defp cancel_ncmd_timer(state), do: %{state | ncmd_timer: nil}
 
-  # The reply to the in-flight command, if it is for its opcode.
+  # The reply to the in-flight command, if it is for its opcode. Read after
+  # the deadline (this process was backlogged) it is still a timeout, and
+  # one without a Status byte a garbled controller: both are faults.
   defp complete(%{in_flight: %{opcode: opcode} = entry} = state, opcode, reply) do
-    Process.cancel_timer(entry.timer)
-    GenServer.reply(entry.from, reply)
-    %{state | in_flight: nil}
+    cond do
+      now() >= entry.deadline ->
+        fault(state, {:error, :timeout}, :command_timeout)
+
+      reply == :malformed ->
+        fault(state, {:error, :malformed_reply}, :malformed_reply)
+
+      true ->
+        Process.cancel_timer(entry.timer)
+        GenServer.reply(entry.from, reply)
+        %{state | in_flight: nil}
+    end
   end
 
-  # Unsolicited (opcode 0x0000): it only grants credits.
+  # Unsolicited (opcode 0x0000), or a stray reply: it only grants credits.
   defp complete(state, _opcode, _reply), do: state
 
   defp drop_queued(state, ref) do
@@ -632,8 +665,9 @@ defmodule Bluez.HciUser do
     reply =
       case rp do
         <<0, return_params::binary>> -> {:ok, return_params}
-        <<>> -> {:ok, <<>>}
         <<status, _::binary>> -> {:error, {:status, status}}
+        # Fine for the opcode-0 credit update, garbled for a command.
+        <<>> -> :malformed
       end
 
     state |> complete(opcode, reply) |> credits(ncmd) |> dispatch()
@@ -644,10 +678,8 @@ defmodule Bluez.HciUser do
     state |> complete(opcode, reply) |> credits(ncmd) |> dispatch()
   end
 
-  defp handle_event({:adv_reports, reports}, state) do
-    Enum.each(reports, &notify(state, {:adv_report, &1}))
-    state
-  end
+  defp handle_event({:adv_reports, reports}, state),
+    do: Enum.reduce(reports, state, &deliver_report/2)
 
   defp handle_event({:hardware_error, code}, state) do
     Logger.warning("Bluez.HciUser: hci#{state.index} reported hardware error 0x#{hex(code)}")
@@ -662,10 +694,41 @@ defmodule Bluez.HciUser do
 
   defp handle_event(:ignore, state), do: state
 
+  # Reports are the only flood: past the owner's backlog limit they are
+  # dropped (and counted) rather than queued without bound. Nothing else is.
+  defp deliver_report(report, state) do
+    if owner_backlog(state) >= state.max_owner_backlog do
+      if state.dropped == 0,
+        do: Logger.warning("Bluez.HciUser: owner backlogged, dropping advertising reports")
+
+      %{state | dropped: state.dropped + 1}
+    else
+      state = flush_dropped(state)
+      notify(state, {:adv_report, report})
+      state
+    end
+  end
+
+  defp owner_backlog(%{owner: owner}) when node(owner) == node() do
+    case Process.info(owner, :message_queue_len) do
+      {:message_queue_len, len} -> len
+      nil -> 0
+    end
+  end
+
+  defp owner_backlog(_state), do: 0
+
+  defp flush_dropped(%{dropped: 0} = state), do: state
+
+  defp flush_dropped(state) do
+    notify(state, {:reports_dropped, state.dropped})
+    %{state | dropped: 0}
+  end
+
   # The socket is gone: fail every command, tell the owner, then stop.
   defp close_down(%{closed: nil} = state, reason) do
     Logger.info("Bluez.HciUser: user channel on hci#{state.index} closed (#{inspect(reason)})")
-    state = fail_pending(state)
+    state = state |> fail_pending() |> flush_dropped()
     notify(state, {:closed, reason})
     %{state | closed: reason}
   end

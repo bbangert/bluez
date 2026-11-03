@@ -232,6 +232,9 @@ sequenceDiagram
   take in time) closes the channel as a controller fault, so a late
   reply can never be taken for a later command's. A controller that
   grants no credit for 4 s is reported as `:command_stall`.
+- **Bounded report delivery.** Advertising reports are dropped (and
+  counted, then reported as `{:reports_dropped, n}`) while the owner's
+  message queue is past a limit; every other event is always delivered.
 - **Gone means stopped.** A socket error (a dongle unplugged, say) fails
   every pending command with `{:error, :closed}`, sends the owner
   `{:closed, reason}` and stops the process. The owner re-binds by

@@ -70,6 +70,28 @@ defmodule Bluez.HciUserTest do
 
   defp async(fun), do: Task.async(fun)
 
+  defp forward(pid) do
+    receive do
+      msg -> send(pid, msg)
+    end
+
+    forward(pid)
+  end
+
+  defp wait_until(fun, tries \\ 200) do
+    cond do
+      fun.() ->
+        true
+
+      tries == 0 ->
+        false
+
+      true ->
+        Process.sleep(10)
+        wait_until(fun, tries - 1)
+    end
+  end
+
   # Whether the server has sent the task's command (it is in flight), or
   # the task finished first. While a send blocks, the server can't answer.
   defp sent_or_done(server, task) do
@@ -246,6 +268,39 @@ defmodule Bluez.HciUserTest do
       assert HciUser.le_set_advertising_enable(server, false) == {:error, :closed}
     end
 
+    test "a reply read only after the deadline is still a timeout" do
+      %{server: server, kernel: kernel} = start_server()
+      mon = Process.monitor(server)
+
+      task = async(fn -> HciUser.le_set_advertising_enable(server, true, 100) end)
+      expect_command(kernel, 0x200A)
+
+      :ok = :sys.suspend(server)
+      # Readiness queued before the timeout fires, by an earlier event...
+      event(kernel, 0x05, <<0, 0x40, 0x00, 0x13>>)
+      Process.sleep(150)
+      # ...and the reply arriving after the deadline, read in the same drain.
+      complete(kernel, 0x200A, <<0>>)
+      :ok = :sys.resume(server)
+
+      assert Task.await(task) == {:error, :timeout}
+      assert_receive {:bluez_hci_user, ^server, {:closed, :command_timeout}}, 1_000
+      assert_receive {:DOWN, ^mon, :process, ^server, :normal}, 1_000
+    end
+
+    test "a Command Complete without a Status byte is a fault" do
+      %{server: server, kernel: kernel} = start_server()
+      mon = Process.monitor(server)
+
+      task = async(fn -> HciUser.le_set_advertising_enable(server, true) end)
+      expect_command(kernel, 0x200A)
+      complete(kernel, 0x200A, <<>>)
+
+      assert Task.await(task) == {:error, :malformed_reply}
+      assert_receive {:bluez_hci_user, ^server, {:closed, :malformed_reply}}, 1_000
+      assert_receive {:DOWN, ^mon, :process, ^server, :normal}, 1_000
+    end
+
     test "a request that expired in the mailbox is rejected, never sent" do
       %{server: server, kernel: kernel} = start_server()
 
@@ -367,6 +422,42 @@ defmodule Bluez.HciUserTest do
       assert_receive {:bluez_hci_user, ^server,
                       {:adv_report, %{data: ^data, rssi: -55, legacy: true, address_type: 1}}},
                      1_000
+    end
+
+    test "reports are dropped while the owner is backlogged, other events never" do
+      test_pid = self()
+
+      # Holds its mailbox until told to forward everything to the test.
+      owner =
+        spawn_link(fn ->
+          receive do
+            :go -> forward(test_pid)
+          end
+        end)
+
+      %{server: server, kernel: kernel} = start_server(owner: owner, max_owner_backlog: 3)
+
+      report = <<3, 0, @addr_le::binary, 0, -50::signed>>
+      event(kernel, 0x3E, <<0x02, 6>> <> :binary.copy(report, 6))
+      event(kernel, 0x10, <<0x42>>)
+      event(kernel, 0x05, <<0, 0x40, 0x00, 0x13>>)
+
+      # Three reports delivered, three dropped, both other events kept.
+      assert wait_until(fn ->
+               Process.info(owner, :message_queue_len) == {:message_queue_len, 5}
+             end)
+
+      send(owner, :go)
+
+      for _i <- 1..3, do: assert_receive({:bluez_hci_user, ^server, {:adv_report, _}}, 1_000)
+      assert_receive {:bluez_hci_user, ^server, {:hardware_error, 0x42}}, 1_000
+      assert_receive {:bluez_hci_user, ^server, {:event, 0x05, _}}, 1_000
+      refute_receive {:bluez_hci_user, ^server, _other}, 100
+
+      # Caught up: the drop count first, then reports again.
+      event(kernel, 0x3E, <<0x02, 1>> <> report)
+      assert_receive {:bluez_hci_user, ^server, {:reports_dropped, 3}}, 1_000
+      assert_receive {:bluez_hci_user, ^server, {:adv_report, %{rssi: -50}}}, 1_000
     end
 
     test "other events are forwarded raw; data packets are dropped" do
