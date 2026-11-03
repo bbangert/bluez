@@ -638,20 +638,25 @@ defmodule Bluez.HciUserTest do
       case :socket.recv(kernel, 0, 1_000) do
         {:ok, <<opcode::little-16, index::little-16, len::little-16, params::binary-size(len)>>} ->
           send(test_pid, {:mgmt, opcode, index, params})
-          {status, rp} = answer.(opcode, index, params)
-          ev = <<opcode::little-16, status, rp::binary>>
 
-          # The other side may have given up (and closed) meanwhile.
-          case :socket.send(
-                 kernel,
-                 <<0x0001::little-16, index::little-16, byte_size(ev)::little-16, ev::binary>>
-               ) do
-            :ok -> mgmt_loop(kernel, test_pid, answer)
-            {:error, _reason} -> :socket.close(kernel)
+          case answer.(opcode, index, params) do
+            :no_reply -> mgmt_loop(kernel, test_pid, answer)
+            {status, rp} -> mgmt_reply(kernel, test_pid, answer, index, opcode, status, rp)
           end
 
         {:error, _reason} ->
           :socket.close(kernel)
+      end
+    end
+
+    defp mgmt_reply(kernel, test_pid, answer, index, opcode, status, rp) do
+      ev = <<opcode::little-16, status, rp::binary>>
+      packet = <<0x0001::little-16, index::little-16, byte_size(ev)::little-16, ev::binary>>
+
+      # The other side may have given up (and closed) meanwhile.
+      case :socket.send(kernel, packet) do
+        :ok -> mgmt_loop(kernel, test_pid, answer)
+        {:error, _reason} -> :socket.close(kernel)
       end
     end
 
@@ -791,30 +796,42 @@ defmodule Bluez.HciUserTest do
       assert_received {:mgmt, @set_powered, 0, <<0>>}
     end
 
-    test "slow MGMT replies while re-powering off count against the bind budget" do
-      # Every reply takes 80 ms, and the controller always reads powered.
+    test "MGMT commands while re-powering off share what is left of the bind budget" do
+      set_powered_calls = :counters.new(1, [])
+
+      # The controller always reads powered, slowly. The first Set Powered
+      # (before binding) is answered; the retry's never is.
       answer = fn
         @set_powered, 0, <<0>> ->
-          Process.sleep(80)
-          {0, <<0::little-32>>}
+          :counters.add(set_powered_calls, 1, 1)
+          if :counters.get(set_powered_calls, 1) == 1, do: {0, <<0::little-32>>}, else: :no_reply
 
         @read_controller_info, 0, <<>> ->
-          Process.sleep(80)
+          Process.sleep(400)
           {0, controller_info(@bd_addr, 1)}
       end
 
       attempts = :counters.new(1, [])
+      started = System.monotonic_time(:millisecond)
 
-      # Read Controller Info leaves ~20 ms of the 100 ms budget: Set Powered
-      # gets only that, and no bind is attempted past the budget.
       assert HciUser.start_link(
                index: 0,
                power_off_first: true,
-               bind_timeout: 100,
+               mgmt_timeout: 2_000,
+               bind_timeout: 600,
                open_control: fake_mgmt(answer),
                open: busy_then_open(1_000, attempts)
              ) == {:error, {:bind, :ebusy}}
 
+      elapsed = System.monotonic_time(:millisecond) - started
+
+      # The retry did read the controller and try to power it off...
+      assert_received {:mgmt, @set_powered, 0, <<0>>}
+      assert_received {:mgmt, @read_controller_info, 0, <<>>}
+      assert_received {:mgmt, @set_powered, 0, <<0>>}
+      # ...but Set Powered only waited out the ~200 ms left of the 600 ms
+      # budget, not a fresh 600 ms (~1 000 ms in all) or :mgmt_timeout.
+      assert elapsed < 850
       assert :counters.get(attempts, 1) == 1
     end
 

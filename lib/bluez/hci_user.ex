@@ -291,7 +291,8 @@ defmodule Bluez.HciUser do
   end
 
   defp find_index(sock, address, timeout) do
-    with {:ok, rp} <- mgmt(sock, Hci.op_read_index_list(), Hci.index_none(), <<>>, timeout),
+    with {:ok, rp} <-
+           mgmt(sock, Hci.op_read_index_list(), Hci.index_none(), <<>>, deadline(timeout)),
          {:ok, indexes} <- decode(Hci.decode_index_list(rp)) do
       case Enum.find(indexes, &has_address?(sock, &1, address, timeout)) do
         nil -> {:error, :not_found}
@@ -302,7 +303,7 @@ defmodule Bluez.HciUser do
 
   # A controller that vanished or answers oddly is simply not it.
   defp has_address?(sock, index, address, timeout) do
-    case mgmt(sock, Hci.op_read_controller_info(), index, <<>>, timeout) do
+    case mgmt(sock, Hci.op_read_controller_info(), index, <<>>, deadline(timeout)) do
       {:ok, rp} -> match?({:ok, %{address: ^address}}, Hci.decode_controller_info(rp))
       {:error, _reason} -> false
     end
@@ -493,7 +494,9 @@ defmodule Bluez.HciUser do
 
   defp maybe_power_off(opts, index, open_control, timeout) do
     if Keyword.get(opts, :power_off_first, true) do
-      case with_control(open_control, &mgmt(&1, Hci.op_set_powered(), index, <<0>>, timeout)) do
+      set_powered_off = &mgmt(&1, Hci.op_set_powered(), index, <<0>>, deadline(timeout))
+
+      case with_control(open_control, set_powered_off) do
         {:ok, _settings} -> :ok
         {:error, reason} -> {:error, {:power_off, reason}}
       end
@@ -532,13 +535,15 @@ defmodule Bluez.HciUser do
     end
   end
 
-  # The deadline is checked again after the power-off: its MGMT commands
-  # take time out of the same budget.
+  # The deadline is checked again after the power-off (its MGMT commands
+  # take time out of the same budget) and after the sleep (which can
+  # overrun).
   defp retry_bind(retry) do
     with true <- time_for_another_bind?(retry),
          retry = power_off_if_powered(retry),
-         true <- time_for_another_bind?(retry) do
-      Process.sleep(@bind_retry_ms)
+         true <- time_for_another_bind?(retry),
+         :ok <- Process.sleep(@bind_retry_ms),
+         true <- now() < retry.deadline do
       bind_loop(retry)
     else
       false -> {:error, {:bind, :ebusy}}
@@ -562,13 +567,11 @@ defmodule Bluez.HciUser do
 
   defp power_off_if_powered(retry), do: retry
 
-  # Each command gets what is left of the bind budget (at most
-  # :mgmt_timeout), and none once it is spent.
+  # Each command, send and reply together, gets what is left of the bind
+  # budget (at most :mgmt_timeout), and none once it is spent.
   defp budgeted_mgmt(sock, retry, opcode, params) do
-    case min(retry.mgmt_timeout, retry.deadline - now()) do
-      timeout when timeout > 0 -> mgmt(sock, opcode, retry.index, params, timeout)
-      _spent -> {:error, :timeout}
-    end
+    deadline = min(deadline(retry.mgmt_timeout), retry.deadline)
+    mgmt(sock, opcode, retry.index, params, deadline)
   end
 
   @impl GenServer
@@ -871,11 +874,16 @@ defmodule Bluez.HciUser do
   end
 
   # One MGMT command, answered by its Command Complete (→ `{:ok, params}`)
-  # or a failing Command Status. Events for other controllers/commands on
-  # the shared control channel are skipped.
-  defp mgmt(sock, opcode, index, params, timeout) do
-    case :socket.send(sock, Hci.mgmt_command(opcode, index, params)) do
-      :ok -> await_mgmt(sock, opcode, index, deadline(timeout))
+  # or a failing Command Status, all by the absolute `deadline` — the send
+  # included. Events for other controllers/commands on the shared control
+  # channel are skipped.
+  defp mgmt(sock, opcode, index, params, deadline) do
+    with remaining when remaining > 0 <- deadline - now(),
+         :ok <- :socket.send(sock, Hci.mgmt_command(opcode, index, params), [], remaining) do
+      await_mgmt(sock, opcode, index, deadline)
+    else
+      expired when is_integer(expired) -> {:error, :timeout}
+      {:error, {:timeout, _unsent}} -> {:error, :timeout}
       {:error, reason} -> {:error, reason}
     end
   end
