@@ -70,6 +70,28 @@ defmodule Bluez.HciUserTest do
 
   defp async(fun), do: Task.async(fun)
 
+  # The server's traced steps, in order, until it stops.
+  defp trace_steps(server, acc) do
+    receive do
+      {:trace, ^server, :call, {:socket, :close, _args}} ->
+        trace_steps(server, [:close | acc])
+
+      {:trace, ^server, :send, {_tag, {:error, :timeout}}, _to} ->
+        trace_steps(server, [:reply | acc])
+
+      {:trace, ^server, :send, {:bluez_hci_user, ^server, {:closed, _}}, _to} ->
+        trace_steps(server, [:closed | acc])
+
+      {:trace, ^server, _kind, _what, _to} ->
+        trace_steps(server, acc)
+
+      {:trace, ^server, _kind, _what} ->
+        trace_steps(server, acc)
+    after
+      200 -> Enum.reverse(acc)
+    end
+  end
+
   defp forward(pid) do
     receive do
       msg -> send(pid, msg)
@@ -258,14 +280,34 @@ defmodule Bluez.HciUserTest do
       disable = async(fn -> HciUser.le_set_advertising_enable(server, false) end)
 
       assert Task.await(enable) == {:error, :timeout}
+      # Released before anyone hears of the fault: re-binding can't race it.
+      assert {:error, :econnrefused} = :socket.send(kernel, <<0x04, 0x10, 1, 0>>)
       assert Task.await(disable) == {:error, :closed}
       assert_receive {:bluez_hci_user, ^server, {:closed, :command_timeout}}, 1_000
       assert_receive {:DOWN, ^mon, :process, ^server, :normal}, 1_000
 
-      # The disable was never sent, and the socket is closed.
+      # The disable was never sent.
       refute_command(kernel)
-      assert {:error, :econnrefused} = :socket.send(kernel, <<0x04, 0x0E, 4, 1, 0x0A, 0x20, 0>>)
       assert HciUser.le_set_advertising_enable(server, false) == {:error, :closed}
+    end
+
+    test "the socket is closed before the fault is reported to anyone" do
+      %{server: server, kernel: kernel} = start_server()
+
+      # An isolated trace session: the server's socket close, and its sends.
+      session = :trace.session_create(:hci_user_close_order, self(), [])
+      on_exit(fn -> :trace.session_destroy(session) end)
+      :trace.function(session, {:socket, :close, 1}, true, [:local])
+      :trace.process(session, server, true, [:call, :send])
+
+      task = async(fn -> HciUser.le_set_advertising_enable(server, true, 100) end)
+      expect_command(kernel, 0x200A)
+      assert Task.await(task) == {:error, :timeout}
+      assert_receive {:bluez_hci_user, ^server, {:closed, :command_timeout}}, 1_000
+
+      # In the order they happened: the close first, then the caller's
+      # reply and the owner's message.
+      assert [:close, :reply, :closed] = server |> trace_steps([]) |> Enum.uniq()
     end
 
     test "a reply read only after the deadline is still a timeout" do
@@ -485,8 +527,10 @@ defmodule Bluez.HciUserTest do
       # What the socket layer delivers when the select is aborted under us.
       send(server, {:"$socket", proc, :abort, {make_ref(), :enodev}})
 
-      assert Task.await(task) == {:error, :closed}
       assert_receive {:bluez_hci_user, ^server, {:closed, {:abort, :enodev}}}, 1_000
+      # Already closed when the owner hears of it.
+      assert {:error, :econnrefused} = :socket.send(kernel, <<0x04, 0x10, 1, 0>>)
+      assert Task.await(task) == {:error, :closed}
       assert_receive {:DOWN, ^mon, :process, ^server, :normal}, 1_000
       assert HciUser.command(server, @reset) == {:error, :closed}
     end
@@ -624,6 +668,29 @@ defmodule Bluez.HciUserTest do
                {:error, :not_found}
 
       assert HciUser.find_index("nope") == {:error, {:invalid_address, "nope"}}
+    end
+
+    test "nothing is read once the MGMT deadline has passed" do
+      # A stream of unrelated events already waiting, then the very reply
+      # the command wants: reading on past the deadline would find it.
+      open_control = fn ->
+        {proc, kernel} = TestSocketPair.open()
+        index_added = <<0x0004::little-16, 5::little-16, 0::little-16>>
+        for _i <- 1..100, do: :ok = :socket.send(kernel, index_added)
+        rp = <<0x0005::little-16, 0, 0::little-32>>
+        :ok = :socket.send(kernel, <<1::little-16, 0::little-16, byte_size(rp)::little-16>> <> rp)
+        {:ok, proc}
+      end
+
+      assert HciUser.start_link(
+               index: 0,
+               owner: self(),
+               mgmt_timeout: 0,
+               open_control: open_control,
+               open: user_channel_open()
+             ) == {:error, {:power_off, :timeout}}
+
+      refute_received {:bound, _, _, _}
     end
 
     test "a refused power-off fails the start without binding" do

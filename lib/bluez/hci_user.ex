@@ -117,7 +117,9 @@ defmodule Bluez.HciUser do
       `{:abort, reason}` for an aborted select, `:command_timeout` /
       `:send_timeout` for a command that timed out in flight, or
       `:malformed_reply`. Always the last message; not sent when the
-      socket is closed on purpose (`close/1`, the owner exiting).
+      socket is closed on purpose (`close/1`, the owner exiting). The
+      socket is already closed when it (or a failed command's reply)
+      arrives, so the controller can be re-bound at once.
 
   A busy radio reports hundreds of adverts a second, so delivery is
   bounded: while the owner's message queue holds `:max_owner_backlog`
@@ -536,10 +538,10 @@ defmodule Bluez.HciUser do
 
   @impl GenServer
   def terminate(_reason, state) do
-    # Pending callers learn now rather than at their call timeout.
-    _ = fail_pending(state)
-    # Closing the socket hands the controller back to the kernel.
-    :socket.close(state.sock)
+    # Closing the socket hands the controller back to the kernel; then
+    # pending callers learn now rather than at their call timeout.
+    state = close_socket(state)
+    _ = fail_pending(state, {:error, :closed})
     :ok
   end
 
@@ -587,11 +589,7 @@ defmodule Bluez.HciUser do
 
   # The in-flight command failed (timed out, or a garbled reply): its
   # caller gets `reply`, everything else {:error, :closed}.
-  defp fault(%{in_flight: entry} = state, reply, reason) do
-    Process.cancel_timer(entry.timer)
-    GenServer.reply(entry.from, reply)
-    close_down(%{state | in_flight: nil}, reason)
-  end
+  defp fault(state, reply, reason), do: close_down(state, reason, reply)
 
   # Num_HCI_Command_Packets from a Command Complete/Status.
   defp credits(state, ncmd) do
@@ -726,21 +724,35 @@ defmodule Bluez.HciUser do
   end
 
   # The socket is gone: fail every command, tell the owner, then stop.
-  defp close_down(%{closed: nil} = state, reason) do
+  # The socket is closed before anyone hears of it, so a caller or owner
+  # reacting at once (re-binding the index) never races its release.
+  # `in_flight_reply` is for the command that faulted, if any.
+  defp close_down(state, reason, in_flight_reply \\ {:error, :closed})
+
+  defp close_down(%{closed: nil} = state, reason, in_flight_reply) do
     Logger.info("Bluez.HciUser: user channel on hci#{state.index} closed (#{inspect(reason)})")
-    state = state |> fail_pending() |> flush_dropped()
+    state = state |> close_socket() |> fail_pending(in_flight_reply) |> flush_dropped()
     notify(state, {:closed, reason})
     %{state | closed: reason}
   end
 
-  defp close_down(state, _reason), do: state
+  defp close_down(state, _reason, _in_flight_reply), do: state
 
-  defp fail_pending(state) do
-    entries = List.wrap(state.in_flight) ++ :queue.to_list(state.queue)
+  defp close_socket(%{sock: nil} = state), do: state
 
-    Enum.each(entries, fn entry ->
+  defp close_socket(state) do
+    :socket.close(state.sock)
+    %{state | sock: nil}
+  end
+
+  defp fail_pending(state, in_flight_reply) do
+    replies =
+      Enum.map(List.wrap(state.in_flight), &{&1, in_flight_reply}) ++
+        Enum.map(:queue.to_list(state.queue), &{&1, {:error, :closed}})
+
+    Enum.each(replies, fn {entry, reply} ->
       Process.cancel_timer(entry.timer)
-      GenServer.reply(entry.from, {:error, :closed})
+      GenServer.reply(entry.from, reply)
     end)
 
     %{state | in_flight: nil, queue: :queue.new()}
@@ -778,8 +790,17 @@ defmodule Bluez.HciUser do
     end
   end
 
+  # The deadline is checked before every read: a stream of unrelated
+  # events must not keep the wait going past it.
   defp await_mgmt(sock, opcode, index, deadline) do
-    case :socket.recv(sock, 0, max(deadline - now(), 0)) do
+    case deadline - now() do
+      remaining when remaining > 0 -> await_mgmt(sock, opcode, index, deadline, remaining)
+      _expired -> {:error, :timeout}
+    end
+  end
+
+  defp await_mgmt(sock, opcode, index, deadline, remaining) do
+    case :socket.recv(sock, 0, remaining) do
       {:ok, packet} ->
         case Hci.decode_mgmt(packet) do
           {:ok, {:cmd_complete, ^index, ^opcode, :success, params}} ->
