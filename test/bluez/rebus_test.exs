@@ -8,6 +8,7 @@ defmodule Bluez.RebusTest do
 
   alias Bluez.Rebus.Connection
   alias Bluez.Rebus.Message
+  alias Bluez.Rebus.SignalHandler
   alias Bluez.Rebus.TestServer
 
   describe "Connections" do
@@ -334,11 +335,67 @@ defmodule Bluez.RebusTest do
     end
   end
 
+  describe "Buffered messages" do
+    setup [:server_setup]
+
+    test "complete messages read together with the Hello reply are delivered at once",
+         %{svr: svr} do
+      {:ok, addr} = TestServer.get_listen_addr(svr)
+      {:ok, cli} = Bluez.Rebus.connect(addr)
+      assert_receive {^svr, %Message{header_fields: %{member: "Hello"}}}
+
+      # Register straight on the signal bus: add_signal_handler/1 is a call
+      # the connection can't serve until the Hello exchange is over.
+      ref = make_ref()
+      :ok = :gen_event.add_handler(SignalHandler, {SignalHandler, ref}, {cli, self(), ref})
+      on_exit(fn -> :gen_event.delete_handler(SignalHandler, {SignalHandler, ref}, nil) end)
+
+      frames =
+        [
+          Message.new!(:method_return,
+            reply_serial: 1,
+            signature: "s",
+            flags: [],
+            body: [":1.100"]
+          ),
+          Message.new!(:signal,
+            path: "/org/freedesktop/DBus",
+            interface: "org.freedesktop.DBus",
+            member: "NameAcquired",
+            destination: ":1.100",
+            signature: "s",
+            body: [":1.100"]
+          ),
+          Message.new!(:signal,
+            path: "/org/freedesktop/DBus",
+            interface: "org.freedesktop.DBus",
+            member: "Buffered",
+            signature: "s",
+            body: ["foobar"]
+          )
+        ]
+        |> Enum.with_index(1)
+        |> Enum.map(fn {msg, serial} ->
+          {:ok, iodata} = Message.encode(%{msg | serial: serial})
+          iodata
+        end)
+
+      # One write, so the connection reads all three in a single recv.
+      :ok = TestServer.push_raw(svr, IO.iodata_to_binary(frames))
+
+      assert_receive {^ref, %Message{header_fields: %{member: "Buffered"}}}, 1_000
+    end
+  end
+
   describe "Malformed messages" do
     setup [:server_setup, :client_setup]
 
     test "a complete message with a corrupt type byte stops the connection cleanly",
          %{cli: cli, svr: svr} do
+      # Finish the Hello continuations first, so the frame can't be read
+      # together with the Hello reply.
+      :sys.get_state(cli)
+
       signal =
         Message.new!(:signal, path: "/", interface: "test.Interface", member: "Test")
 
