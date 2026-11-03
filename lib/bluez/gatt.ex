@@ -70,6 +70,15 @@ defmodule Bluez.Gatt do
   with an error code. Requested disconnects remove state immediately and
   need no follow-up message.
 
+  ## Signal scope
+
+  Each connection entry installs its own bus match rule for
+  `PropertiesChanged` under its device path
+  (`path_namespace='/org/bluez/hciN/dev_…'`), before `Device1.Connect` is
+  sent, and removes it when the entry is dropped. With no connections this
+  process receives no property changes at all — in particular not the one
+  bluetoothd emits per received advert on every adapter.
+
   ## Notifications
 
   `StartNotify` makes BlueZ emit `PropertiesChanged` with `Value` on the
@@ -298,16 +307,8 @@ defmodule Bluez.Gatt do
         sig_ref = Bluez.Rebus.add_signal_handler(conn)
         conn_ref = Process.monitor(conn)
 
-        # rebus installs no bus-side match rules; route org.bluez's Device1
-        # (Connected/ServicesResolved) and GattCharacteristic1 (Value)
-        # property changes to this connection.
-        for iface <- [@device_iface, @char_iface] do
-          DBus.add_match(
-            conn,
-            "type='signal',sender='org.bluez',interface='#{@props_iface}'," <>
-              "member='PropertiesChanged',arg0='#{iface}'"
-          )
-        end
+        # rebus installs no bus-side match rules. Each connection entry
+        # installs its own, scoped to its device (see watch_device/2).
 
         {:ok,
          %{
@@ -767,13 +768,37 @@ defmodule Bluez.Gatt do
   end
 
   defp drop_entry(state, address) do
-    {_entry, state} = pop_in(state.conns[address])
+    {entry, state} = pop_in(state.conns[address])
+    if entry, do: unwatch_device(state.conn, entry.path)
     notify_connections_changed(state)
 
     update_in(state.notify_paths, fn paths ->
       paths |> Enum.reject(fn {_path, {addr, _h}} -> addr == address end) |> Map.new()
     end)
   end
+
+  @doc false
+  # Routes one device's property changes — Device1 (Connected,
+  # ServicesResolved) on the device object and GattCharacteristic1 (Value)
+  # on the characteristics below it — to this connection. Scoped per device
+  # because bluetoothd emits a Device1 PropertiesChanged for every advert
+  # it receives: a bus-wide rule would decode every adapter's scan traffic.
+  # Public only for unit tests.
+  @spec device_match_rule(String.t()) :: String.t()
+  def device_match_rule(device_path) do
+    "type='signal',sender='org.bluez',interface='#{@props_iface}'," <>
+      "member='PropertiesChanged',path_namespace='#{device_path}'"
+  end
+
+  # One rule per entry, added in start_connect/3 and removed in
+  # drop_entry/2. Both go out NO_REPLY_EXPECTED from this loop: they reach
+  # the daemon in the order entries come and go (a replaced entry's remove
+  # lands before its successor's add) and never wait on its reply.
+  defp watch_device(conn, path),
+    do: DBus.add_match(conn, device_match_rule(path), no_reply: true)
+
+  defp unwatch_device(conn, path),
+    do: DBus.remove_match(conn, device_match_rule(path), no_reply: true)
 
   # Slot usage changed (entry created or dropped) — the injected fun lets
   # the host push an off-tick update (the app wires Bluetooth.Stats, whose
@@ -848,6 +873,9 @@ defmodule Bluez.Gatt do
     else
       gen = state.gen_seq + 1
       path = DevicePath.from_address(address)
+      # Sent before the connect Task exists, so the daemon has the rule
+      # before bluetoothd ever sees Device1.Connect.
+      watch_device(state.conn, path)
       run_connect(state.conn, address, gen, path)
       notify_connections_changed(state)
 

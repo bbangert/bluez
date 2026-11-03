@@ -39,8 +39,9 @@ defmodule Bluez.ClientTest do
     returns `objects` whole, `Properties.GetAll` the object's props, and
     every other method call an empty return (so `power_on` and the real
     mode calls succeed). Every method call is reported to `tap` as
-    `{:bus_call, member, path}`; `set_objects/2` swaps the tree (e.g. a
-    radio appearing between setup retries).
+    `{:bus_call, member, path}`, and match-rule calls additionally as
+    `{:bus_match, "AddMatch" | "RemoveMatch", rule}`; `set_objects/2`
+    swaps the tree (e.g. a radio appearing between setup retries).
     """
     use GenServer
 
@@ -61,8 +62,13 @@ defmodule Bluez.ClientTest do
     def handle_call({:set_objects, objects}, _from, state),
       do: {:reply, :ok, %{state | objects: objects}}
 
-    def handle_call({:send, %Message{header_fields: hf}}, _from, state) do
-      if state.tap, do: send(state.tap, {:bus_call, hf[:member], hf[:path]})
+    def handle_call({:send, %Message{header_fields: hf, body: msg_body}}, _from, state) do
+      if state.tap do
+        send(state.tap, {:bus_call, hf[:member], hf[:path]})
+
+        if hf[:member] in ["AddMatch", "RemoveMatch"],
+          do: send(state.tap, {:bus_match, hf[:member], hd(msg_body)})
+      end
 
       body =
         case hf[:member] do
@@ -404,7 +410,7 @@ defmodule Bluez.ClientTest do
     # the test triggers the final setup attempt itself ({:setup_retry, 0}),
     # so no-adapter outcomes stop at once instead of after ~10 s of retries.
     defp start_setup_client(objects) do
-      {:ok, bus} = BusStub.start_link(objects)
+      {:ok, bus} = BusStub.start_link(objects, self())
 
       {:ok, client} =
         Client.start_link(
@@ -523,6 +529,109 @@ defmodule Bluez.ClientTest do
       _ = :sys.get_state(client)
       refute_received {:bluetooth_adapters_changed}
       assert Bluez.DevicePath.resolved_adapter_path() == :error
+    end
+
+    @om_rule "type='signal',sender='org.bluez',interface='org.freedesktop.DBus.ObjectManager'"
+
+    defp device_rule(index) do
+      "type='signal',sender='org.bluez',interface='org.freedesktop.DBus.Properties'," <>
+        "member='PropertiesChanged',arg0='org.bluez.Device1'," <>
+        "path_namespace='/org/bluez/hci#{index}'"
+    end
+
+    defp received_matches do
+      receive do
+        {:bus_match, member, rule} -> [{member, rule} | received_matches()]
+      after
+        0 -> []
+      end
+    end
+
+    test "the Device1 rule is scoped to the claimed adapter's path namespace" do
+      assert Client.device_match_rule("/org/bluez/hci1") == device_rule(1)
+    end
+
+    test "before any claim only the ObjectManager rule is installed" do
+      :persistent_term.put(Bluez.DevicePath.excluded_adapters_key(), ["AA:BB:CC:DD:EE:00"])
+      {_client, _bus} = start_retrying_client([adapter_object(0, "AA:BB:CC:DD:EE:00")])
+
+      # Retrying with every adapter excluded: nothing is claimed, so no
+      # Device1 rule — scoped or not — may exist yet.
+      assert_receive {:bus_call, "GetManagedObjects", "/"}, 2_000
+      assert received_matches() == [{"AddMatch", @om_rule}]
+    end
+
+    test "the claim routes only the claimed adapter's Device1 signals, never an excluded one's" do
+      :persistent_term.put(Bluez.DevicePath.excluded_adapters_key(), ["AA:BB:CC:DD:EE:00"])
+
+      client =
+        start_setup_client([
+          adapter_object(0, "AA:BB:CC:DD:EE:00"),
+          adapter_object(1, "AA:BB:CC:DD:EE:01")
+        ])
+
+      send(client, {:setup_retry, 0})
+      _ = :sys.get_state(client)
+
+      assert received_matches() == [{"AddMatch", device_rule(1)}]
+      assert :sys.get_state(client).device_match == device_rule(1)
+    end
+
+    test "the rule is installed before setup seeds devices from GetManagedObjects" do
+      client = start_setup_client([adapter_object(0, "AA:BB:CC:DD:EE:00")])
+
+      send(client, {:setup_retry, 0})
+      _ = :sys.get_state(client)
+
+      # Calls in arrival order: discovery, the match, power-on, the seed.
+      calls =
+        Stream.repeatedly(fn ->
+          receive do
+            {:bus_call, member, _path} -> member
+          after
+            0 -> nil
+          end
+        end)
+        |> Enum.take_while(& &1)
+
+      assert ["GetManagedObjects", "AddMatch", "Set", "GetManagedObjects" | _] = calls
+    end
+
+    test "moving the claim adds the new adapter's rule, then removes the old one" do
+      hci0 = adapter_object(0, "AA:BB:CC:DD:EE:00")
+      hci1 = adapter_object(1, "AA:BB:CC:DD:EE:01")
+      {:ok, bus} = BusStub.start_link([hci0, hci1], self())
+
+      {:ok, client} =
+        Client.start_link(
+          connect_fun: fn -> {:ok, bus} end,
+          setup: false,
+          apply_mode_fun: fn _conn, _engaged, _target -> {:ok, :monitor} end
+        )
+
+      on_exit(fn ->
+        for pid <- [client, bus], Process.alive?(pid), do: Process.exit(pid, :kill)
+      end)
+
+      send(client, {:setup_retry, 0})
+      _ = :sys.get_state(client)
+      assert received_matches() == [{"AddMatch", device_rule(0)}]
+
+      # Re-claiming the same adapter leaves the rule alone.
+      send(client, {:setup_retry, 0})
+      _ = :sys.get_state(client)
+      assert received_matches() == []
+
+      :ok = BusStub.set_objects(bus, [hci1])
+      send(client, {:setup_retry, 0})
+      _ = :sys.get_state(client)
+
+      assert received_matches() == [
+               {"AddMatch", device_rule(1)},
+               {"RemoveMatch", device_rule(0)}
+             ]
+
+      assert :sys.get_state(client).device_match == device_rule(1)
     end
   end
 end
