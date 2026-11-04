@@ -220,9 +220,11 @@ sequenceDiagram
 
 - **Bring-up order.** Find the controller by address in MGMT's index
   list (not sysfs, which shows it before its setup is done), power it
-  off, then bind — retrying while the kernel answers `:ebusy`, which it
-  does until its vendor setup (the firmware patch) has finished, so a
-  bound controller always has its patch loaded.
+  off — retrying while MGMT answers Busy, as it does while `bluetoothd`
+  configures an index it has just (re)acquired — then bind, retrying
+  while the kernel answers `:ebusy`, which it does until its vendor setup
+  (the firmware patch) has finished, so a bound controller always has its
+  patch loaded. Both retries share one budget.
 - **Not supervised by `Bluez`.** The owner starts it (`restart:
   :temporary`) and runs the bring-up itself — Reset, event masks, scan
   and advertising parameters; the moduledoc lists the sequence that works

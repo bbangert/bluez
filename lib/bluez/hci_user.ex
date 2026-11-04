@@ -32,20 +32,30 @@ defmodule Bluez.HciUser do
       lists it once it is. Never assume an index number; re-resolve by
       address every time (see "Events").
    2. **Power it off** through MGMT, since the kernel only binds a
-      controller that is down (skip with `power_off_first: false`).
-   3. **Bind**, retrying every 20 ms while the kernel answers `:ebusy`,
-      for up to `:bind_timeout`. The kernel refuses the bind until its
+      controller that is down (skip with `power_off_first: false`). Right
+      after `bluetoothd` (re)acquires an index — at boot, or when another
+      user-channel holder lets go — it configures the adapter for a
+      moment, and Set Powered is refused with MGMT Busy meanwhile: that
+      is retried every 20 ms. Any other MGMT status fails the start at
+      once.
+   3. **Bind**, retrying every 20 ms while the kernel answers `:ebusy`.
+      The kernel refuses the bind until its
       vendor setup and init have finished — about 600 ms after a USB
       dongle (re)enumerates — and while `bluetoothd` is powering the
       controller on, which it starts ~150 ms after the index appears; if
       Read Controller Information shows it powered on meanwhile, it is
-      powered off again (a bounded number of times). A successful bind
-      therefore also guarantees the kernel's firmware patch is loaded.
+      powered off again (a bounded number of times, Busy retried as in
+      step 2). A successful bind therefore also guarantees the kernel's
+      firmware patch is loaded.
+
+  Steps 2 and 3 share one budget, `:bind_timeout` (default 3 s), which
+  every MGMT command in them also counts against.
 
   Any failure is returned as `{:error, reason}`, and the process exits
   normally (so a linked caller doesn't crash): `{:resolve, reason}`
   (`:not_found` when no controller has the address), `{:power_off,
-  reason}` (a MGMT status such as `:invalid_index`, or a socket error),
+  reason}` (a MGMT status such as `:invalid_index`, a socket error, or
+  `:busy` when the budget is spent while the power-off is still refused),
   or `{:bind, reason}` (`:ebusy` once the budget is spent).
 
   The sequence that brought up a Realtek RTL8761B (UB500 dongle) on a
@@ -170,8 +180,8 @@ defmodule Bluez.HciUser do
     * `:max_owner_backlog` — see "Events" (default `5_000` messages).
     * `:mgmt_timeout` — patience per MGMT command during bring-up
       (default `2_000` ms).
-    * `:bind_timeout` — how long to keep retrying a bind refused with
-      `:ebusy` (default `3_000` ms), see "Bring-up".
+    * `:bind_timeout` — the budget for powering off and binding, retries
+      included (default `3_000` ms), see "Bring-up".
     * `:name` — optional registered name.
 
   The child spec is `restart: :temporary`: the owner decides when to
@@ -191,7 +201,7 @@ defmodule Bluez.HciUser do
   @max_owner_backlog 5_000
   @mgmt_timeout 2_000
   @bind_timeout 3_000
-  @bind_retry_ms 20
+  @retry_ms 20
   # Power-offs while retrying the bind, on top of the first.
   @max_power_offs 5
   # Bounded drain per wakeup so a flood of reports can't starve the mailbox.
@@ -449,8 +459,9 @@ defmodule Bluez.HciUser do
     open_control = Keyword.get(opts, :open_control, &open_control/0)
 
     with {:ok, index} <- resolve(opts, open_control, mgmt_timeout),
-         :ok <- maybe_power_off(opts, index, open_control, mgmt_timeout),
-         {:ok, sock} <- bind(opts, index, open, open_control, mgmt_timeout) do
+         retry = bring_up(opts, index, open, open_control, mgmt_timeout),
+         :ok <- power_off(retry),
+         {:ok, sock} <- bind_loop(retry) do
       state = %{
         sock: sock,
         index: index,
@@ -493,36 +504,46 @@ defmodule Bluez.HciUser do
     end
   end
 
-  defp maybe_power_off(opts, index, open_control, timeout) do
-    if Keyword.get(opts, :power_off_first, true) do
-      set_powered_off = &mgmt(&1, Hci.op_set_powered(), index, <<0>>, deadline(timeout))
+  # Powering off and binding share one budget, :bind_timeout. Both can be
+  # refused for a while: the bind with :ebusy until the kernel's vendor
+  # setup (the firmware patch) and init have finished — ~600 ms after a
+  # dongle (re)enumerates — and while bluetoothd is powering the controller
+  # on; Set Powered with MGMT Busy while bluetoothd configures an index it
+  # has just (re)acquired. Both are retried until the budget is spent, and
+  # the controller powered off again (a bounded number of times) whenever
+  # bluetoothd has powered it on meanwhile.
+  defp bring_up(opts, index, open, open_control, mgmt_timeout) do
+    power_off? = Keyword.get(opts, :power_off_first, true)
 
-      case with_control(open_control, set_powered_off) do
-        {:ok, _settings} -> :ok
-        {:error, reason} -> {:error, {:power_off, reason}}
-      end
-    else
-      :ok
-    end
-  end
-
-  # The kernel refuses the bind with :ebusy until its vendor setup (the
-  # firmware patch) and init have finished — ~600 ms after a dongle
-  # (re)enumerates — and while bluetoothd is powering the controller on.
-  # Retry until the budget is spent, powering it off again (a bounded
-  # number of times) whenever bluetoothd has powered it on meanwhile.
-  defp bind(opts, index, open, open_control, mgmt_timeout) do
-    bind_loop(%{
+    %{
       index: index,
       open: open,
       open_control: open_control,
       mgmt_timeout: mgmt_timeout,
       sleep: Keyword.get(opts, :sleep, &Process.sleep/1),
-      power_offs_left:
-        if(Keyword.get(opts, :power_off_first, true), do: @max_power_offs, else: 0),
+      power_off?: power_off?,
+      power_offs_left: if(power_off?, do: @max_power_offs, else: 0),
+      # Whether the last power-off was refused as Busy.
+      power_off_busy?: false,
       deadline: now() + Keyword.get(opts, :bind_timeout, @bind_timeout)
-    })
+    }
   end
+
+  defp power_off(%{power_off?: false}), do: :ok
+
+  defp power_off(retry) do
+    case with_control(retry.open_control, &set_powered_off(&1, retry)) do
+      {:ok, _settings} -> :ok
+      {:error, :busy} -> retry_power_off(retry)
+      {:error, reason} -> {:error, {:power_off, reason}}
+    end
+  end
+
+  defp retry_power_off(retry) do
+    if pause(retry), do: power_off(retry), else: {:error, {:power_off, :busy}}
+  end
+
+  defp set_powered_off(sock, retry), do: budgeted_mgmt(sock, retry, Hci.op_set_powered(), <<0>>)
 
   defp bind_loop(retry) do
     case retry.open.(retry.index) do
@@ -538,33 +559,48 @@ defmodule Bluez.HciUser do
   end
 
   # The deadline is checked again after the power-off (its MGMT commands
-  # take time out of the same budget) and after the sleep (which can
-  # overrun).
+  # take time out of the same budget).
   defp retry_bind(retry) do
-    with true <- time_for_another_bind?(retry),
-         retry = power_off_if_powered(retry),
-         true <- time_for_another_bind?(retry),
-         :ok <- retry.sleep.(@bind_retry_ms),
-         true <- now() < retry.deadline do
-      bind_loop(retry)
+    if time_for_retry?(retry) do
+      retry = power_off_if_powered(retry)
+      if pause(retry), do: bind_loop(retry), else: give_up(retry)
     else
-      false -> {:error, {:bind, :ebusy}}
+      give_up(retry)
     end
   end
 
-  defp time_for_another_bind?(retry), do: now() + @bind_retry_ms < retry.deadline
+  # The budget is spent: a power-off still refused as Busy is what kept
+  # the controller from binding.
+  defp give_up(%{power_off_busy?: true}), do: {:error, {:power_off, :busy}}
+  defp give_up(_retry), do: {:error, {:bind, :ebusy}}
+
+  # The pause between attempts, if the budget leaves room for another; the
+  # deadline is checked again after it, as a sleep can overrun.
+  defp pause(retry) do
+    with true <- time_for_retry?(retry),
+         :ok <- retry.sleep.(@retry_ms) do
+      now() < retry.deadline
+    end
+  end
+
+  defp time_for_retry?(retry), do: now() + @retry_ms < retry.deadline
 
   defp power_off_if_powered(%{power_offs_left: left} = retry) when left > 0 do
-    powered_off =
+    # Best effort: anything but Busy (which the next round retries) is
+    # left to the bind to report.
+    result =
       with_control(retry.open_control, fn sock ->
         with {:ok, rp} <- budgeted_mgmt(sock, retry, Hci.op_read_controller_info(), <<>>),
-             {:ok, %{powered: true}} <- Hci.decode_controller_info(rp),
-             {:ok, _settings} <- budgeted_mgmt(sock, retry, Hci.op_set_powered(), <<0>>) do
-          :powered_off
+             {:ok, %{powered: true}} <- Hci.decode_controller_info(rp) do
+          set_powered_off(sock, retry)
         end
       end)
 
-    if powered_off == :powered_off, do: %{retry | power_offs_left: left - 1}, else: retry
+    case result do
+      {:ok, _settings} -> %{retry | power_offs_left: left - 1, power_off_busy?: false}
+      {:error, :busy} -> %{retry | power_off_busy?: true}
+      _not_powered_or_failed -> %{retry | power_off_busy?: false}
+    end
   end
 
   defp power_off_if_powered(retry), do: retry

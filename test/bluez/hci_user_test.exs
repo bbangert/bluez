@@ -880,17 +880,87 @@ defmodule Bluez.HciUserTest do
       assert :counters.get(attempts, 1) == 1
     end
 
-    test "a refused power-off fails the start without binding" do
-      refuse = fn @set_powered, _index, _params -> {0x11, <<>>} end
+    test "a refused power-off fails the start at once, without binding" do
+      for {status, reason} <- [{0x11, :invalid_index}, {0x03, :failed}] do
+        calls = :counters.new(1, [])
 
-      assert HciUser.start_link(
-               index: 3,
-               owner: self(),
-               open_control: fake_mgmt(refuse),
-               open: user_channel_open()
-             ) == {:error, {:power_off, :invalid_index}}
+        refuse = fn @set_powered, _index, _params ->
+          :counters.add(calls, 1, 1)
+          {status, <<>>}
+        end
+
+        assert HciUser.start_link(
+                 index: 3,
+                 owner: self(),
+                 open_control: fake_mgmt(refuse),
+                 open: user_channel_open()
+               ) == {:error, {:power_off, reason}}
+
+        # Only Busy is retried.
+        assert :counters.get(calls, 1) == 1
+      end
 
       refute_received {:bound, _, _, _}
+    end
+
+    # MGMT Busy (0x0A) for the first `busy` Set Powered commands.
+    defp busy_power_off(busy, calls) do
+      fn @set_powered, 0, <<0>> ->
+        :counters.add(calls, 1, 1)
+        if :counters.get(calls, 1) <= busy, do: {0x0A, <<>>}, else: {0, <<0::little-32>>}
+      end
+    end
+
+    test "a power-off refused as Busy (bluetoothd configuring the index) is retried" do
+      calls = :counters.new(1, [])
+
+      %{server: server} =
+        start_server(power_off_first: true, open_control: fake_mgmt(busy_power_off(3, calls)))
+
+      assert :counters.get(calls, 1) == 4
+      assert HciUser.index(server) == {:ok, 0}
+    end
+
+    test "a power-off still Busy when the budget is spent fails with :busy" do
+      calls = :counters.new(1, [])
+      started = System.monotonic_time(:millisecond)
+
+      assert HciUser.start_link(
+               index: 0,
+               bind_timeout: 200,
+               open_control: fake_mgmt(busy_power_off(1_000, calls)),
+               open: user_channel_open()
+             ) == {:error, {:power_off, :busy}}
+
+      assert :counters.get(calls, 1) >= 3
+      assert System.monotonic_time(:millisecond) - started < 1_000
+      refute_received {:bound, _, _, _}
+    end
+
+    test "a re-power-off still Busy when the bind budget is spent fails with :busy" do
+      calls = :counters.new(1, [])
+
+      # The first power-off works; bluetoothd then powers the controller
+      # on again and refuses every later one as Busy.
+      answer = fn
+        @set_powered, 0, <<0>> ->
+          :counters.add(calls, 1, 1)
+          if :counters.get(calls, 1) == 1, do: {0, <<0::little-32>>}, else: {0x0A, <<>>}
+
+        @read_controller_info, 0, <<>> ->
+          {0, controller_info(@bd_addr, 1)}
+      end
+
+      assert HciUser.start_link(
+               index: 0,
+               bind_timeout: 200,
+               open_control: fake_mgmt(answer),
+               open: fn 0 -> {:error, :ebusy} end
+             ) == {:error, {:power_off, :busy}}
+
+      assert_received {:mgmt, @set_powered, 0, <<0>>}
+      assert_received {:mgmt, @read_controller_info, 0, <<>>}
+      assert_received {:mgmt, @set_powered, 0, <<0>>}
     end
 
     test "a bind refused with :ebusy is retried until it succeeds" do
