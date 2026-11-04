@@ -92,6 +92,13 @@ defmodule Bluez.HciUserTest do
     end
   end
 
+  defp fill(sock) do
+    case :socket.send(sock, :binary.copy(<<0>>, 256), [], 10) do
+      :ok -> fill(sock)
+      {:error, :timeout} -> :ok
+    end
+  end
+
   defp forward(pid) do
     receive do
       msg -> send(pid, msg)
@@ -638,19 +645,25 @@ defmodule Bluez.HciUserTest do
       case :socket.recv(kernel, 0, 1_000) do
         {:ok, <<opcode::little-16, index::little-16, len::little-16, params::binary-size(len)>>} ->
           send(test_pid, {:mgmt, opcode, index, params})
-          {status, rp} = answer.(opcode, index, params)
-          ev = <<opcode::little-16, status, rp::binary>>
 
-          :ok =
-            :socket.send(
-              kernel,
-              <<0x0001::little-16, index::little-16, byte_size(ev)::little-16, ev::binary>>
-            )
-
-          mgmt_loop(kernel, test_pid, answer)
+          case answer.(opcode, index, params) do
+            :no_reply -> mgmt_loop(kernel, test_pid, answer)
+            {status, rp} -> mgmt_reply(kernel, test_pid, answer, index, opcode, status, rp)
+          end
 
         {:error, _reason} ->
           :socket.close(kernel)
+      end
+    end
+
+    defp mgmt_reply(kernel, test_pid, answer, index, opcode, status, rp) do
+      ev = <<opcode::little-16, status, rp::binary>>
+      packet = <<0x0001::little-16, index::little-16, byte_size(ev)::little-16, ev::binary>>
+
+      # The other side may have given up (and closed) meanwhile.
+      case :socket.send(kernel, packet) do
+        :ok -> mgmt_loop(kernel, test_pid, answer)
+        {:error, _reason} -> :socket.close(kernel)
       end
     end
 
@@ -716,27 +729,155 @@ defmodule Bluez.HciUserTest do
       assert HciUser.find_index("nope") == {:error, {:invalid_address, "nope"}}
     end
 
-    test "nothing is read once the MGMT deadline has passed" do
-      # A stream of unrelated events already waiting, then the very reply
-      # the command wants: reading on past the deadline would find it.
+    test "an expired MGMT deadline sends nothing" do
+      test_pid = self()
+
       open_control = fn ->
         {proc, kernel} = TestSocketPair.open()
-        index_added = <<0x0004::little-16, 5::little-16, 0::little-16>>
-        for _i <- 1..100, do: :ok = :socket.send(kernel, index_added)
-        rp = <<0x0005::little-16, 0, 0::little-32>>
-        :ok = :socket.send(kernel, <<1::little-16, 0::little-16, byte_size(rp)::little-16>> <> rp)
+        :ok = :socket.setopt(kernel, :otp, :controlling_process, test_pid)
+        send(test_pid, {:control_kernel, kernel})
         {:ok, proc}
       end
 
       assert HciUser.start_link(
                index: 0,
-               owner: self(),
                mgmt_timeout: 0,
                open_control: open_control,
                open: user_channel_open()
              ) == {:error, {:power_off, :timeout}}
 
+      assert_received {:control_kernel, kernel}
+      assert {:error, :timeout} = :socket.recv(kernel, 0, 100)
+    end
+
+    test "nothing is read once the MGMT deadline has passed" do
+      test_pid = self()
+
+      open_control = fn ->
+        {proc, kernel} = TestSocketPair.open()
+        :ok = :socket.setopt(kernel, :otp, :controlling_process, test_pid)
+        send(test_pid, {:control_kernel, self(), kernel})
+        {:ok, proc}
+      end
+
+      task =
+        Task.async(fn ->
+          HciUser.start(
+            index: 0,
+            owner: test_pid,
+            mgmt_timeout: 100,
+            open_control: open_control,
+            open: user_channel_open()
+          )
+        end)
+
+      assert_receive {:control_kernel, server, kernel}, 1_000
+      assert {:ok, <<0x0005::little-16, _::binary>>} = :socket.recv(kernel, 0, 1_000)
+
+      # The server is waiting for the reply. Hold it past its deadline, then
+      # let unrelated events — and after them the very reply it wants —
+      # arrive: reading on past the deadline would reach the reply.
+      true = :erlang.suspend_process(server)
+      Process.sleep(200)
+      index_added = <<0x0004::little-16, 5::little-16, 0::little-16>>
+      for _i <- 1..20, do: :ok = :socket.send(kernel, index_added)
+      rp = <<0x0005::little-16, 0, 0::little-32>>
+      :ok = :socket.send(kernel, <<1::little-16, 0::little-16, byte_size(rp)::little-16>> <> rp)
+      true = :erlang.resume_process(server)
+
+      assert Task.await(task) == {:error, {:power_off, :timeout}}
       refute_received {:bound, _, _, _}
+    end
+
+    test "a MGMT command the control socket can't take times out" do
+      test_pid = self()
+
+      # The smallest send buffer, filled with packets nobody reads.
+      open_control = fn ->
+        {proc, kernel} = TestSocketPair.open()
+        :ok = :socket.setopt(kernel, :otp, :controlling_process, test_pid)
+        :ok = :socket.setopt(proc, {:socket, :sndbuf}, 1)
+        fill(proc)
+        {:ok, proc}
+      end
+
+      task =
+        Task.async(fn ->
+          HciUser.start_link(
+            index: 0,
+            mgmt_timeout: 200,
+            open_control: open_control,
+            open: user_channel_open()
+          )
+        end)
+
+      assert Task.yield(task, 1_500) == {:ok, {:error, {:power_off, :timeout}}}
+    end
+
+    test "an unanswered MGMT command times out by :mgmt_timeout, leaving the bind budget" do
+      # Read Controller Info during the retry is never answered.
+      answer = fn
+        @set_powered, 0, <<0>> -> {0, <<0::little-32>>}
+        @read_controller_info, 0, <<>> -> :no_reply
+      end
+
+      attempts = :counters.new(1, [])
+
+      # It gives up on the reply after 100 ms, and the second bind (well
+      # inside the 2 s budget) succeeds.
+      %{server: server} =
+        start_server(
+          power_off_first: true,
+          mgmt_timeout: 100,
+          bind_timeout: 2_000,
+          open_control: fake_mgmt(answer),
+          open: busy_then_open(1, attempts)
+        )
+
+      assert HciUser.index(server) == {:ok, 0}
+      assert :counters.get(attempts, 1) == 2
+      assert_received {:mgmt, @read_controller_info, 0, <<>>}
+    end
+
+    test "no pause is taken once the MGMT work has spent the bind budget" do
+      test_pid = self()
+
+      answer = fn
+        @set_powered, 0, <<0>> -> {0, <<0::little-32>>}
+        @read_controller_info, 0, <<>> -> :no_reply
+      end
+
+      assert HciUser.start_link(
+               index: 0,
+               power_off_first: true,
+               mgmt_timeout: 2_000,
+               bind_timeout: 300,
+               open_control: fake_mgmt(answer),
+               open: fn 0 -> {:error, :ebusy} end,
+               sleep: fn ms ->
+                 send(test_pid, :slept)
+                 Process.sleep(ms)
+               end
+             ) == {:error, {:bind, :ebusy}}
+
+      # The unanswered Read Controller Info used up the budget.
+      assert_received {:mgmt, @read_controller_info, 0, <<>>}
+      refute_received :slept
+    end
+
+    test "a bind due after the deadline (the retry overslept) is not attempted" do
+      attempts = :counters.new(1, [])
+
+      assert HciUser.start_link(
+               index: 0,
+               power_off_first: false,
+               bind_timeout: 100,
+               # The second bind would succeed, but comes too late.
+               open: busy_then_open(1, attempts),
+               sleep: fn _ms -> Process.sleep(150) end
+             ) == {:error, {:bind, :ebusy}}
+
+      assert :counters.get(attempts, 1) == 1
     end
 
     test "a refused power-off fails the start without binding" do
@@ -788,6 +929,45 @@ defmodule Bluez.HciUserTest do
       assert_received {:mgmt, @set_powered, 0, <<0>>}
       assert_received {:mgmt, @read_controller_info, 0, <<>>}
       assert_received {:mgmt, @set_powered, 0, <<0>>}
+    end
+
+    test "MGMT commands while re-powering off share what is left of the bind budget" do
+      set_powered_calls = :counters.new(1, [])
+
+      # The controller always reads powered, slowly. The first Set Powered
+      # (before binding) is answered; the retry's never is.
+      answer = fn
+        @set_powered, 0, <<0>> ->
+          :counters.add(set_powered_calls, 1, 1)
+          if :counters.get(set_powered_calls, 1) == 1, do: {0, <<0::little-32>>}, else: :no_reply
+
+        @read_controller_info, 0, <<>> ->
+          Process.sleep(400)
+          {0, controller_info(@bd_addr, 1)}
+      end
+
+      attempts = :counters.new(1, [])
+      started = System.monotonic_time(:millisecond)
+
+      assert HciUser.start_link(
+               index: 0,
+               power_off_first: true,
+               mgmt_timeout: 2_000,
+               bind_timeout: 600,
+               open_control: fake_mgmt(answer),
+               open: busy_then_open(1_000, attempts)
+             ) == {:error, {:bind, :ebusy}}
+
+      elapsed = System.monotonic_time(:millisecond) - started
+
+      # The retry did read the controller and try to power it off...
+      assert_received {:mgmt, @set_powered, 0, <<0>>}
+      assert_received {:mgmt, @read_controller_info, 0, <<>>}
+      assert_received {:mgmt, @set_powered, 0, <<0>>}
+      # ...but Set Powered only waited out the ~200 ms left of the 600 ms
+      # budget, not a fresh 600 ms (~1 000 ms in all) or :mgmt_timeout.
+      assert elapsed < 850
+      assert :counters.get(attempts, 1) == 1
     end
 
     test "a bind still refused when the budget is spent fails with :ebusy" do
