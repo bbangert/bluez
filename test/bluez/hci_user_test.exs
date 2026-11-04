@@ -937,6 +937,61 @@ defmodule Bluez.HciUserTest do
       refute_received {:bound, _, _, _}
     end
 
+    test "reads finding the controller off don't use up the re-power-off allowance" do
+      reads = :counters.new(1, [])
+      set_powered = :counters.new(1, [])
+
+      # Off for the first six retry rounds (more than the allowance of five
+      # power-offs), then bluetoothd powers it on.
+      answer = fn
+        @set_powered, 0, <<0>> ->
+          :counters.add(set_powered, 1, 1)
+          {0, <<0::little-32>>}
+
+        @read_controller_info, 0, <<>> ->
+          :counters.add(reads, 1, 1)
+          {0, controller_info(@bd_addr, if(:counters.get(reads, 1) >= 7, do: 1, else: 0))}
+      end
+
+      attempts = :counters.new(1, [])
+
+      start_server(
+        power_off_first: true,
+        open_control: fake_mgmt(answer),
+        open: busy_then_open(7, attempts)
+      )
+
+      # The initial power-off, and the one correcting bluetoothd's power-on.
+      assert :counters.get(set_powered, 1) == 2
+    end
+
+    test "an inconclusive read after a Busy power-off still ends in :busy" do
+      set_powered = :counters.new(1, [])
+      reads = :counters.new(1, [])
+
+      # The first retry round finds it on and the power-off Busy; later
+      # reads go unanswered.
+      answer = fn
+        @set_powered, 0, <<0>> ->
+          :counters.add(set_powered, 1, 1)
+          if :counters.get(set_powered, 1) == 1, do: {0, <<0::little-32>>}, else: {0x0A, <<>>}
+
+        @read_controller_info, 0, <<>> ->
+          :counters.add(reads, 1, 1)
+          if :counters.get(reads, 1) == 1, do: {0, controller_info(@bd_addr, 1)}, else: :no_reply
+      end
+
+      assert HciUser.start_link(
+               index: 0,
+               mgmt_timeout: 50,
+               bind_timeout: 300,
+               open_control: fake_mgmt(answer),
+               open: fn 0 -> {:error, :ebusy} end
+             ) == {:error, {:power_off, :busy}}
+
+      assert :counters.get(reads, 1) >= 2
+    end
+
     test "a re-power-off still Busy when the bind budget is spent fails with :busy" do
       calls = :counters.new(1, [])
 

@@ -586,20 +586,36 @@ defmodule Bluez.HciUser do
   defp time_for_retry?(retry), do: now() + @retry_ms < retry.deadline
 
   defp power_off_if_powered(%{power_offs_left: left} = retry) when left > 0 do
-    # Best effort: anything but Busy (which the next round retries) is
-    # left to the bind to report.
     result =
       with_control(retry.open_control, fn sock ->
         with {:ok, rp} <- budgeted_mgmt(sock, retry, Hci.op_read_controller_info(), <<>>),
              {:ok, %{powered: true}} <- Hci.decode_controller_info(rp) do
-          set_powered_off(sock, retry)
+          {:set_powered, set_powered_off(sock, retry)}
+        else
+          {:ok, %{powered: false}} -> :already_off
+          _failed_read -> :inconclusive
         end
       end)
 
+    # Only an actual power-off uses up the allowance. Best effort: a failed
+    # power-off other than Busy (which the next round retries) is left to
+    # the bind to report, and a failed read tells nothing, so keeps the
+    # last Busy verdict.
     case result do
-      {:ok, _settings} -> %{retry | power_offs_left: left - 1, power_off_busy?: false}
-      {:error, :busy} -> %{retry | power_off_busy?: true}
-      _not_powered_or_failed -> %{retry | power_off_busy?: false}
+      {:set_powered, {:ok, _settings}} ->
+        %{retry | power_offs_left: left - 1, power_off_busy?: false}
+
+      {:set_powered, {:error, :busy}} ->
+        %{retry | power_off_busy?: true}
+
+      {:set_powered, {:error, _reason}} ->
+        %{retry | power_off_busy?: false}
+
+      :already_off ->
+        %{retry | power_off_busy?: false}
+
+      _inconclusive ->
+        retry
     end
   end
 
