@@ -921,6 +921,48 @@ defmodule Bluez.HciUserTest do
       assert HciUser.index(server) == {:ok, 0}
     end
 
+    test "an unanswered first power-off times out by the bind budget, not :mgmt_timeout" do
+      answer = fn @set_powered, 0, <<0>> -> :no_reply end
+      started = System.monotonic_time(:millisecond)
+
+      assert HciUser.start_link(
+               index: 0,
+               mgmt_timeout: 2_000,
+               bind_timeout: 200,
+               open_control: fake_mgmt(answer),
+               open: user_channel_open()
+             ) == {:error, {:power_off, :timeout}}
+
+      assert System.monotonic_time(:millisecond) - started < 1_000
+      refute_received {:bound, _, _, _}
+    end
+
+    test "a slow first power-off leaves the bind retries only the rest of the budget" do
+      # Set Powered succeeds after 400 ms of the 600 ms budget; the
+      # controller then reads off, and every bind is refused.
+      answer = fn
+        @set_powered, 0, <<0>> ->
+          Process.sleep(400)
+          {0, <<0::little-32>>}
+
+        @read_controller_info, 0, <<>> ->
+          {0, controller_info(@bd_addr, 0)}
+      end
+
+      started = System.monotonic_time(:millisecond)
+
+      assert HciUser.start_link(
+               index: 0,
+               mgmt_timeout: 2_000,
+               bind_timeout: 600,
+               open_control: fake_mgmt(answer),
+               open: fn 0 -> {:error, :ebusy} end
+             ) == {:error, {:bind, :ebusy}}
+
+      # ~600 ms in all; a fresh 600 ms for the binds would take ~1 000.
+      assert System.monotonic_time(:millisecond) - started < 850
+    end
+
     test "a power-off still Busy when the budget is spent fails with :busy" do
       calls = :counters.new(1, [])
       started = System.monotonic_time(:millisecond)
