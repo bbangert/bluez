@@ -880,17 +880,184 @@ defmodule Bluez.HciUserTest do
       assert :counters.get(attempts, 1) == 1
     end
 
-    test "a refused power-off fails the start without binding" do
-      refuse = fn @set_powered, _index, _params -> {0x11, <<>>} end
+    test "a refused power-off fails the start at once, without binding" do
+      for {status, reason} <- [{0x11, :invalid_index}, {0x03, :failed}] do
+        calls = :counters.new(1, [])
 
-      assert HciUser.start_link(
-               index: 3,
-               owner: self(),
-               open_control: fake_mgmt(refuse),
-               open: user_channel_open()
-             ) == {:error, {:power_off, :invalid_index}}
+        refuse = fn @set_powered, _index, _params ->
+          :counters.add(calls, 1, 1)
+          {status, <<>>}
+        end
+
+        assert HciUser.start_link(
+                 index: 3,
+                 owner: self(),
+                 open_control: fake_mgmt(refuse),
+                 open: user_channel_open()
+               ) == {:error, {:power_off, reason}}
+
+        # Only Busy is retried.
+        assert :counters.get(calls, 1) == 1
+      end
 
       refute_received {:bound, _, _, _}
+    end
+
+    # MGMT Busy (0x0A) for the first `busy` Set Powered commands.
+    defp busy_power_off(busy, calls) do
+      fn @set_powered, 0, <<0>> ->
+        :counters.add(calls, 1, 1)
+        if :counters.get(calls, 1) <= busy, do: {0x0A, <<>>}, else: {0, <<0::little-32>>}
+      end
+    end
+
+    test "a power-off refused as Busy (bluetoothd configuring the index) is retried" do
+      calls = :counters.new(1, [])
+
+      %{server: server} =
+        start_server(power_off_first: true, open_control: fake_mgmt(busy_power_off(3, calls)))
+
+      assert :counters.get(calls, 1) == 4
+      assert HciUser.index(server) == {:ok, 0}
+    end
+
+    test "an unanswered first power-off times out by the bind budget, not :mgmt_timeout" do
+      answer = fn @set_powered, 0, <<0>> -> :no_reply end
+      started = System.monotonic_time(:millisecond)
+
+      assert HciUser.start_link(
+               index: 0,
+               mgmt_timeout: 2_000,
+               bind_timeout: 200,
+               open_control: fake_mgmt(answer),
+               open: user_channel_open()
+             ) == {:error, {:power_off, :timeout}}
+
+      assert System.monotonic_time(:millisecond) - started < 1_000
+      refute_received {:bound, _, _, _}
+    end
+
+    test "a slow first power-off leaves the bind retries only the rest of the budget" do
+      # Set Powered succeeds after 400 ms of the 600 ms budget; the
+      # controller then reads off, and every bind is refused.
+      answer = fn
+        @set_powered, 0, <<0>> ->
+          Process.sleep(400)
+          {0, <<0::little-32>>}
+
+        @read_controller_info, 0, <<>> ->
+          {0, controller_info(@bd_addr, 0)}
+      end
+
+      started = System.monotonic_time(:millisecond)
+
+      assert HciUser.start_link(
+               index: 0,
+               mgmt_timeout: 2_000,
+               bind_timeout: 600,
+               open_control: fake_mgmt(answer),
+               open: fn 0 -> {:error, :ebusy} end
+             ) == {:error, {:bind, :ebusy}}
+
+      # ~600 ms in all; a fresh 600 ms for the binds would take ~1 000.
+      assert System.monotonic_time(:millisecond) - started < 850
+    end
+
+    test "a power-off still Busy when the budget is spent fails with :busy" do
+      calls = :counters.new(1, [])
+      started = System.monotonic_time(:millisecond)
+
+      assert HciUser.start_link(
+               index: 0,
+               bind_timeout: 200,
+               open_control: fake_mgmt(busy_power_off(1_000, calls)),
+               open: user_channel_open()
+             ) == {:error, {:power_off, :busy}}
+
+      assert :counters.get(calls, 1) >= 3
+      assert System.monotonic_time(:millisecond) - started < 1_000
+      refute_received {:bound, _, _, _}
+    end
+
+    test "reads finding the controller off don't use up the re-power-off allowance" do
+      reads = :counters.new(1, [])
+      set_powered = :counters.new(1, [])
+
+      # Off for the first six retry rounds (more than the allowance of five
+      # power-offs), then bluetoothd powers it on.
+      answer = fn
+        @set_powered, 0, <<0>> ->
+          :counters.add(set_powered, 1, 1)
+          {0, <<0::little-32>>}
+
+        @read_controller_info, 0, <<>> ->
+          :counters.add(reads, 1, 1)
+          {0, controller_info(@bd_addr, if(:counters.get(reads, 1) >= 7, do: 1, else: 0))}
+      end
+
+      attempts = :counters.new(1, [])
+
+      start_server(
+        power_off_first: true,
+        open_control: fake_mgmt(answer),
+        open: busy_then_open(7, attempts)
+      )
+
+      # The initial power-off, and the one correcting bluetoothd's power-on.
+      assert :counters.get(set_powered, 1) == 2
+    end
+
+    test "an inconclusive read after a Busy power-off still ends in :busy" do
+      set_powered = :counters.new(1, [])
+      reads = :counters.new(1, [])
+
+      # The first retry round finds it on and the power-off Busy; later
+      # reads go unanswered.
+      answer = fn
+        @set_powered, 0, <<0>> ->
+          :counters.add(set_powered, 1, 1)
+          if :counters.get(set_powered, 1) == 1, do: {0, <<0::little-32>>}, else: {0x0A, <<>>}
+
+        @read_controller_info, 0, <<>> ->
+          :counters.add(reads, 1, 1)
+          if :counters.get(reads, 1) == 1, do: {0, controller_info(@bd_addr, 1)}, else: :no_reply
+      end
+
+      assert HciUser.start_link(
+               index: 0,
+               mgmt_timeout: 50,
+               bind_timeout: 300,
+               open_control: fake_mgmt(answer),
+               open: fn 0 -> {:error, :ebusy} end
+             ) == {:error, {:power_off, :busy}}
+
+      assert :counters.get(reads, 1) >= 2
+    end
+
+    test "a re-power-off still Busy when the bind budget is spent fails with :busy" do
+      calls = :counters.new(1, [])
+
+      # The first power-off works; bluetoothd then powers the controller
+      # on again and refuses every later one as Busy.
+      answer = fn
+        @set_powered, 0, <<0>> ->
+          :counters.add(calls, 1, 1)
+          if :counters.get(calls, 1) == 1, do: {0, <<0::little-32>>}, else: {0x0A, <<>>}
+
+        @read_controller_info, 0, <<>> ->
+          {0, controller_info(@bd_addr, 1)}
+      end
+
+      assert HciUser.start_link(
+               index: 0,
+               bind_timeout: 200,
+               open_control: fake_mgmt(answer),
+               open: fn 0 -> {:error, :ebusy} end
+             ) == {:error, {:power_off, :busy}}
+
+      assert_received {:mgmt, @set_powered, 0, <<0>>}
+      assert_received {:mgmt, @read_controller_info, 0, <<>>}
+      assert_received {:mgmt, @set_powered, 0, <<0>>}
     end
 
     test "a bind refused with :ebusy is retried until it succeeds" do
